@@ -1,0 +1,1 @@
+multiply.frag:10: error: fragment shader uses OpVectorTimesScalar (vector * scalar): the GS cannot run code per pixel. Only 'outColor = <interpolated color input>;' is supported so far

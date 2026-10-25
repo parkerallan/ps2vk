@@ -1,0 +1,1 @@
+no_position.vert: error: vertex shader never writes gl_Position

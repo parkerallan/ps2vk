@@ -1,0 +1,1 @@
+texture.frag: error: 'tex' is a uniform, push constant or buffer; this version of ps2vk-shaderc supports only shader inputs and outputs

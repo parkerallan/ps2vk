@@ -18,6 +18,9 @@ clear: $(EE_LIB)
 triangle: $(EE_LIB) shaderc
 	$(MAKE) -C samples/triangle
 
+test:
+	$(MAKE) -C tools/shaderc test
+
 docs:
 	doxygen Doxyfile
 
@@ -27,7 +30,14 @@ clean:
 	$(MAKE) -C samples/clear clean
 	$(MAKE) -C samples/triangle clean
 
-.PHONY: all shaderc clear triangle docs clean
+.PHONY: all shaderc clear triangle test docs clean
 
+# The PS2 build rules come from ps2sdk. `make test` and `make docs` run on the
+# PC alone, so they work without PS2SDK set.
+ifneq ($(PS2SDK),)
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.eeglobal
+else
+$(EE_LIB):
+	$(error PS2SDK is not set; see the Setup section of README.md)
+endif

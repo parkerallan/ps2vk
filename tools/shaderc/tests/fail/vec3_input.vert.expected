@@ -1,0 +1,1 @@
+vec3_input.vert: error: input 'inPos' must be a vec4 for now

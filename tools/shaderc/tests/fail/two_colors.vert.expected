@@ -1,0 +1,1 @@
+two_colors.vert: error: shader has 2 color outputs; the GS can interpolate only one color
