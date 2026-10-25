@@ -1,4 +1,4 @@
-# ps2vk proof of concept: one Gouraud-shaded triangle.
+# ps2vk triangle sample: one Gouraud-shaded triangle.
 # Shaders: GLSL -> SPIR-V (glslangValidator) -> ps2vk-shaderc -> VU1 code / GS settings.
 
 PS2VK   = ../..

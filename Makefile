@@ -18,13 +18,16 @@ clear: $(EE_LIB)
 triangle: $(EE_LIB) shaderc
 	$(MAKE) -C samples/triangle
 
+docs:
+	doxygen Doxyfile
+
 clean:
 	rm -f $(EE_LIB) $(EE_OBJS)
 	$(MAKE) -C tools/shaderc clean
 	$(MAKE) -C samples/clear clean
 	$(MAKE) -C samples/triangle clean
 
-.PHONY: all shaderc clear triangle clean
+.PHONY: all shaderc clear triangle docs clean
 
 include $(PS2SDK)/samples/Makefile.pref
 include $(PS2SDK)/samples/Makefile.eeglobal

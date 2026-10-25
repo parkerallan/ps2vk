@@ -20,7 +20,7 @@ Those coming from Vulkan will find the same design pattern, where we write a com
 
 ## Status
 
-Proof of concept: a Gouraud-shaded triangle drawn from GLSL vertex and fragment shaders, running in PCSX2.
+Draws a Gouraud-shaded triangle from GLSL vertex and fragment shaders, running in PCSX2.
 
 ## Setup
 

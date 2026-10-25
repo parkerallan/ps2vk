@@ -1,0 +1,19 @@
+# Doxygen configuration for the ps2vk public API.
+# Only settings that differ from Doxygen's defaults are listed. Run: make docs
+
+PROJECT_NAME           = ps2vk
+PROJECT_BRIEF          = "A Vulkan-like graphics API for the PlayStation 2"
+OUTPUT_DIRECTORY       = docs
+INPUT                  = include/ps2vk.h README.md
+USE_MDFILE_AS_MAINPAGE = README.md
+LAYOUT_FILE            = DoxygenLayout.xml
+OPTIMIZE_OUTPUT_FOR_C  = YES
+EXTRACT_ALL            = YES
+TYPEDEF_HIDES_STRUCT   = YES
+SORT_MEMBER_DOCS       = NO
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+HAVE_DOT               = NO
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_NO_PARAMDOC       = YES

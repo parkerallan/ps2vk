@@ -1,5 +1,5 @@
 /*
- * ps2vk proof of concept: clear the screen and draw one triangle whose
+ * ps2vk triangle sample: clear the screen and draw one triangle whose
  * corners are red, green and blue, using only ps2vk calls.
  */
 #include <stdio.h>
