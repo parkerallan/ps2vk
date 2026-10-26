@@ -4,9 +4,10 @@
  *   vertex shader   -> VU1 microcode (.vsm for dvp-as) + PvkShaderCode (.c)
  *   fragment shader -> GS settings in a PvkShaderCode (.c)
  *
- * This first version accepts only shaders that copy inputs to outputs:
+ * This version accepts:
  *
- *   vertex:   gl_Position = <vec4 input>; [color output] = <vec4 input>;
+ *   vertex:   gl_Position and an optional color output computed from vec4 inputs
+ *             and float/vec4 constants with +, -, *, / and negation
  *   fragment: <color output> = <interpolated color input>;
  *
  * Anything else is rejected with an error that says why, the way a Vulkan
@@ -25,6 +26,7 @@
 #define MAX_IDS     4096
 #define MAX_INPUTS  8
 #define MAX_OUTPUTS 8
+#define MAX_BODY    256
 
 /* SPIR-V opcodes used here (SPIR-V 1.x specification). */
 enum {
@@ -63,8 +65,11 @@ typedef struct {
     uint32_t elemType;       /* vector component type, pointer pointee */
     uint32_t elemCount;      /* vector size */
     uint32_t storage;        /* pointer storage class */
-    /* constants */
+    /* constants and values */
     uint32_t value;
+    uint32_t valType;        /* type id of a constant or value */
+    uint32_t comps[4];       /* constant components (float bits) */
+    int      compCount;      /* 0 if the constant isn't a float or float vector */
     /* variables and pointers */
     uint32_t varType;        /* pointer type id */
     int      location;       /* -1 if none */
@@ -138,7 +143,7 @@ static void unsupported(uint32_t op, const char *stage)
         fail("fragment shader uses %s: the GS cannot run code per pixel. "
              "Only 'outColor = <interpolated color input>;' is supported so far", what);
     fail("vertex shader uses %s, which this version of ps2vk-shaderc does not "
-         "compile yet. Only copying inputs to outputs is supported so far", what);
+         "compile yet. Only +, -, *, / and negation of inputs and constants are supported so far", what);
 }
 
 static uint32_t *read_spirv(const char *path, size_t *words)
@@ -171,7 +176,33 @@ static int is_vec4_float(const IdInfo *ids, uint32_t type)
            ids[t->elemType].type == T_FLOAT && ids[t->elemType].width == 32;
 }
 
+static int is_float(const IdInfo *ids, uint32_t type)
+{
+    return ids[type].type == T_FLOAT && ids[type].width == 32;
+}
+
+/* Component count of an arithmetic operand or result: 1 (float) or 4 (vec4). */
+static int value_size(const IdInfo *ids, uint32_t id, const char *stage)
+{
+    if (ids[id].kind != ID_VALUE && !(ids[id].kind == ID_CONST && ids[id].compCount))
+        fail("%s shader computes with something other than inputs and constants", stage);
+    if (is_float(ids, ids[id].valType))
+        return 1;
+    if (is_vec4_float(ids, ids[id].valType))
+        return 4;
+    fail("%s shader computes with a type other than float or vec4; only those are supported so far", stage);
+    return 0;
+}
+
 /* ----------------------------------------------------------------------- */
+
+/* One arithmetic instruction of a vertex shader body, in program order. */
+typedef struct {
+    uint32_t op;
+    uint32_t result;
+    uint32_t a, b;                  /* operand ids; b is 0 for OpFNegate */
+    uint32_t line;                  /* GLSL line, 0 if unknown */
+} BodyOp;
 
 typedef struct {
     uint32_t execModel;
@@ -180,9 +211,11 @@ typedef struct {
     Var      outputs[MAX_OUTPUTS];  /* location outputs only */
     int      outputCount;
     uint32_t positionVar;           /* gl_PerVertex or Position variable, 0 if none */
-    int      positionFrom;          /* input index stored to gl_Position, -1 if never */
-    int      colorFrom;             /* input index stored to the color output, -1 if never */
+    uint32_t positionValue;         /* value id stored to gl_Position, 0 if never */
+    uint32_t colorValue;            /* value id stored to the color output, 0 if never */
     int      colorLocation;         /* -1 if none */
+    BodyOp   body[MAX_BODY];
+    int      bodyCount;
 } Shader;
 
 static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
@@ -196,7 +229,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 
     memset(sh, 0, sizeof(*sh));
     sh->execModel = ~0u;
-    sh->positionFrom = sh->colorFrom = sh->colorLocation = -1;
+    sh->colorLocation = -1;
     for (uint32_t i = 0; i < bound; i++) {
         ids[i].location = ids[i].builtin = ids[i].structPosMember = -1;
         ids[i].fromInput = -1;
@@ -260,7 +293,23 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             break;
         case OpConstant:
             ids[w[2]].kind = ID_CONST; ids[w[2]].value = w[3];
+            ids[w[2]].valType = w[1];
+            if (is_float(ids, w[1])) {
+                ids[w[2]].comps[0] = w[3];
+                ids[w[2]].compCount = 1;
+            }
             break;
+        case OpConstantComposite: {
+            uint32_t id = w[2];
+            ids[id].kind = ID_CONST;
+            ids[id].valType = w[1];
+            if (ids[w[1]].type == T_VECTOR && is_float(ids, ids[w[1]].elemType) && n - 3 <= 4) {
+                for (uint32_t i = 0; i < n - 3; i++)
+                    ids[id].comps[i] = ids[w[3 + i]].comps[0];
+                ids[id].compCount = (int)(n - 3);
+            }
+            break;
+        }
         case OpVariable: {
             uint32_t type = w[1], id = w[2], storage = w[3];
             ids[id].kind = ID_VAR;
@@ -385,7 +434,50 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 if (ids[ptr].kind != ID_VAR || ids[ptr].fromInput < 0)
                     fail("%s shader reads something other than a vertex input", stage);
                 ids[id].kind = ID_VALUE;
+                ids[id].valType = w[1];
                 ids[id].fromInput = ids[ptr].fromInput;
+                break;
+            }
+            case OpFAdd: case OpFSub: case OpFMul: case OpFDiv: case OpFNegate:
+            case OpVectorTimesScalar: {
+                BodyOp *b;
+                int size;
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                ids[w[2]].kind = ID_VALUE;
+                ids[w[2]].valType = w[1];
+                size = value_size(ids, w[2], stage);
+                if (op == OpVectorTimesScalar) {
+                    if (value_size(ids, w[3], stage) != 4 || value_size(ids, w[4], stage) != 1)
+                        fail("corrupt SPIR-V: OpVectorTimesScalar needs a vec4 and a float");
+                } else if (value_size(ids, w[3], stage) != size ||
+                           (op != OpFNegate && value_size(ids, w[4], stage) != size)) {
+                    fail("corrupt SPIR-V: %s operands differ in size", op_name(op));
+                }
+                if (sh->bodyCount == MAX_BODY)
+                    fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+                b = &sh->body[sh->bodyCount++];
+                b->op = op;
+                b->result = w[2];
+                b->a = w[3];
+                b->b = op == OpFNegate ? 0 : w[4];
+                b->line = g_line;
+                break;
+            }
+            case OpCompositeConstruct: {
+                /* Only all-constant vectors, e.g. glslang's vec4(2.0) for 'v / 2.0'. */
+                uint32_t id = w[2];
+                if (sh->execModel != ExecVertex || n - 3 > 4)
+                    unsupported(op, stage);
+                for (uint32_t i = 0; i < n - 3; i++) {
+                    if (ids[w[3 + i]].kind != ID_CONST || ids[w[3 + i]].compCount != 1)
+                        unsupported(op, stage);
+                    ids[id].comps[i] = ids[w[3 + i]].comps[0];
+                }
+                ids[id].kind = ID_CONST;
+                ids[id].valType = w[1];
+                ids[id].compCount = (int)(n - 3);
                 break;
             }
             case OpAccessChain: {
@@ -403,15 +495,18 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             }
             case OpStore: {
                 uint32_t ptr = w[1], val = w[2];
-                int from = ids[val].kind == ID_VALUE ? ids[val].fromInput : -1;
 
-                if (from < 0)
-                    fail("%s shader stores a computed value; only copying an input "
-                         "unchanged is supported so far", stage);
+                if (sh->execModel == ExecFragment) {
+                    if (ids[val].kind != ID_VALUE || ids[val].fromInput < 0)
+                        fail("%s shader stores a computed value; only copying an input "
+                             "unchanged is supported so far", stage);
+                } else if (value_size(ids, val, stage) != 4) {
+                    fail("%s shader stores something other than a vec4 to an output", stage);
+                }
                 if (ids[ptr].isPosition) {
-                    sh->positionFrom = from;
+                    sh->positionValue = val;
                 } else if (sh->outputCount == 1 && ptr == sh->outputs[0].var) {
-                    sh->colorFrom = from;
+                    sh->colorValue = val;
                 } else {
                     fail("%s shader writes to something other than its outputs", stage);
                 }
@@ -426,11 +521,11 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     g_line = 0;
 
     if (sh->execModel == ExecVertex) {
-        if (sh->positionFrom < 0)
+        if (!sh->positionValue)
             fail("vertex shader never writes gl_Position");
-        if (sh->outputCount == 1 && sh->colorFrom < 0)
+        if (sh->outputCount == 1 && !sh->colorValue)
             fail("vertex shader declares a color output but never writes it");
-    } else if (sh->colorFrom < 0) {
+    } else if (!sh->colorValue) {
         fail("fragment shader must write 'outColor = <color input>;'");
     }
 }
@@ -458,16 +553,154 @@ static void vu(FILE *f, const char *upper, const char *lower, const char *commen
         fprintf(f, "         %-40s %s\n", upper, lower);
 }
 
-static void emit_vertex(const Shader *sh, const char *base, const char *sym)
+/*
+ * VF registers free for constants and shader temporaries. The rest hold the
+ * prologue constants (VF01-VF04), inputs (VF10-VF17) and epilogue values (VF20-VF24).
+ */
+static const int g_pool[] = { 5, 6, 7, 8, 9, 18, 19, 25, 26, 27, 28, 29, 30, 31 };
+
+typedef struct {
+    int reg[MAX_IDS];       /* VF register holding each value, 0 if none */
+    int lastUse[MAX_IDS];   /* body index of the last read, MAX_BODY if stored to an output */
+    int busy[32];
+} Regs;
+
+static int reg_alloc(Regs *r)
+{
+    for (size_t i = 0; i < sizeof(g_pool) / sizeof(g_pool[0]); i++)
+        if (!r->busy[g_pool[i]]) {
+            r->busy[g_pool[i]] = 1;
+            return g_pool[i];
+        }
+    fail("vertex shader needs more than %d values at once; VU1 has run out of registers",
+         (int)(sizeof(g_pool) / sizeof(g_pool[0])));
+    return 0;
+}
+
+/* Frees a temporary after its last read (inputs and constants stay). */
+static void reg_release(Regs *r, const IdInfo *ids, uint32_t id, int at)
+{
+    if (ids[id].kind == ID_VALUE && ids[id].fromInput < 0 && r->lastUse[id] <= at && r->reg[id]) {
+        r->busy[r->reg[id]] = 0;
+        r->reg[id] = 0;
+    }
+}
+
+/* LOI takes the float's raw bits in hex, as VCL's output does; the comment gets the value. */
+static void loi_text(uint32_t bits, char *ins, size_t insSize, char *comment, size_t commentSize)
+{
+    float v;
+
+    memcpy(&v, &bits, sizeof(v));
+    if (v != v || v - v != 0)
+        fail("constant is infinite or NaN, which VU1 cannot represent");
+    snprintf(ins, insSize, "loi           0x%08x", (unsigned)bits);
+    snprintf(comment, commentSize, "%.9g", v);
+}
+
+/* Loads a constant into its register: zero it, then LOI + ADDI per distinct component value. */
+static void emit_constant(FILE *f, const IdInfo *c, int reg)
+{
+    static const char field[] = "xyzw";
+    char buf[64], buf2[64], mask[5], val[32];
+    int done[4] = { 0 }, i, j, k;
+
+    snprintf(buf, sizeof(buf), "sub.xyzw      VF%02d,VF00,VF00", reg);
+    snprintf(buf2, sizeof(buf2), "%s", c->compCount == 1 ? "float constant" : "vec4 constant");
+    vu(f, buf, "NOP", buf2);
+    for (i = 0; i < c->compCount; i++) {
+        if (done[i] || !(c->comps[i] & 0x7fffffff))
+            continue;
+        for (j = i, k = 0; j < c->compCount; j++)
+            if (c->comps[j] == c->comps[i]) {
+                mask[k++] = field[j];
+                done[j] = 1;
+            }
+        mask[k] = 0;
+        loi_text(c->comps[i], buf, sizeof(buf), val, sizeof(val));
+        vu(f, "NOP", buf, val);
+        snprintf(buf, sizeof(buf), "addi.%-8s VF%02d,VF%02d,I", mask, reg, reg);
+        vu(f, buf, "NOP", NULL);
+    }
+}
+
+static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, int a, int bb)
+{
+    static const char field[] = "xyzw";
+    const char *dest = is_float(ids, ids[b->result].valType) ? "x" : "xyzw";
+    char buf[64], line[96];
+    int i;
+
+    if (b->line)
+        snprintf(line, sizeof(line), "line %u: %s", (unsigned)b->line, op_name(b->op));
+    else
+        snprintf(line, sizeof(line), "%s", op_name(b->op));
+
+    switch (b->op) {
+    case OpFAdd: case OpFSub: case OpFMul: {
+        const char *m = b->op == OpFAdd ? "add" : b->op == OpFSub ? "sub" : "mul";
+        char mn[16];
+        snprintf(mn, sizeof(mn), "%s.%s", m, dest);
+        snprintf(buf, sizeof(buf), "%-14sVF%02d,VF%02d,VF%02d", mn, d, a, bb);
+        vu(f, buf, "NOP", line);
+        break;
+    }
+    case OpVectorTimesScalar:
+        snprintf(buf, sizeof(buf), "mulx.xyzw     VF%02d,VF%02d,VF%02dx", d, a, bb);
+        vu(f, buf, "NOP", line);
+        break;
+    case OpFNegate: {
+        char mn[16];
+        vu(f, "NOP", "loi           0xbf800000", line);   /* -1.0 */
+        snprintf(mn, sizeof(mn), "muli.%s", dest);
+        snprintf(buf, sizeof(buf), "%-14sVF%02d,VF%02d,I", mn, d, a);
+        vu(f, buf, "NOP", NULL);
+        break;
+    }
+    case OpFDiv:
+        /* VU1 divides one component at a time into Q; copy Q out with VF00 = (0, 0, 0, 1). */
+        for (i = 0; i < (int)strlen(dest); i++) {
+            char c = field[i];
+            snprintf(buf, sizeof(buf), "div           Q,VF%02d%c,VF%02d%c", a, c, bb, c);
+            vu(f, "NOP", buf, i ? NULL : line);
+            vu(f, "NOP", "waitq", NULL);
+            if (c == 'w')
+                snprintf(buf, sizeof(buf), "mulq.w        VF%02d,VF00,Q", d);
+            else
+                snprintf(buf, sizeof(buf), "addq.%c        VF%02d,VF00,Q", c, d);
+            vu(f, buf, "NOP", NULL);
+        }
+        break;
+    }
+}
+
+static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, const char *sym)
 {
     FILE *f = open_out(base, ".vsm");
     char buf[64], buf2[64];
-    int i;
+    static Regs r;
+    int i, constants = 0;
+
+    /* Registers: inputs are fixed, constants live for the whole program, temporaries
+     * are freed after their last read. */
+    memset(&r, 0, sizeof(r));
+    for (i = 0; i < sh->bodyCount; i++) {
+        r.lastUse[sh->body[i].a] = i;
+        if (sh->body[i].b)
+            r.lastUse[sh->body[i].b] = i;
+    }
+    r.lastUse[sh->positionValue] = MAX_BODY;
+    if (sh->colorValue)
+        r.lastUse[sh->colorValue] = MAX_BODY;
+    for (i = 0; i < MAX_IDS; i++)
+        if (ids[i].kind == ID_VALUE && ids[i].fromInput >= 0)
+            r.reg[i] = 10 + ids[i].fromInput;
 
     fprintf(f, "; Generated by ps2vk-shaderc from %s. Do not edit.\n", g_src);
     fprintf(f, ";\n; VU1 registers:\n");
     fprintf(f, ";   VF01 viewport scale, VF02 viewport offset, VF03 color scale\n");
     fprintf(f, ";   VF10.. shader inputs, VF20 gl_Position, VF21 color output\n");
+    fprintf(f, ";   VF05-VF09, VF18-VF19, VF25-VF31 constants and temporaries\n");
     fprintf(f, ";   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer\n\n");
     fprintf(f, "\t\t.vu\n\t\t.align 4\n");
     fprintf(f, "\t\t.global\t%s_CodeStart\n\t\t.global\t%s_CodeEnd\n", sym, sym);
@@ -493,6 +726,24 @@ static void emit_vertex(const Shader *sh, const char *base, const char *sym)
     vu(f, "sub.xyzw      VF23,VF00,VF00", "sq            VF04,0(VI04)", "XYZ2 w = 0 (ADC off)");
     vu(f, "NOP", "iaddiu        VI05,VI04,1", "output pointer");
 
+    for (i = 0; i <= sh->bodyCount + 1; i++) {
+        uint32_t use[2] = { 0, 0 };
+        if (i < sh->bodyCount) {
+            use[0] = sh->body[i].a;
+            use[1] = sh->body[i].b;
+        } else {
+            use[0] = i == sh->bodyCount ? sh->positionValue : sh->colorValue;
+        }
+        for (int j = 0; j < 2; j++) {
+            if (!use[j] || ids[use[j]].kind != ID_CONST || r.reg[use[j]])
+                continue;
+            if (!constants++)
+                fprintf(f, "; constants\n");
+            r.reg[use[j]] = reg_alloc(&r);
+            emit_constant(f, &ids[use[j]], r.reg[use[j]]);
+        }
+    }
+
     fprintf(f, "%s_loop:\n", sym);
     fprintf(f, "; load inputs (location order)\n");
     for (i = 0; i < sh->inputCount; i++) {
@@ -502,10 +753,21 @@ static void emit_vertex(const Shader *sh, const char *base, const char *sym)
     }
 
     fprintf(f, "; shader body\n");
-    snprintf(buf, sizeof(buf), "move.xyzw     VF20,VF%02d", 10 + sh->positionFrom);
+    for (i = 0; i < sh->bodyCount; i++) {
+        const BodyOp *b = &sh->body[i];
+        int a = r.reg[b->a], bb = b->b ? r.reg[b->b] : 0, d;
+
+        reg_release(&r, ids, b->a, i);
+        if (b->b)
+            reg_release(&r, ids, b->b, i);
+        d = r.reg[b->result] = reg_alloc(&r);
+        emit_body_op(f, ids, b, d, a, bb);
+        reg_release(&r, ids, b->result, i);   /* never read */
+    }
+    snprintf(buf, sizeof(buf), "move.xyzw     VF20,VF%02d", r.reg[sh->positionValue]);
     vu(f, "NOP", buf, "gl_Position");
-    if (sh->colorFrom >= 0) {
-        snprintf(buf, sizeof(buf), "move.xyzw     VF21,VF%02d", 10 + sh->colorFrom);
+    if (sh->colorValue) {
+        snprintf(buf, sizeof(buf), "move.xyzw     VF21,VF%02d", r.reg[sh->colorValue]);
         snprintf(buf2, sizeof(buf2), "color output, location %d", sh->colorLocation);
         vu(f, "NOP", buf, buf2);
     } else {
@@ -556,13 +818,13 @@ static void emit_vertex(const Shader *sh, const char *base, const char *sym)
     for (i = 0; i < sh->inputCount; i++)
         fprintf(f, "%s%d", i ? ", " : " ", sh->inputs[i].location);
     fprintf(f, " },\n");
-    fprintf(f, "    .colorOutputLocation = %d,\n", sh->colorFrom >= 0 ? sh->colorLocation : -1);
+    fprintf(f, "    .colorOutputLocation = %d,\n", sh->colorValue ? sh->colorLocation : -1);
     fprintf(f, "    .colorInputLocation = -1,\n");
     fprintf(f, "};\n");
     fclose(f);
 }
 
-static void emit_fragment(const Shader *sh, const char *base, const char *sym)
+static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base, const char *sym)
 {
     FILE *f = open_out(base, ".c");
 
@@ -573,7 +835,7 @@ static void emit_fragment(const Shader *sh, const char *base, const char *sym)
     fprintf(f, "    .stage = PVK_SHADER_STAGE_FRAGMENT,\n");
     fprintf(f, "    .name = \"%s\",\n", g_src);
     fprintf(f, "    .colorOutputLocation = -1,\n");
-    fprintf(f, "    .colorInputLocation = %d,\n", sh->inputs[sh->colorFrom].location);
+    fprintf(f, "    .colorInputLocation = %d,\n", sh->inputs[ids[sh->colorValue].fromInput].location);
     fprintf(f, "    .gouraud = 1,\n");
     fprintf(f, "    .textured = 0,\n");
     fprintf(f, "};\n");
@@ -635,9 +897,9 @@ int main(int argc, char **argv)
     parse(code, words, ids, &sh);
 
     if (sh.execModel == ExecVertex)
-        emit_vertex(&sh, outBase, sym);
+        emit_vertex(&sh, ids, outBase, sym);
     else
-        emit_fragment(&sh, outBase, sym);
+        emit_fragment(&sh, ids, outBase, sym);
 
     free(code);
     return 0;

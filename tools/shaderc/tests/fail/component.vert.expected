@@ -1,0 +1,1 @@
+component.vert:8: error: vertex shader accesses a member or element other than gl_Position

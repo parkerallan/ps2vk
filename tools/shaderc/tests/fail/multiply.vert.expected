@@ -1,1 +1,0 @@
-multiply.vert:8: error: vertex shader uses OpVectorTimesScalar (vector * scalar), which this version of ps2vk-shaderc does not compile yet. Only copying inputs to outputs is supported so far

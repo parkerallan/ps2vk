@@ -3,6 +3,7 @@
 ; VU1 registers:
 ;   VF01 viewport scale, VF02 viewport offset, VF03 color scale
 ;   VF10.. shader inputs, VF20 gl_Position, VF21 color output
+;   VF05-VF09, VF18-VF19, VF25-VF31 constants and temporaries
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
 
 		.vu

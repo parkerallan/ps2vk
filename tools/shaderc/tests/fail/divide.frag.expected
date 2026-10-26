@@ -1,0 +1,1 @@
+divide.frag:10: error: fragment shader uses OpCompositeConstruct (a vector constructor): the GS cannot run code per pixel. Only 'outColor = <interpolated color input>;' is supported so far

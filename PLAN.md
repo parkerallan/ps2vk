@@ -95,7 +95,7 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | ✓ | Pass-through vertex shaders | `OpLoad`/`OpStore` of inputs and outputs | VU1 `MOVE` + generated prologue/epilogue |
 | ✓ | `outColor = vColor` fragment shaders | `OpLoad`/`OpStore` | GS `PRIM.IIP` (Gouraud) |
 | ✓ | Errors with line numbers and reasons | Any unsupported opcode | Build-time error |
-| | Arithmetic | `OpFAdd`, `OpFSub`, `OpFMul`, `OpFDiv`, `OpFNegate`, `OpVectorTimesScalar` | VU1 `ADD`, `SUB`, `MUL`, `DIV` (Q register) |
+| ✓ | Arithmetic | `OpFAdd`, `OpFSub`, `OpFMul`, `OpFDiv`, `OpFNegate`, `OpVectorTimesScalar`, float/vec4 constants | VU1 `ADD`, `SUB`, `MUL`, `MULx` broadcast, `DIV` per component through Q; constants loaded once with `LOI`. *Vertex shaders only: the GS can't compute per pixel* |
 | | Swizzles, constructors, component access | `OpVectorShuffle`, `OpCompositeConstruct`, `OpCompositeExtract` | VU1 field masks (`.xyz`), `MR32`, broadcast operands |
 | | Matrices and matrix × vector | `OpMatrixTimesVector`, `OpTypeMatrix` | VU1 `MULA`/`MADDA`/`MADD` chain (4 instructions) |
 | | Built-in functions | `OpExtInst` GLSL.std.450 (`Normalize`, `Pow`, `Sin`, …), `OpDot` | VU1 `DIV`/`SQRT`/`RSQRT`, EFU (`ESIN`, `EEXP`, `ERSQRT`, …) |

@@ -1,6 +1,6 @@
 #version 450
 
-// Arithmetic in a vertex shader isn't compiled yet.
+// vec4 * float constant: one MULx with the constant broadcast from x.
 layout(location = 0) in vec4 inPos;
 
 void main()
