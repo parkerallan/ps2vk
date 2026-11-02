@@ -1,6 +1,6 @@
 #version 450
 
-// Reading one component is the swizzle feature, not arithmetic.
+// inPos.w is read in place as a broadcast operand: one MUL, no copy.
 layout(location = 0) in vec4 inPos;
 
 void main()

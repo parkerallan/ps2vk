@@ -7,7 +7,8 @@
  * This version accepts:
  *
  *   vertex:   gl_Position and an optional color output computed from vec4 inputs
- *             and float/vec4 constants with +, -, *, / and negation
+ *             and float/vec4 constants with +, -, *, / and negation, swizzles
+ *             (v.xyz, v.bgra), component reads (v.w) and vector constructors
  *   fragment: <color output> = <interpolated color input>;
  *
  * Anything else is rejected with an error that says why, the way a Vulkan
@@ -78,6 +79,10 @@ typedef struct {
     int      isPosition;     /* pointer that targets gl_Position */
     /* values: which input a loaded value came from */
     int      fromInput;      /* index into inputs[], or -1 */
+    /* values that live inside another value's register: v.w, v.xyz */
+    uint32_t aliasOf;        /* id whose register this value shares, 0 if its own */
+    int      comp;           /* field (0..3) holding a scalar value */
+    int      mapOp;          /* 1 + body index of the shuffle/constructor that builds it, 0 if none */
     const char *name;
 } IdInfo;
 
@@ -143,7 +148,8 @@ static void unsupported(uint32_t op, const char *stage)
         fail("fragment shader uses %s: the GS cannot run code per pixel. "
              "Only 'outColor = <interpolated color input>;' is supported so far", what);
     fail("vertex shader uses %s, which this version of ps2vk-shaderc does not "
-         "compile yet. Only +, -, *, / and negation of inputs and constants are supported so far", what);
+         "compile yet. Only +, -, *, /, negation, swizzles and vector constructors "
+         "of inputs and constants are supported so far", what);
 }
 
 static uint32_t *read_spirv(const char *path, size_t *words)
@@ -181,28 +187,74 @@ static int is_float(const IdInfo *ids, uint32_t type)
     return ids[type].type == T_FLOAT && ids[type].width == 32;
 }
 
-/* Component count of an arithmetic operand or result: 1 (float) or 4 (vec4). */
+/* Component count of a float or vecN type, 0 for anything else. */
+static int type_size(const IdInfo *ids, uint32_t type)
+{
+    const IdInfo *t = &ids[type];
+    if (is_float(ids, type))
+        return 1;
+    if (t->type == T_VECTOR && t->elemCount >= 2 && t->elemCount <= 4 && is_float(ids, t->elemType))
+        return (int)t->elemCount;
+    return 0;
+}
+
+/* Component count of an arithmetic operand or result: 1 (float) to 4 (vec4). */
 static int value_size(const IdInfo *ids, uint32_t id, const char *stage)
 {
+    int size;
+
     if (ids[id].kind != ID_VALUE && !(ids[id].kind == ID_CONST && ids[id].compCount))
         fail("%s shader computes with something other than inputs and constants", stage);
-    if (is_float(ids, ids[id].valType))
-        return 1;
-    if (is_vec4_float(ids, ids[id].valType))
-        return 4;
-    fail("%s shader computes with a type other than float or vec4; only those are supported so far", stage);
-    return 0;
+    size = type_size(ids, ids[id].valType);
+    if (!size)
+        fail("%s shader computes with a type other than float, vec2, vec3 or vec4; only those are supported so far", stage);
+    return size;
+}
+
+/* The value that owns the register an alias (v.w, v.xyz) lives in. */
+static uint32_t root(const IdInfo *ids, uint32_t id)
+{
+    while (ids[id].aliasOf)
+        id = ids[id].aliasOf;
+    return id;
+}
+
+/* Write mask for the first n fields: "x", "xy", "xyz", "xyzw". */
+static const char *mask_n(int n)
+{
+    static const char *const masks[] = { "", "x", "xy", "xyz", "xyzw" };
+    return masks[n];
 }
 
 /* ----------------------------------------------------------------------- */
 
-/* One arithmetic instruction of a vertex shader body, in program order. */
+/*
+ * One instruction of a vertex shader body, in program order.
+ *
+ * Swizzles, constructors and component reads are all "field maps": each result
+ * field names the operand and field it copies (or the constants 0 and 1, which
+ * VF00 provides). Maps compose at parse time, so vec4(v.xyz, 1.0) is one map
+ * over v however glslang split it up, and a map nobody but another map reads
+ * emits no code.
+ */
 typedef struct {
     uint32_t op;
     uint32_t result;
-    uint32_t a, b;                  /* operand ids; b is 0 for OpFNegate */
+    uint32_t ops[4];                /* operand ids */
+    int      nops;
+    int      fieldOp[4];            /* maps: operand index per result field, or FIELD_* */
+    int      fieldComp[4];          /* maps: operand field per result field */
+    int      dead;                  /* maps: result only feeds other maps, emit nothing */
     uint32_t line;                  /* GLSL line, 0 if unknown */
 } BodyOp;
+
+enum { FIELD_ZERO = -1, FIELD_ONE = -2, FIELD_UNDEF = -3 };
+#define SHUFFLE_UNDEF 0xffffffffu
+
+static int is_map_op(uint32_t op)
+{
+    return op == OpVectorShuffle || op == OpCompositeConstruct || op == OpCompositeExtract;
+}
 
 typedef struct {
     uint32_t execModel;
@@ -217,6 +269,92 @@ typedef struct {
     BodyOp   body[MAX_BODY];
     int      bodyCount;
 } Shader;
+
+/* Where component j of value id really lives: (source id, field), seen through
+ * aliases and earlier maps. */
+typedef struct { uint32_t src; int comp; } Field;
+
+static Field field_of(const IdInfo *ids, const Shader *sh, uint32_t id, int j)
+{
+    Field fl;
+
+    if (ids[id].mapOp) {
+        const BodyOp *m = &sh->body[ids[id].mapOp - 1];
+        if (m->fieldOp[j] < 0) {
+            fl.src = 0;
+            fl.comp = m->fieldOp[j];
+            return fl;
+        }
+        return field_of(ids, sh, m->ops[m->fieldOp[j]], m->fieldComp[j]);
+    }
+    if (ids[id].aliasOf)
+        return field_of(ids, sh, ids[id].aliasOf, ids[id].comp + j);
+    /* Every load of an input reads the same register: name it by the variable so
+     * in.x and in.y loaded separately still group into one MOVE. */
+    fl.src = ids[id].kind == ID_VALUE && ids[id].fromInput >= 0 ? sh->inputs[ids[id].fromInput].var : id;
+    fl.comp = ids[id].comp + j;
+    return fl;
+}
+
+/* Defines value id (a float or vecN of `size` fields) as the given fields: a
+ * constant when every field is one, an alias when they are the leading fields of
+ * one value, else a map body op. */
+static void define_map(IdInfo *ids, Shader *sh, uint32_t op, uint32_t id, uint32_t type,
+                       const Field *fl, int size)
+{
+    int allConst = 1, aliasable = 1;
+    BodyOp *b;
+
+    ids[id].valType = type;
+    for (int j = 0; j < size; j++) {
+        if (fl[j].src && ids[fl[j].src].kind != ID_CONST)
+            allConst = 0;
+        if (fl[j].src == 0 && fl[j].comp != FIELD_UNDEF)
+            allConst = 0;
+        if (fl[j].src != fl[0].src || fl[j].src == 0 || fl[j].comp != fl[0].comp + j)
+            aliasable = 0;
+    }
+    if (allConst) {
+        ids[id].kind = ID_CONST;
+        for (int j = 0; j < size; j++)
+            ids[id].comps[j] = fl[j].src ? ids[fl[j].src].comps[fl[j].comp] : 0;
+        ids[id].compCount = size;
+        return;
+    }
+    ids[id].kind = ID_VALUE;
+    if (aliasable && (size == 1 || fl[0].comp == 0)) {
+        /* v.w or v.xyz: read in place, no code. */
+        ids[id].aliasOf = fl[0].src;
+        ids[id].comp = fl[0].comp;
+        return;
+    }
+    if (sh->bodyCount == MAX_BODY)
+        fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+    b = &sh->body[sh->bodyCount++];
+    b->op = op;
+    b->result = id;
+    b->line = g_line;
+    for (int j = 0; j < size; j++) {
+        uint32_t src = fl[j].src;
+        int k;
+        if (!src) {
+            b->fieldOp[j] = fl[j].comp;
+            continue;
+        }
+        if (ids[src].kind == ID_CONST) {
+            uint32_t bits = ids[src].comps[fl[j].comp];
+            if (!(bits & 0x7fffffff)) { b->fieldOp[j] = FIELD_ZERO; continue; }
+            if (bits == 0x3f800000) { b->fieldOp[j] = FIELD_ONE; continue; }
+        }
+        for (k = 0; k < b->nops && b->ops[k] != src; k++)
+            ;
+        if (k == b->nops)
+            b->ops[b->nops++] = src;
+        b->fieldOp[j] = k;
+        b->fieldComp[j] = fl[j].comp;
+    }
+    ids[id].mapOp = sh->bodyCount;
+}
 
 static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 {
@@ -431,11 +569,12 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 break;
             case OpLoad: {
                 uint32_t id = w[2], ptr = w[3];
-                if (ids[ptr].kind != ID_VAR || ids[ptr].fromInput < 0)
+                if ((ids[ptr].kind != ID_VAR && ids[ptr].kind != ID_PTR) || ids[ptr].fromInput < 0)
                     fail("%s shader reads something other than a vertex input", stage);
                 ids[id].kind = ID_VALUE;
                 ids[id].valType = w[1];
                 ids[id].fromInput = ids[ptr].fromInput;
+                ids[id].comp = ids[ptr].comp;   /* in.w loaded through an access chain */
                 break;
             }
             case OpFAdd: case OpFSub: case OpFMul: case OpFDiv: case OpFNegate:
@@ -449,39 +588,112 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[w[2]].valType = w[1];
                 size = value_size(ids, w[2], stage);
                 if (op == OpVectorTimesScalar) {
-                    if (value_size(ids, w[3], stage) != 4 || value_size(ids, w[4], stage) != 1)
-                        fail("corrupt SPIR-V: OpVectorTimesScalar needs a vec4 and a float");
+                    if (value_size(ids, w[3], stage) != size || value_size(ids, w[4], stage) != 1)
+                        fail("corrupt SPIR-V: OpVectorTimesScalar needs a vector and a float");
                 } else if (value_size(ids, w[3], stage) != size ||
                            (op != OpFNegate && value_size(ids, w[4], stage) != size)) {
                     fail("corrupt SPIR-V: %s operands differ in size", op_name(op));
                 }
+                /* A scalar result stays in the field its first operand uses; a division
+                 * is copied out of Q into x. */
+                if (size == 1)
+                    ids[w[2]].comp = op == OpFDiv ? 0 : ids[w[3]].comp;
                 if (sh->bodyCount == MAX_BODY)
                     fail("vertex shader is too long (max %d instructions)", MAX_BODY);
                 b = &sh->body[sh->bodyCount++];
                 b->op = op;
                 b->result = w[2];
-                b->a = w[3];
-                b->b = op == OpFNegate ? 0 : w[4];
+                b->ops[0] = w[3];
+                b->nops = 1;
+                if (op != OpFNegate)
+                    b->ops[b->nops++] = w[4];
                 b->line = g_line;
                 break;
             }
-            case OpCompositeConstruct: {
-                /* Only all-constant vectors, e.g. glslang's vec4(2.0) for 'v / 2.0'. */
-                uint32_t id = w[2];
-                if (sh->execModel != ExecVertex || n - 3 > 4)
+            case OpCompositeExtract: {
+                /* v.w */
+                uint32_t id = w[2], src = w[3];
+                Field fl[1];
+                int size;
+
+                if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
-                for (uint32_t i = 0; i < n - 3; i++) {
-                    if (ids[w[3 + i]].kind != ID_CONST || ids[w[3 + i]].compCount != 1)
-                        unsupported(op, stage);
-                    ids[id].comps[i] = ids[w[3 + i]].comps[0];
+                size = value_size(ids, src, stage);
+                if (n != 5 || size < 2 || w[4] >= (uint32_t)size || !is_float(ids, w[1]))
+                    fail("vertex shader reads a component of something other than a vector; "
+                         "only v.x .. v.w of a float vector is supported so far");
+                fl[0] = field_of(ids, sh, src, (int)w[4]);
+                define_map(ids, sh, op, id, w[1], fl, 1);
+                break;
+            }
+            case OpVectorShuffle: {
+                /* v.bgra, vec4(a, b).xz: result fields picked from two vectors. */
+                uint32_t id = w[2], v1 = w[3], v2 = w[4];
+                int size1, size2, size = (int)(n - 5);
+                Field fl[4];
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                size1 = value_size(ids, v1, stage);
+                size2 = value_size(ids, v2, stage);
+                if (size < 2 || size > 4 || type_size(ids, w[1]) != size)
+                    fail("corrupt SPIR-V: OpVectorShuffle result is not a vec2, vec3 or vec4");
+                for (int i = 0; i < size; i++) {
+                    uint32_t s = w[5 + i];
+                    if (s == SHUFFLE_UNDEF) {
+                        fl[i].src = 0;
+                        fl[i].comp = FIELD_UNDEF;
+                    } else if (s < (uint32_t)size1) {
+                        fl[i] = field_of(ids, sh, v1, (int)s);
+                    } else if (s < (uint32_t)(size1 + size2)) {
+                        fl[i] = field_of(ids, sh, v2, (int)(s - size1));
+                    } else {
+                        fail("corrupt SPIR-V: OpVectorShuffle component out of range");
+                    }
                 }
-                ids[id].kind = ID_CONST;
-                ids[id].valType = w[1];
-                ids[id].compCount = (int)(n - 3);
+                define_map(ids, sh, op, id, w[1], fl, size);
+                break;
+            }
+            case OpCompositeConstruct: {
+                /* vec4(v.xyz, 1.0), vec4(r, g, b, a): operands laid end to end. */
+                uint32_t id = w[2];
+                int size, total = 0;
+                Field fl[4];
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                size = type_size(ids, w[1]);
+                if (!size || n - 3 > 4)
+                    fail("vertex shader constructs something other than a vec2, vec3 or vec4 "
+                         "from floats and vectors; only those are supported so far");
+                for (uint32_t i = 0; i < n - 3; i++) {
+                    int k = value_size(ids, w[3 + i], stage);
+                    if (total + k > size)
+                        fail("corrupt SPIR-V: OpCompositeConstruct operands overflow the result");
+                    for (int j = 0; j < k; j++)
+                        fl[total + j] = field_of(ids, sh, w[3 + i], j);
+                    total += k;
+                }
+                if (total != size)
+                    fail("corrupt SPIR-V: OpCompositeConstruct operands do not fill the result");
+                define_map(ids, sh, op, id, w[1], fl, size);
                 break;
             }
             case OpAccessChain: {
                 uint32_t id = w[2], base = w[3];
+                if (ids[base].kind == ID_VAR && ids[base].fromInput >= 0) {
+                    /* in.w read straight from the input: glslang emits this instead of
+                     * OpCompositeExtract when debug info is on. */
+                    if (sh->execModel != ExecVertex)
+                        unsupported(OpCompositeExtract, stage);
+                    if (n != 5 || ids[w[4]].kind != ID_CONST || ids[w[4]].value >= 4)
+                        fail("vertex shader indexes an input with something other than a "
+                             "constant component; only in.x .. in.w is supported so far");
+                    ids[id].kind = ID_PTR;
+                    ids[id].fromInput = ids[base].fromInput;
+                    ids[id].comp = (int)ids[w[4]].value;
+                    break;
+                }
                 if (base != sh->positionVar || n != 5 || ids[w[4]].kind != ID_CONST)
                     fail("%s shader accesses a member or element other than gl_Position", stage);
                 {
@@ -519,6 +731,23 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         pc += n;
     }
     g_line = 0;
+
+    /* A map read only by other maps was folded into them: emit nothing for it. */
+    {
+        static int used[MAX_IDS];
+        memset(used, 0, sizeof(used));
+        for (int i = 0; i < sh->bodyCount; i++)
+            if (!is_map_op(sh->body[i].op))
+                for (int j = 0; j < sh->body[i].nops; j++)
+                    used[root(ids, sh->body[i].ops[j])] = 1;
+        if (sh->positionValue)
+            used[root(ids, sh->positionValue)] = 1;
+        if (sh->colorValue)
+            used[root(ids, sh->colorValue)] = 1;
+        for (int i = 0; i < sh->bodyCount; i++)
+            if (is_map_op(sh->body[i].op) && !used[sh->body[i].result])
+                sh->body[i].dead = 1;
+    }
 
     if (sh->execModel == ExecVertex) {
         if (!sh->positionValue)
@@ -580,11 +809,19 @@ static int reg_alloc(Regs *r)
 /* Frees a temporary after its last read (inputs and constants stay). */
 static void reg_release(Regs *r, const IdInfo *ids, uint32_t id, int at)
 {
+    id = root(ids, id);
     if (ids[id].kind == ID_VALUE && ids[id].fromInput < 0 && r->lastUse[id] <= at && r->reg[id]) {
         r->busy[r->reg[id]] = 0;
         r->reg[id] = 0;
     }
 }
+
+/* Register holding a value (an alias reads its root's register). */
+static int reg_of(const Regs *r, const IdInfo *ids, uint32_t id)
+{
+    return r->reg[root(ids, id)];
+}
+
 
 /* LOI takes the float's raw bits in hex, as VCL's output does; the comment gets the value. */
 static void loi_text(uint32_t bits, char *ins, size_t insSize, char *comment, size_t commentSize)
@@ -624,10 +861,58 @@ static void emit_constant(FILE *f, const IdInfo *c, int reg)
     }
 }
 
-static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, int a, int bb)
+/*
+ * Builds a field map into register d, one instruction per group of result
+ * fields with the same source: a masked MOVE where the fields line up, else
+ * 0 + source field broadcast; 0 and 1 come from VF00 = (0, 0, 0, 1).
+ */
+static void emit_map(FILE *f, const BodyOp *b, int d, const int *regs, int size, const char *line)
 {
     static const char field[] = "xyzw";
-    const char *dest = is_float(ids, ids[b->result].valType) ? "x" : "xyzw";
+    int done[4] = { 0, 0, 0, 0 }, first = 1;
+    char buf[64], mask[5];
+
+    for (int i = 0; i < size; i++) {
+        int op = b->fieldOp[i], sc = b->fieldComp[i], k = 0, ident = op >= 0 && sc == i;
+
+        if (done[i] || op == FIELD_UNDEF)
+            continue;
+        for (int j = i; j < size; j++) {
+            int same = b->fieldOp[j] == op &&
+                       (op < 0 || (ident ? b->fieldComp[j] == j : b->fieldComp[j] == sc));
+            if (!done[j] && same) {
+                mask[k++] = field[j];
+                done[j] = 1;
+            }
+        }
+        mask[k] = 0;
+        if (op == FIELD_ZERO) {
+            snprintf(buf, sizeof(buf), "sub.%-9s VF%02d,VF00,VF00", mask, d);
+            vu(f, buf, "NOP", first ? line : NULL);
+        } else if (op == FIELD_ONE) {
+            snprintf(buf, sizeof(buf), "addw.%-8s VF%02d,VF00,VF00w", mask, d);
+            vu(f, buf, "NOP", first ? line : NULL);
+        } else if (ident) {
+            snprintf(buf, sizeof(buf), "move.%-8s VF%02d,VF%02d", mask, d, regs[op]);
+            vu(f, "NOP", buf, first ? line : NULL);
+        } else {
+            char mn[16];
+            snprintf(mn, sizeof(mn), "add%c.%s", field[sc], mask);
+            snprintf(buf, sizeof(buf), "%-14sVF%02d,VF00,VF%02d%c", mn, d, regs[op], field[sc]);
+            vu(f, buf, "NOP", first ? line : NULL);
+        }
+        first = 0;
+    }
+}
+
+/* Emits body op b into register d; regs[] holds each operand's register. */
+static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, const int *regs)
+{
+    static const char field[] = "xyzw";
+    int size = type_size(ids, ids[b->result].valType);
+    int a = regs[0], bb = regs[1];
+    int ca = ids[b->ops[0]].comp, cb = b->nops > 1 ? ids[b->ops[1]].comp : 0;
+    const char *dest = size == 1 ? &"x\0y\0z\0w"[ca * 2] : mask_n(size);
     char buf[64], line[96];
     int i;
 
@@ -640,15 +925,24 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, int
     case OpFAdd: case OpFSub: case OpFMul: {
         const char *m = b->op == OpFAdd ? "add" : b->op == OpFSub ? "sub" : "mul";
         char mn[16];
-        snprintf(mn, sizeof(mn), "%s.%s", m, dest);
-        snprintf(buf, sizeof(buf), "%-14sVF%02d,VF%02d,VF%02d", mn, d, a, bb);
+        if (size == 1) {
+            /* d.ca = a.ca op b.cb: the second operand is broadcast from its field. */
+            snprintf(mn, sizeof(mn), "%s%c.%s", m, field[cb], dest);
+            snprintf(buf, sizeof(buf), "%-14sVF%02d,VF%02d,VF%02d%c", mn, d, a, bb, field[cb]);
+        } else {
+            snprintf(mn, sizeof(mn), "%s.%s", m, dest);
+            snprintf(buf, sizeof(buf), "%-14sVF%02d,VF%02d,VF%02d", mn, d, a, bb);
+        }
         vu(f, buf, "NOP", line);
         break;
     }
-    case OpVectorTimesScalar:
-        snprintf(buf, sizeof(buf), "mulx.xyzw     VF%02d,VF%02d,VF%02dx", d, a, bb);
+    case OpVectorTimesScalar: {
+        char mn[16];
+        snprintf(mn, sizeof(mn), "mul%c.%s", field[cb], dest);
+        snprintf(buf, sizeof(buf), "%-14sVF%02d,VF%02d,VF%02d%c", mn, d, a, bb, field[cb]);
         vu(f, buf, "NOP", line);
         break;
+    }
     case OpFNegate: {
         char mn[16];
         vu(f, "NOP", "loi           0xbf800000", line);   /* -1.0 */
@@ -659,9 +953,9 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, int
     }
     case OpFDiv:
         /* VU1 divides one component at a time into Q; copy Q out with VF00 = (0, 0, 0, 1). */
-        for (i = 0; i < (int)strlen(dest); i++) {
-            char c = field[i];
-            snprintf(buf, sizeof(buf), "div           Q,VF%02d%c,VF%02d%c", a, c, bb, c);
+        for (i = 0; i < size; i++) {
+            char c = field[i], sa = size == 1 ? field[ca] : c, sb = size == 1 ? field[cb] : c;
+            snprintf(buf, sizeof(buf), "div           Q,VF%02d%c,VF%02d%c", a, sa, bb, sb);
             vu(f, "NOP", buf, i ? NULL : line);
             vu(f, "NOP", "waitq", NULL);
             if (c == 'w')
@@ -670,6 +964,9 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, int
                 snprintf(buf, sizeof(buf), "addq.%c        VF%02d,VF00,Q", c, d);
             vu(f, buf, "NOP", NULL);
         }
+        break;
+    case OpVectorShuffle: case OpCompositeConstruct: case OpCompositeExtract:
+        emit_map(f, b, d, regs, size, line);
         break;
     }
 }
@@ -684,16 +981,14 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     /* Registers: inputs are fixed, constants live for the whole program, temporaries
      * are freed after their last read. */
     memset(&r, 0, sizeof(r));
-    for (i = 0; i < sh->bodyCount; i++) {
-        r.lastUse[sh->body[i].a] = i;
-        if (sh->body[i].b)
-            r.lastUse[sh->body[i].b] = i;
-    }
-    r.lastUse[sh->positionValue] = MAX_BODY;
+    for (i = 0; i < sh->bodyCount; i++)
+        for (int j = 0; j < sh->body[i].nops && !sh->body[i].dead; j++)
+            r.lastUse[root(ids, sh->body[i].ops[j])] = i;
+    r.lastUse[root(ids, sh->positionValue)] = MAX_BODY;
     if (sh->colorValue)
-        r.lastUse[sh->colorValue] = MAX_BODY;
+        r.lastUse[root(ids, sh->colorValue)] = MAX_BODY;
     for (i = 0; i < MAX_IDS; i++)
-        if (ids[i].kind == ID_VALUE && ids[i].fromInput >= 0)
+        if ((ids[i].kind == ID_VALUE || ids[i].kind == ID_VAR) && ids[i].fromInput >= 0)
             r.reg[i] = 10 + ids[i].fromInput;
 
     fprintf(f, "; Generated by ps2vk-shaderc from %s. Do not edit.\n", g_src);
@@ -727,20 +1022,21 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     vu(f, "NOP", "iaddiu        VI05,VI04,1", "output pointer");
 
     for (i = 0; i <= sh->bodyCount + 1; i++) {
-        uint32_t use[2] = { 0, 0 };
+        uint32_t use[4] = { 0, 0, 0, 0 };
         if (i < sh->bodyCount) {
-            use[0] = sh->body[i].a;
-            use[1] = sh->body[i].b;
+            for (int j = 0; j < sh->body[i].nops && !sh->body[i].dead; j++)
+                use[j] = sh->body[i].ops[j];
         } else {
             use[0] = i == sh->bodyCount ? sh->positionValue : sh->colorValue;
         }
-        for (int j = 0; j < 2; j++) {
-            if (!use[j] || ids[use[j]].kind != ID_CONST || r.reg[use[j]])
+        for (int j = 0; j < 4; j++) {
+            uint32_t c = use[j] ? root(ids, use[j]) : 0;
+            if (!c || ids[c].kind != ID_CONST || r.reg[c])
                 continue;
             if (!constants++)
                 fprintf(f, "; constants\n");
-            r.reg[use[j]] = reg_alloc(&r);
-            emit_constant(f, &ids[use[j]], r.reg[use[j]]);
+            r.reg[c] = reg_alloc(&r);
+            emit_constant(f, &ids[c], r.reg[c]);
         }
     }
 
@@ -755,19 +1051,28 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, "; shader body\n");
     for (i = 0; i < sh->bodyCount; i++) {
         const BodyOp *b = &sh->body[i];
-        int a = r.reg[b->a], bb = b->b ? r.reg[b->b] : 0, d;
+        /* Shuffles and constructors read fields they have already written if the
+         * result shares an operand's register, so they get a distinct one. */
+        int distinct = is_map_op(b->op), d = 0;
+        int regs[4] = { 0, 0, 0, 0 };
 
-        reg_release(&r, ids, b->a, i);
-        if (b->b)
-            reg_release(&r, ids, b->b, i);
-        d = r.reg[b->result] = reg_alloc(&r);
-        emit_body_op(f, ids, b, d, a, bb);
+        if (b->dead)
+            continue;
+        for (int j = 0; j < b->nops; j++)
+            regs[j] = reg_of(&r, ids, b->ops[j]);
+        if (distinct)
+            d = r.reg[b->result] = reg_alloc(&r);
+        for (int j = 0; j < b->nops; j++)
+            reg_release(&r, ids, b->ops[j], i);
+        if (!distinct)
+            d = r.reg[b->result] = reg_alloc(&r);
+        emit_body_op(f, ids, b, d, regs);
         reg_release(&r, ids, b->result, i);   /* never read */
     }
-    snprintf(buf, sizeof(buf), "move.xyzw     VF20,VF%02d", r.reg[sh->positionValue]);
+    snprintf(buf, sizeof(buf), "move.xyzw     VF20,VF%02d", reg_of(&r, ids, sh->positionValue));
     vu(f, "NOP", buf, "gl_Position");
     if (sh->colorValue) {
-        snprintf(buf, sizeof(buf), "move.xyzw     VF21,VF%02d", r.reg[sh->colorValue]);
+        snprintf(buf, sizeof(buf), "move.xyzw     VF21,VF%02d", reg_of(&r, ids, sh->colorValue));
         snprintf(buf2, sizeof(buf2), "color output, location %d", sh->colorLocation);
         vu(f, "NOP", buf, buf2);
     } else {

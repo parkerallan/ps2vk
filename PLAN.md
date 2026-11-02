@@ -96,7 +96,7 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | ✓ | `outColor = vColor` fragment shaders | `OpLoad`/`OpStore` | GS `PRIM.IIP` (Gouraud) |
 | ✓ | Errors with line numbers and reasons | Any unsupported opcode | Build-time error |
 | ✓ | Arithmetic | `OpFAdd`, `OpFSub`, `OpFMul`, `OpFDiv`, `OpFNegate`, `OpVectorTimesScalar`, float/vec4 constants | VU1 `ADD`, `SUB`, `MUL`, `MULx` broadcast, `DIV` per component through Q; constants loaded once with `LOI`. *Vertex shaders only: the GS can't compute per pixel* |
-| | Swizzles, constructors, component access | `OpVectorShuffle`, `OpCompositeConstruct`, `OpCompositeExtract` | VU1 field masks (`.xyz`), `MR32`, broadcast operands |
+| ✓ | Swizzles, constructors, component access | `OpVectorShuffle`, `OpCompositeConstruct`, `OpCompositeExtract` | Composed into one per-field map at compile time: `v.w` and `v.xyz` are read in place (broadcast operands, write masks); anything else is a grouped masked `MOVE` or `ADD` from `VF00`, which also supplies 0 and 1 |
 | | Matrices and matrix × vector | `OpMatrixTimesVector`, `OpTypeMatrix` | VU1 `MULA`/`MADDA`/`MADD` chain (4 instructions) |
 | | Built-in functions | `OpExtInst` GLSL.std.450 (`Normalize`, `Pow`, `Sin`, …), `OpDot` | VU1 `DIV`/`SQRT`/`RSQRT`, EFU (`ESIN`, `EEXP`, `ERSQRT`, …) |
 | | Uniform blocks and push constants | `OpVariable` `Uniform`/`PushConstant` | Loads from the VU1 context area defined by the pipeline layout |
