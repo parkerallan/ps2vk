@@ -1,0 +1,1 @@
+mat_too_large.vert: error: push constant block 'pc' is 192 bytes; ps2vk reserves 128 bytes of VU1 memory for push constants

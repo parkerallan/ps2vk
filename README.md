@@ -16,11 +16,11 @@ Those coming from Vulkan will find the same design pattern, where we write a com
 | `VkCommandBuffer` | `PvkCommandBuffer` | A VIF1 DMA chain in main RAM |
 | `vkCmdBeginRendering` | `pvkCmdBeginRendering` | GS `FRAME`, `ZBUF`, `SCISSOR`, `XYOFFSET`; a clear is a rectangle draw |
 | `VkFence` | `PvkFence` | GS `FINISH` signal |
-| `VkSwapchainKHR` | `PvkSwapchain` | Framebuffers in VRAM, switched with `DISPFB` at vsync |
+| `VkSwapchainKHR` | `PvkSwapchain` | Framebuffers in VRAM, switched with `DISPFB` at vsync; NTSC, PAL or 480p like a `VK_KHR_display` mode |
 
 ## Status
 
-Draws a Gouraud-shaded triangle from GLSL vertex and fragment shaders, running in PCSX2.
+Draws a Gouraud-shaded triangle from GLSL vertex and fragment shaders, running in PCSX2. Vertex shaders can currently use vector arithmetic, swizzles and constructors, push constants, and matrix × vector products.
 
 ## Setup
 

@@ -1,7 +1,8 @@
 /*
  * ps2vk triangle sample: clear the screen and draw one triangle whose
  * corners are red, green and blue, using only ps2vk calls. The triangle
- * circles the screen: its position is a push constant set every frame.
+ * circles the screen: its position is a translation in a mat4 push constant
+ * set every frame, and the vertex shader multiplies each position by it.
  */
 #include <math.h>
 #include <stdio.h>
@@ -54,6 +55,7 @@ int main(void)
 
     PvkSwapchainCreateInfo swapchainInfo = {
         .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_CT32, .imageCount = 2,
+        .displayMode = PVK_DISPLAY_MODE_NTSC, /* 480i: presents on even fields, 30 frames */
     };
     CHECK(pvkCreateSwapchain(device, &swapchainInfo, &swapchain));
     CHECK(pvkGetSwapchainImages(device, swapchain, &imageCount, images));
@@ -91,9 +93,14 @@ int main(void)
 
     for (unsigned frame = 0;; frame++) {
         uint32_t imageIndex;
-        /* One lap every 4 seconds at 60 Hz, in clip space (y down). */
+        /* One lap every 4 seconds at 60 Hz; the offset is the column-major mat4's last column. */
         float angle = (float)frame * (2.0f * 3.14159265f / 240.0f);
-        float offset[4] = { 0.3f * cosf(angle), 0.3f * sinf(angle), 0.0f, 0.0f };
+        float mvp[16] = {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.3f * cosf(angle), 0.3f * sinf(angle), 0.0f, 1.0f
+        };
 
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
@@ -108,7 +115,7 @@ int main(void)
         };
         pvkCmdBeginRendering(cmd, &rendering);
         pvkCmdBindPipeline(cmd, pipeline);
-        pvkCmdPushConstants(cmd, 0, sizeof(offset), offset);
+        pvkCmdPushConstants(cmd, 0, sizeof(mvp), mvp);
         pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
         pvkCmdDraw(cmd, 3, 0);
         pvkCmdEndRendering(cmd);

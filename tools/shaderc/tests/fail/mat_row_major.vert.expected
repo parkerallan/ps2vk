@@ -1,0 +1,1 @@
+mat_row_major.vert: error: member 0 of push constant block 'pc' is a row_major matrix; VU1 multiplies by columns, so leave the block column-major (the default)

@@ -53,6 +53,7 @@ struct PvkSwapchain_T {
     uint32_t          width, height;
     uint32_t          imageCount;
     uint32_t          nextImage;
+    int               interlaced;  /* flip only on even fields, so both fields show one frame */
     struct PvkImage_T images[PVK_MAX_SWAPCHAIN_IMAGES];
 };
 

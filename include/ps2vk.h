@@ -125,18 +125,35 @@ typedef struct PvkSwapchain_T     *PvkSwapchain;
 /** @brief An image in GS VRAM, such as a swapchain framebuffer. */
 typedef struct PvkImage_T         *PvkImage;
 
+/**
+ * @brief The video mode the swapchain is shown in, like a VK_KHR_display mode.
+ *
+ * Interlaced modes show one framebuffer for both fields of a picture, so they
+ * present at most 30 (NTSC) or 25 (PAL) frames a second. Progressive 480p
+ * presents up to 60 and needs a display that accepts it, which PCSX2 and
+ * component or HDMI outputs do.
+ */
+typedef enum PvkDisplayMode {
+    PVK_DISPLAY_MODE_AUTO = 0, /**< The console's region: NTSC or PAL, interlaced. */
+    PVK_DISPLAY_MODE_NTSC,     /**< 480i: 640x448, 60 fields a second. */
+    PVK_DISPLAY_MODE_PAL,      /**< 576i: 640x512, 50 fields a second. */
+    PVK_DISPLAY_MODE_480P      /**< 480p: 640x448 progressive, 60 frames a second. */
+} PvkDisplayMode;
+
 /** @brief Parameters for pvkCreateSwapchain(). */
 typedef struct PvkSwapchainCreateInfo {
-    uint32_t  width;      /**< Width in pixels, e.g. 640. */
-    uint32_t  height;     /**< Height in pixels, e.g. 448. */
-    PvkFormat format;     /**< Must be PVK_FORMAT_CT32. */
-    uint32_t  imageCount; /**< Must be 2. */
+    uint32_t       width;       /**< Width in pixels, e.g. 640. */
+    uint32_t       height;      /**< Height in pixels, e.g. 448. */
+    PvkFormat      format;      /**< Must be PVK_FORMAT_CT32. */
+    uint32_t       imageCount;  /**< Must be 2. */
+    PvkDisplayMode displayMode; /**< Video mode; 0 is PVK_DISPLAY_MODE_AUTO. */
 } PvkSwapchainCreateInfo;
 
 /**
  * @brief Allocates the swapchain framebuffers in GS VRAM and turns on video output.
  *
- * Image 0 is shown first, so the first image to render into is image 1.
+ * Image 0 is shown first, so the first image to render into is image 1. The
+ * video mode is set from PvkSwapchainCreateInfo::displayMode.
  *
  * @param device The device.
  * @param info Swapchain parameters.
@@ -472,7 +489,8 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline);
  * @param cmd The command buffer.
  * @param offset Byte offset into the push constant range; a multiple of 4.
  * @param size Bytes to write; a multiple of 4, offset + size at most PVK_MAX_PUSH_CONSTANT_BYTES.
- * @param data The values, laid out as in the shader's block (std430).
+ * @param data The values, laid out as in the shader's block (std430): a mat4 is
+ *             its four columns, 16 bytes each, column-major as GLSL stores it.
  */
 void pvkCmdPushConstants(PvkCommandBuffer cmd, uint32_t offset, uint32_t size, const void *data);
 

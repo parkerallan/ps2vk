@@ -62,7 +62,7 @@ Status: ✓ = implemented. *Italic notes* mark features the PS2 can't do nativel
 | | Load/store ops | `VkAttachmentLoadOp`, `VkAttachmentStoreOp` | `PvkAttachmentLoadOp`, `PvkAttachmentStoreOp` | Clear = sprite fill; load/store/don't care = nothing (GS draws straight into VRAM) |
 | | Color write mask | `VkPipelineColorBlendAttachmentState.colorWriteMask` | Same field | GS `FRAME.FBMSK` |
 | | Scissor rectangles | `VkPipelineViewportStateCreateInfo`, `vkCmdSetScissor` | Pipeline field + `pvkCmdSetScissor` | GS `SCISSOR` |
-| | Video modes: NTSC, PAL, 480p | `VkSurfaceKHR`, `VK_KHR_display` display modes | `PvkSwapchainCreateInfo` video mode field | `SetGsCrt` / `graph_set_mode`, GS `SMODE`/`DISPLAY` |
+| ✓ | Video modes: NTSC, PAL, 480p | `VkSurfaceKHR`, `VK_KHR_display` display modes | `PvkDisplayMode` in `PvkSwapchainCreateInfo` (auto, NTSC, PAL, 480p) | `graph_set_mode`; interlaced modes are field mode and present only on even fields (`CSR.FIELD`), so both fields show one frame; 480p flips every vsync |
 | | Triple buffering, immediate present | `VkPresentModeKHR` (`FIFO`, `MAILBOX`, `IMMEDIATE`), `minImageCount` | `PvkPresentMode`, `imageCount` up to 3 | 3 framebuffers; immediate = write `DISPFB` without waiting for vsync |
 | | Custom resolutions and widescreen | `VkSwapchainCreateInfoKHR.imageExtent` | Swapchain width/height | Framebuffer size + GS `DISPLAY` magnification |
 | | 16-bit framebuffers: half the VRAM | `VK_FORMAT_A1R5G5B5_UNORM_PACK16` | `PVK_FORMAT_CT16` | GS `PSMCT16` |
@@ -97,7 +97,7 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | ✓ | Errors with line numbers and reasons | Any unsupported opcode | Build-time error |
 | ✓ | Arithmetic | `OpFAdd`, `OpFSub`, `OpFMul`, `OpFDiv`, `OpFNegate`, `OpVectorTimesScalar`, float/vec4 constants | VU1 `ADD`, `SUB`, `MUL`, `MULx` broadcast, `DIV` per component through Q; constants loaded once with `LOI`. *Vertex shaders only: the GS can't compute per pixel* |
 | ✓ | Swizzles, constructors, component access | `OpVectorShuffle`, `OpCompositeConstruct`, `OpCompositeExtract` | Composed into one per-field map at compile time: `v.w` and `v.xyz` are read in place (broadcast operands, write masks); anything else is a grouped masked `MOVE` or `ADD` from `VF00`, which also supplies 0 and 1 |
-| | Matrices and matrix × vector | `OpMatrixTimesVector`, `OpTypeMatrix` | VU1 `MULA`/`MADDA`/`MADD` chain (4 instructions) |
+| ✓ | Matrices and matrix × vector | `OpMatrixTimesVector`, `OpTypeMatrix` | VU1 `MULA`/`MADDA`/`MADD` chain, one instruction per column, the vector's field broadcast; push constant and constant matrices, column-major with 16-byte columns (std430), so a mat4 is 4 push qwords and `m[c]` reads one |
 | | Built-in functions | `OpExtInst` GLSL.std.450 (`Normalize`, `Pow`, `Sin`, …), `OpDot` | VU1 `DIV`/`SQRT`/`RSQRT`, EFU (`ESIN`, `EEXP`, `ERSQRT`, …) |
 | ✓ | Push constants | `OpVariable` `PushConstant`, `OpAccessChain` with constant indices, `OpLoad` | Each qword the shader reads is loaded once in the prologue (`LQ` from the push range) and read in place; float/vec2/vec3/vec4 members and arrays of them, 128 bytes max |
 | | Uniform blocks | `OpVariable` `Uniform` | Loads from the VU1 context area defined by the pipeline layout |
@@ -130,7 +130,7 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | Status | Sample | Exercises |
 | --- | --- | --- |
 | ✓ | Clear | Swapchain, rendering, fences |
-| ✓ | Triangle | Pipeline, vertex buffer, shaders, push constants (the triangle circles the screen) |
+| ✓ | Triangle | Pipeline, vertex buffer, shaders, a mat4 push constant (the triangle circles the screen), NTSC display mode |
 | | Textured cube | Depth buffer, textures, uniforms, indexed drawing |
 | | Lighting | Light uniforms, per-vertex lighting |
 | | Skinning | Bone matrices, animation |

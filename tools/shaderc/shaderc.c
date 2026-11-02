@@ -7,10 +7,10 @@
  * This version accepts:
  *
  *   vertex:   gl_Position and an optional color output computed from vec4 inputs,
- *             push constants (a block of float/vec2/vec3/vec4 members and arrays
- *             of them, up to 128 bytes) and float/vec4 constants with +, -, *, /
- *             and negation, swizzles (v.xyz, v.bgra), component reads (v.w) and
- *             vector constructors
+ *             push constants (a block of float/vec2/vec3/vec4/matrix members and
+ *             arrays of vectors, up to 128 bytes) and float/vec4/matrix constants
+ *             with +, -, *, / and negation, matrix * vector, swizzles (v.xyz,
+ *             v.bgra), component reads (v.w) and vector constructors
  *   fragment: <color output> = <interpolated color input>;
  *
  * Anything else is rejected with an error that says why, the way a Vulkan
@@ -30,6 +30,7 @@
 #define MAX_INPUTS  8
 #define MAX_OUTPUTS 8
 #define MAX_BODY    256
+#define MAX_OPERANDS 5
 
 /* SPIR-V opcodes used here (SPIR-V 1.x specification). */
 enum {
@@ -43,15 +44,18 @@ enum {
     OpConstantComposite = 44, OpFunction = 54, OpFunctionParameter = 55, OpFunctionEnd = 56,
     OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
     OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
-    OpCompositeExtract = 81, OpSampledImage = 86, OpImageSampleImplicitLod = 87,
+    OpCompositeExtract = 81, OpTranspose = 84, OpSampledImage = 86,
+    OpImageSampleImplicitLod = 87,
     OpFNegate = 127, OpFAdd = 129, OpFSub = 131, OpFMul = 133, OpFDiv = 136,
-    OpVectorTimesScalar = 142, OpMatrixTimesVector = 145, OpDot = 148,
+    OpVectorTimesScalar = 142, OpMatrixTimesScalar = 143, OpVectorTimesMatrix = 144,
+    OpMatrixTimesVector = 145, OpMatrixTimesMatrix = 146, OpOuterProduct = 147, OpDot = 148,
     OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249,
     OpBranchConditional = 250, OpKill = 252, OpReturn = 253, OpReturnValue = 254,
     OpNoLine = 317, OpModuleProcessed = 330
 };
 
-enum { DecBlock = 2, DecArrayStride = 6, DecBuiltIn = 11, DecLocation = 30, DecOffset = 35 };
+enum { DecBlock = 2, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
+       DecBuiltIn = 11, DecLocation = 30, DecOffset = 35 };
 enum { BuiltInPosition = 0 };
 enum { ScUniformConstant = 0, ScInput = 1, ScUniform = 2, ScOutput = 3, ScFunction = 7,
        ScPushConstant = 9, ScStorageBuffer = 12 };
@@ -59,18 +63,18 @@ enum { ExecVertex = 0, ExecFragment = 4 };
 
 /* What we know about each SPIR-V result id. */
 typedef enum { ID_NONE, ID_TYPE, ID_CONST, ID_VAR, ID_VALUE, ID_PTR } IdKind;
-typedef enum { T_OTHER, T_FLOAT, T_INT, T_VECTOR, T_STRUCT, T_POINTER, T_ARRAY } TypeKind;
+typedef enum { T_OTHER, T_FLOAT, T_INT, T_VECTOR, T_MATRIX, T_STRUCT, T_POINTER, T_ARRAY } TypeKind;
 
 typedef struct {
     IdKind   kind;
     /* types */
     TypeKind type;
     uint32_t width;          /* float/int bits */
-    uint32_t elemType;       /* vector component type, pointer pointee, array element */
-    uint32_t elemCount;      /* vector size, array length */
+    uint32_t elemType;       /* vector component type, matrix column type, pointer pointee, array element */
+    uint32_t elemCount;      /* vector size, matrix columns, array length */
     uint32_t stride;         /* array: bytes per element (ArrayStride) */
     uint32_t storage;        /* pointer storage class */
-    const uint32_t *members; /* struct: member type ids */
+    const uint32_t *members; /* struct: member type ids; matrix constant: column constant ids */
     int      memberCount;
     /* constants and values */
     uint32_t value;
@@ -98,10 +102,12 @@ typedef struct {
     uint32_t var;
 } Var;
 
-/* OpMemberDecorate Offset: byte offset of each struct member (push constant blocks). */
-#define MAX_MEMBER_OFFSETS 256
-static struct { uint32_t structType, member, offset; } g_memberOffsets[MAX_MEMBER_OFFSETS];
-static int g_memberOffsetCount;
+/* OpMemberDecorate on struct members (push constant blocks): byte Offset, and
+ * for matrix members their MatrixStride and RowMajor/ColMajor layout. */
+#define MAX_MEMBER_DECORS 256
+typedef struct { uint32_t structType, member, offset, matrixStride; int hasOffset, rowMajor; } MemberDecor;
+static MemberDecor g_memberDecors[MAX_MEMBER_DECORS];
+static int g_memberDecorCount;
 
 static const char *g_src = "shader";
 static const char *g_file = NULL;    /* from OpLine/OpString, if present */
@@ -139,6 +145,11 @@ static const char *op_name(uint32_t op)
     case OpFDiv: return "OpFDiv (division)";
     case OpVectorTimesScalar: return "OpVectorTimesScalar (vector * scalar)";
     case OpMatrixTimesVector: return "OpMatrixTimesVector (matrix * vector)";
+    case OpVectorTimesMatrix: return "OpVectorTimesMatrix (vector * matrix: write it as matrix * vector)";
+    case OpMatrixTimesMatrix: return "OpMatrixTimesMatrix (matrix * matrix: multiply once on the CPU and push the product)";
+    case OpMatrixTimesScalar: return "OpMatrixTimesScalar (matrix * scalar: scale the matrix on the CPU)";
+    case OpTranspose: return "OpTranspose (transpose: do it on the CPU)";
+    case OpOuterProduct: return "OpOuterProduct (outer product)";
     case OpDot: return "OpDot (dot product)";
     case OpBranch: case OpBranchConditional: case OpSelectionMerge: case OpLoopMerge:
         return "control flow (if/else or loops)";
@@ -161,8 +172,8 @@ static void unsupported(uint32_t op, const char *stage)
         fail("fragment shader uses %s: the GS cannot run code per pixel. "
              "Only 'outColor = <interpolated color input>;' is supported so far", what);
     fail("vertex shader uses %s, which this version of ps2vk-shaderc does not "
-         "compile yet. Only +, -, *, /, negation, swizzles and vector constructors "
-         "of inputs, push constants and constants are supported so far", what);
+         "compile yet. Only +, -, *, /, negation, matrix * vector, swizzles and vector "
+         "constructors of inputs, push constants and constants are supported so far", what);
 }
 
 static uint32_t *read_spirv(const char *path, size_t *words)
@@ -253,7 +264,7 @@ static const char *mask_n(int n)
 typedef struct {
     uint32_t op;
     uint32_t result;
-    uint32_t ops[4];                /* operand ids */
+    uint32_t ops[MAX_OPERANDS];     /* operand ids: up to 4 columns and a vector */
     int      nops;
     int      fieldOp[4];            /* maps: operand index per result field, or FIELD_* */
     int      fieldComp[4];          /* maps: operand field per result field */
@@ -320,14 +331,42 @@ static Field field_of(const IdInfo *ids, const Shader *sh, uint32_t id, int j)
     return fl;
 }
 
+/* The decorations of a struct member; NULL if it has none and create is 0. */
+static MemberDecor *member_decor(uint32_t structType, uint32_t member, int create)
+{
+    MemberDecor *d;
+
+    for (int i = 0; i < g_memberDecorCount; i++)
+        if (g_memberDecors[i].structType == structType && g_memberDecors[i].member == member)
+            return &g_memberDecors[i];
+    if (!create)
+        return NULL;
+    if (g_memberDecorCount == MAX_MEMBER_DECORS)
+        fail("shader has too many block members (max %d)", MAX_MEMBER_DECORS);
+    d = &g_memberDecors[g_memberDecorCount++];
+    memset(d, 0, sizeof(*d));
+    d->structType = structType;
+    d->member = member;
+    return d;
+}
+
 /* Byte offset of a struct member, from its Offset decoration. */
 static uint32_t member_offset(uint32_t structType, uint32_t member)
 {
-    for (int i = 0; i < g_memberOffsetCount; i++)
-        if (g_memberOffsets[i].structType == structType && g_memberOffsets[i].member == member)
-            return g_memberOffsets[i].offset;
-    fail("corrupt SPIR-V: push constant member %u has no Offset decoration", (unsigned)member);
-    return 0;
+    const MemberDecor *d = member_decor(structType, member, 0);
+
+    if (!d || !d->hasOffset)
+        fail("corrupt SPIR-V: push constant member %u has no Offset decoration", (unsigned)member);
+    return d->offset;
+}
+
+/* Columns of a matCxR type (2..4), or 0 if the type is not a float matrix. */
+static int matrix_cols(const IdInfo *ids, uint32_t type)
+{
+    const IdInfo *t = &ids[type];
+    if (t->type != T_MATRIX || t->elemCount < 2 || t->elemCount > 4 || type_size(ids, t->elemType) < 2)
+        return 0;
+    return (int)t->elemCount;
 }
 
 /* Checks a push constant block: members are float, vec2, vec3, vec4 or arrays of
@@ -345,16 +384,33 @@ static uint32_t check_push_block(const IdInfo *ids, uint32_t structType, const c
         if (ids[t].type == T_ARRAY) {
             if (!type_size(ids, ids[t].elemType))
                 fail("member %d of push constant block '%s' is an array of something other than "
-                     "float, vec2, vec3 or vec4, which is not supported yet", m, name);
+                     "float, vec2, vec3 or vec4, which is not supported yet%s", m, name,
+                     matrix_cols(ids, ids[t].elemType) ? " (arrays of matrices come with skinning)" : "");
             end = off + ids[t].stride * ids[t].elemCount;
         } else if (type_size(ids, t)) {
             end = off + 4 * (uint32_t)type_size(ids, t);
+        } else if (matrix_cols(ids, t)) {
+            /* VU1 reads a column per qword and broadcasts the vector's fields over
+             * them, so the columns must be the qwords: column-major, 16 bytes apart
+             * (what std430 gives every matCxR). */
+            const MemberDecor *d = member_decor(structType, (uint32_t)m, 0);
+            if (d->rowMajor)
+                fail("member %d of push constant block '%s' is a row_major matrix; VU1 "
+                     "multiplies by columns, so leave the block column-major (the default)",
+                     m, name);
+            if (d->matrixStride != 16)
+                fail("corrupt SPIR-V: matrix member %d of push constant block '%s' has a "
+                     "column stride of %u bytes, not 16", m, name, (unsigned)d->matrixStride);
+            if (off % 16)
+                fail("member %d of push constant block '%s' is a matrix at byte %u, which is "
+                     "not 16-byte aligned", m, name, (unsigned)off);
+            end = off + 16 * (uint32_t)matrix_cols(ids, t);
         } else if (ids[t].type == T_INT && ids[t].width == 32) {
             end = off + 4;   /* may be declared; using it in arithmetic is rejected */
         } else {
             fail("member %d of push constant block '%s' is something other than float, "
-                 "vec2, vec3, vec4, int or an array of vectors (matrices and nested blocks "
-                 "are not supported yet)", m, name);
+                 "vec2, vec3, vec4, a matrix, int or an array of vectors (arrays of "
+                 "matrices and nested blocks are not supported yet)", m, name);
         }
         if (end > bytes)
             bytes = end;
@@ -484,12 +540,13 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             if (w[3] == DecBuiltIn && w[4] == BuiltInPosition) {
                 ids[w[1]].structPosMember = (int)w[2];
             } else if (w[3] == DecOffset) {
-                if (g_memberOffsetCount == MAX_MEMBER_OFFSETS)
-                    fail("shader has too many block members (max %d)", MAX_MEMBER_OFFSETS);
-                g_memberOffsets[g_memberOffsetCount].structType = w[1];
-                g_memberOffsets[g_memberOffsetCount].member = w[2];
-                g_memberOffsets[g_memberOffsetCount].offset = w[4];
-                g_memberOffsetCount++;
+                MemberDecor *d = member_decor(w[1], w[2], 1);
+                d->offset = w[4];
+                d->hasOffset = 1;
+            } else if (w[3] == DecMatrixStride) {
+                member_decor(w[1], w[2], 1)->matrixStride = w[4];
+            } else if (w[3] == DecRowMajor) {
+                member_decor(w[1], w[2], 1)->rowMajor = 1;
             }
             break;
         case OpTypeFloat:
@@ -515,7 +572,11 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_POINTER;
             ids[w[1]].storage = w[2]; ids[w[1]].elemType = w[3];
             break;
-        case OpTypeImage: case OpTypeSampler: case OpTypeSampledImage: case OpTypeMatrix:
+        case OpTypeMatrix:
+            ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_MATRIX;
+            ids[w[1]].elemType = w[2]; ids[w[1]].elemCount = w[3];
+            break;
+        case OpTypeImage: case OpTypeSampler: case OpTypeSampledImage:
         case OpTypeVoid: case OpTypeBool: case OpTypeRuntimeArray:
         case OpTypeFunction:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_OTHER;
@@ -536,6 +597,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 for (uint32_t i = 0; i < n - 3; i++)
                     ids[id].comps[i] = ids[w[3 + i]].comps[0];
                 ids[id].compCount = (int)(n - 3);
+            } else if (ids[w[1]].type == T_MATRIX) {
+                /* A constant matrix: its columns are vector constants of their own. */
+                ids[id].members = &w[3];
+                ids[id].memberCount = (int)(n - 3);
             }
             break;
         }
@@ -676,6 +741,11 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     int size = type_size(ids, w[1]);
                     ids[id].kind = ID_VALUE;
                     ids[id].valType = w[1];
+                    if (matrix_cols(ids, w[1])) {
+                        /* A whole matrix: its columns are the qwords from fromPush on. */
+                        ids[id].fromPush = ids[ptr].fromPush;
+                        break;
+                    }
                     if (size > 1 && ids[ptr].comp) {
                         /* ...unless it is a vec2/vec3 past field x (vec2 at offset 8):
                          * arithmetic expects vectors in the leading fields, so copy it. */
@@ -732,6 +802,46 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 b->line = g_line;
                 break;
             }
+            case OpMatrixTimesVector: {
+                /* m * v: one multiply-add per column, summed in the accumulator. The
+                 * columns are plain vec operands (push constant qwords or vector
+                 * constants), so the register allocator treats them like any other. */
+                uint32_t id = w[2], m = w[3], v = w[4];
+                int cols = matrix_cols(ids, ids[m].valType), rows, size;
+                BodyOp *b;
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                if (!cols)
+                    fail("corrupt SPIR-V: OpMatrixTimesVector operand is not a float matrix");
+                rows = type_size(ids, ids[ids[m].valType].elemType);
+                ids[id].kind = ID_VALUE;
+                ids[id].valType = w[1];
+                size = type_size(ids, w[1]);
+                if (size != rows || value_size(ids, v, stage) != cols)
+                    fail("corrupt SPIR-V: OpMatrixTimesVector sizes do not match");
+                if (sh->bodyCount == MAX_BODY)
+                    fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+                b = &sh->body[sh->bodyCount++];
+                b->op = op;
+                b->result = id;
+                b->line = g_line;
+                if (ids[m].kind == ID_CONST) {
+                    if (ids[m].memberCount != cols)
+                        fail("corrupt SPIR-V: constant matrix has the wrong number of columns");
+                    for (int c = 0; c < cols; c++)
+                        b->ops[c] = ids[m].members[c];
+                } else if (ids[m].kind == ID_VALUE && ids[m].fromPush >= 0) {
+                    for (int c = 0; c < cols; c++)
+                        b->ops[c] = sh->pushBase + (uint32_t)(ids[m].fromPush + c);
+                } else {
+                    fail("vertex shader multiplies by a matrix that is neither a push constant "
+                         "nor a constant; only those are supported so far");
+                }
+                b->ops[cols] = v;
+                b->nops = cols + 1;
+                break;
+            }
             case OpCompositeExtract: {
                 /* v.w */
                 uint32_t id = w[2], src = w[3];
@@ -785,6 +895,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 size = type_size(ids, w[1]);
+                if (ids[w[1]].type == T_MATRIX)
+                    fail("vertex shader builds a matrix from values computed at run time; "
+                         "only push constant and constant matrices are supported so far");
                 if (!size || n - 3 > 4)
                     fail("vertex shader constructs something other than a vec2, vec3 or vec4 "
                          "from floats and vectors; only those are supported so far");
@@ -826,6 +939,13 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                                      "of %u", (unsigned)v, (unsigned)ids[type].elemCount);
                             off += ids[type].stride * v;
                             type = ids[type].elemType;
+                        } else if (ids[type].type == T_MATRIX) {
+                            /* pc.m[c]: column c is the c-th qword of the matrix. */
+                            if (v >= ids[type].elemCount)
+                                fail("vertex shader reads column %u of a push constant matrix "
+                                     "with %u columns", (unsigned)v, (unsigned)ids[type].elemCount);
+                            off += 16 * v;
+                            type = ids[type].elemType;
                         } else if (ids[type].type == T_VECTOR) {
                             if (v >= ids[type].elemCount)
                                 fail("corrupt SPIR-V: push constant component index out of range");
@@ -834,6 +954,17 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                         } else {
                             fail("corrupt SPIR-V: push constant access chain indexes a scalar");
                         }
+                    }
+                    if (matrix_cols(ids, type)) {
+                        /* pc.m as a whole, for matrix * vector: every column's qword is used. */
+                        int cols = matrix_cols(ids, type);
+                        if (off + 16 * (uint32_t)cols > sh->pushBytes)
+                            fail("corrupt SPIR-V: push constant read past the end of the block");
+                        ids[id].kind = ID_PTR;
+                        ids[id].fromPush = (int)(off / 16);
+                        for (int c = 0; c < cols; c++)
+                            sh->pushUsed[off / 16 + (uint32_t)c] = 1;
+                        break;
                     }
                     size = type_size(ids, type);
                     if (!size && ids[type].type == T_INT)
@@ -1083,6 +1214,7 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, con
     static const char field[] = "xyzw";
     int size = type_size(ids, ids[b->result].valType);
     int a = regs[0], bb = regs[1];
+    int cols = b->nops - 1, vreg = regs[cols];   /* matrix * vector */
     int ca = ids[b->ops[0]].comp, cb = b->nops > 1 ? ids[b->ops[1]].comp : 0;
     const char *dest = size == 1 ? &"x\0y\0z\0w"[ca * 2] : mask_n(size);
     char buf[64], line[96];
@@ -1135,6 +1267,21 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, con
             else
                 snprintf(buf, sizeof(buf), "addq.%c        VF%02d,VF00,Q", c, d);
             vu(f, buf, "NOP", NULL);
+        }
+        break;
+    case OpMatrixTimesVector:
+        /* d = c0 * v.x + c1 * v.y + ...: MULA starts the accumulator, MADDA adds to
+         * it, MADD adds the last column and writes the result. */
+        for (i = 0; i < cols; i++) {
+            const char *m = i == 0 ? "mula" : i == cols - 1 ? "madd" : "madda";
+            char mn[16], dst[8];
+            snprintf(mn, sizeof(mn), "%s%c.%s", m, field[i], dest);
+            if (i == cols - 1)
+                snprintf(dst, sizeof(dst), "VF%02d", d);
+            else
+                snprintf(dst, sizeof(dst), "ACC");
+            snprintf(buf, sizeof(buf), "%-14s%s,VF%02d,VF%02d%c", mn, dst, regs[i], vreg, field[i]);
+            vu(f, buf, "NOP", i ? NULL : line);
         }
         break;
     case OpVectorShuffle: case OpCompositeConstruct: case OpCompositeExtract:
@@ -1208,14 +1355,14 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     vu(f, "NOP", "iaddiu        VI05,VI04,1", "output pointer");
 
     for (i = 0; i <= sh->bodyCount + 1; i++) {
-        uint32_t use[4] = { 0, 0, 0, 0 };
+        uint32_t use[MAX_OPERANDS] = { 0 };
         if (i < sh->bodyCount) {
             for (int j = 0; j < sh->body[i].nops && !sh->body[i].dead; j++)
                 use[j] = sh->body[i].ops[j];
         } else {
             use[0] = i == sh->bodyCount ? sh->positionValue : sh->colorValue;
         }
-        for (int j = 0; j < 4; j++) {
+        for (int j = 0; j < MAX_OPERANDS; j++) {
             uint32_t c = use[j] ? root(ids, use[j]) : 0;
             if (!c || ids[c].kind != ID_CONST || r.reg[c])
                 continue;
@@ -1240,7 +1387,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         /* Shuffles and constructors read fields they have already written if the
          * result shares an operand's register, so they get a distinct one. */
         int distinct = is_map_op(b->op), d = 0;
-        int regs[4] = { 0, 0, 0, 0 };
+        int regs[MAX_OPERANDS] = { 0 };
 
         if (b->dead)
             continue;
