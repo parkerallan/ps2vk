@@ -1,5 +1,6 @@
 /* Command buffers: recorded as a VIF1 DMA chain, sent as-is on submit. */
 #include <stdlib.h>
+#include <string.h>
 
 #include "pvk_internal.h"
 
@@ -86,6 +87,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
     cmd->pipeline     = NULL;
     cmd->vertexBuffer = NULL;
     cmd->vertexOffset = 0;
+    cmd->pushSet      = 0;
     cmd->rendering    = 0;
     cmd->failed       = 0;
     cmd->recording    = 1;
@@ -174,6 +176,40 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
     cmd->pipeline = pipeline;
 }
 
+void pvkCmdPushConstants(PvkCommandBuffer cmd, uint32_t offset, uint32_t size, const void *data)
+{
+    uint32_t first, last, q, i;
+    const uint32_t *words;
+
+    if ((offset | size) & 3 || size == 0 || offset + size > PVK_MAX_PUSH_CONSTANT_BYTES) {
+        pvk_error("pvkCmdPushConstants: offset %u and size %u must be multiples of 4 "
+                  "within %d bytes\n", (unsigned)offset, (unsigned)size, PVK_MAX_PUSH_CONSTANT_BYTES);
+        cmd->failed = 1;
+        return;
+    }
+
+    /* VIF UNPACK writes whole qwords, so merge into a copy of the range and
+     * send the qwords this update touches. */
+    memcpy(cmd->push + offset, data, size);
+    if (offset + size > cmd->pushSet)
+        cmd->pushSet = offset + size;
+    first = offset / 16;
+    last  = (offset + size - 1) / 16;
+
+    if (!cmd_reserve(cmd, 4 + (last - first + 1)))
+        return;
+
+    /* A running batch loads its push constants in its first instructions,
+     * so wait for VU1 to finish before overwriting them. */
+    cmd_flush(cmd);
+    packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_PUSH_ADDR + first, 0);
+    words = (const uint32_t *)(cmd->push + first * 16);
+    for (q = first; q <= last; q++)
+        for (i = 0; i < 4; i++)
+            packet2_add_u32(cmd->packet, *words++);
+    packet2_utils_vu_close_unpack(cmd->packet);
+}
+
 void pvkCmdBindVertexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset)
 {
     if (offset & 15) {
@@ -193,6 +229,13 @@ void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t firstVertex
 
     if (!cmd->rendering || !p || !cmd->vertexBuffer) {
         pvk_error("pvkCmdDraw needs pvkCmdBeginRendering, a pipeline and a vertex buffer\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (p->vs->pushConstantBytes > cmd->pushSet) {
+        pvk_error("pvkCmdDraw: vertex shader '%s' reads %u bytes of push constants but only %u "
+                  "were set with pvkCmdPushConstants\n", p->vs->name,
+                  (unsigned)p->vs->pushConstantBytes, (unsigned)cmd->pushSet);
         cmd->failed = 1;
         return;
     }

@@ -81,6 +81,8 @@ struct PvkCommandBuffer_T {
     PvkPipeline pipeline;
     PvkBuffer   vertexBuffer;
     size_t      vertexOffset;
+    uint8_t     push[PVK_MAX_PUSH_CONSTANT_BYTES]; /* what VU1's push constant range holds */
+    uint32_t    pushSet;      /* bytes set so far (high-water mark) */
     int         recording;
     int         rendering;
     int         failed;       /* a recording error makes the buffer unusable */

@@ -6,9 +6,11 @@
  *
  * This version accepts:
  *
- *   vertex:   gl_Position and an optional color output computed from vec4 inputs
- *             and float/vec4 constants with +, -, *, / and negation, swizzles
- *             (v.xyz, v.bgra), component reads (v.w) and vector constructors
+ *   vertex:   gl_Position and an optional color output computed from vec4 inputs,
+ *             push constants (a block of float/vec2/vec3/vec4 members and arrays
+ *             of them, up to 128 bytes) and float/vec4 constants with +, -, *, /
+ *             and negation, swizzles (v.xyz, v.bgra), component reads (v.w) and
+ *             vector constructors
  *   fragment: <color output> = <interpolated color input>;
  *
  * Anything else is rejected with an error that says why, the way a Vulkan
@@ -49,23 +51,27 @@ enum {
     OpNoLine = 317, OpModuleProcessed = 330
 };
 
-enum { DecBlock = 2, DecBuiltIn = 11, DecLocation = 30 };
+enum { DecBlock = 2, DecArrayStride = 6, DecBuiltIn = 11, DecLocation = 30, DecOffset = 35 };
 enum { BuiltInPosition = 0 };
-enum { ScInput = 1, ScOutput = 3, ScFunction = 7 };
+enum { ScUniformConstant = 0, ScInput = 1, ScUniform = 2, ScOutput = 3, ScFunction = 7,
+       ScPushConstant = 9, ScStorageBuffer = 12 };
 enum { ExecVertex = 0, ExecFragment = 4 };
 
 /* What we know about each SPIR-V result id. */
 typedef enum { ID_NONE, ID_TYPE, ID_CONST, ID_VAR, ID_VALUE, ID_PTR } IdKind;
-typedef enum { T_OTHER, T_FLOAT, T_INT, T_VECTOR, T_STRUCT, T_POINTER } TypeKind;
+typedef enum { T_OTHER, T_FLOAT, T_INT, T_VECTOR, T_STRUCT, T_POINTER, T_ARRAY } TypeKind;
 
 typedef struct {
     IdKind   kind;
     /* types */
     TypeKind type;
     uint32_t width;          /* float/int bits */
-    uint32_t elemType;       /* vector component type, pointer pointee */
-    uint32_t elemCount;      /* vector size */
+    uint32_t elemType;       /* vector component type, pointer pointee, array element */
+    uint32_t elemCount;      /* vector size, array length */
+    uint32_t stride;         /* array: bytes per element (ArrayStride) */
     uint32_t storage;        /* pointer storage class */
+    const uint32_t *members; /* struct: member type ids */
+    int      memberCount;
     /* constants and values */
     uint32_t value;
     uint32_t valType;        /* type id of a constant or value */
@@ -77,8 +83,9 @@ typedef struct {
     int      builtin;        /* -1 if none */
     int      structPosMember;/* gl_PerVertex: member index decorated Position */
     int      isPosition;     /* pointer that targets gl_Position */
-    /* values: which input a loaded value came from */
+    /* values: which input or push constant qword a loaded value came from */
     int      fromInput;      /* index into inputs[], or -1 */
+    int      fromPush;       /* push constant qword (0..PVK_VU1_PUSH_QWORDS-1), or -1 */
     /* values that live inside another value's register: v.w, v.xyz */
     uint32_t aliasOf;        /* id whose register this value shares, 0 if its own */
     int      comp;           /* field (0..3) holding a scalar value */
@@ -90,6 +97,11 @@ typedef struct {
     int location;
     uint32_t var;
 } Var;
+
+/* OpMemberDecorate Offset: byte offset of each struct member (push constant blocks). */
+#define MAX_MEMBER_OFFSETS 256
+static struct { uint32_t structType, member, offset; } g_memberOffsets[MAX_MEMBER_OFFSETS];
+static int g_memberOffsetCount;
 
 static const char *g_src = "shader";
 static const char *g_file = NULL;    /* from OpLine/OpString, if present */
@@ -113,6 +125,7 @@ static void fail(const char *fmt, ...)
 static const char *op_name(uint32_t op)
 {
     switch (op) {
+    case OpLoad: return "OpLoad (a push constant read)";
     case OpExtInst: return "OpExtInst (a GLSL built-in function)";
     case OpFunctionCall: return "OpFunctionCall (a call to another function)";
     case OpVectorShuffle: return "OpVectorShuffle (a swizzle)";
@@ -149,7 +162,7 @@ static void unsupported(uint32_t op, const char *stage)
              "Only 'outColor = <interpolated color input>;' is supported so far", what);
     fail("vertex shader uses %s, which this version of ps2vk-shaderc does not "
          "compile yet. Only +, -, *, /, negation, swizzles and vector constructors "
-         "of inputs and constants are supported so far", what);
+         "of inputs, push constants and constants are supported so far", what);
 }
 
 static uint32_t *read_spirv(const char *path, size_t *words)
@@ -253,7 +266,8 @@ enum { FIELD_ZERO = -1, FIELD_ONE = -2, FIELD_UNDEF = -3 };
 
 static int is_map_op(uint32_t op)
 {
-    return op == OpVectorShuffle || op == OpCompositeConstruct || op == OpCompositeExtract;
+    return op == OpVectorShuffle || op == OpCompositeConstruct || op == OpCompositeExtract ||
+           op == OpLoad;   /* a vec2/vec3 push constant that does not start at field x */
 }
 
 typedef struct {
@@ -262,6 +276,10 @@ typedef struct {
     int      inputCount;
     Var      outputs[MAX_OUTPUTS];  /* location outputs only */
     int      outputCount;
+    uint32_t pushVar;               /* push constant block variable, 0 if none */
+    uint32_t pushBytes;             /* size of the push constant block */
+    uint32_t pushBase;              /* synthetic id of push constant qword 0 (then qword 1, ...) */
+    int      pushUsed[PVK_VU1_PUSH_QWORDS]; /* qwords the shader reads */
     uint32_t positionVar;           /* gl_PerVertex or Position variable, 0 if none */
     uint32_t positionValue;         /* value id stored to gl_Position, 0 if never */
     uint32_t colorValue;            /* value id stored to the color output, 0 if never */
@@ -289,11 +307,62 @@ static Field field_of(const IdInfo *ids, const Shader *sh, uint32_t id, int j)
     }
     if (ids[id].aliasOf)
         return field_of(ids, sh, ids[id].aliasOf, ids[id].comp + j);
-    /* Every load of an input reads the same register: name it by the variable so
-     * in.x and in.y loaded separately still group into one MOVE. */
-    fl.src = ids[id].kind == ID_VALUE && ids[id].fromInput >= 0 ? sh->inputs[ids[id].fromInput].var : id;
+    /* Every load of an input (or push constant qword) reads the same register:
+     * name it by the variable so in.x and in.y loaded separately still group
+     * into one MOVE. */
+    if (ids[id].kind == ID_VALUE && ids[id].fromInput >= 0)
+        fl.src = sh->inputs[ids[id].fromInput].var;
+    else if (ids[id].kind == ID_VALUE && ids[id].fromPush >= 0)
+        fl.src = sh->pushBase + (uint32_t)ids[id].fromPush;
+    else
+        fl.src = id;
     fl.comp = ids[id].comp + j;
     return fl;
+}
+
+/* Byte offset of a struct member, from its Offset decoration. */
+static uint32_t member_offset(uint32_t structType, uint32_t member)
+{
+    for (int i = 0; i < g_memberOffsetCount; i++)
+        if (g_memberOffsets[i].structType == structType && g_memberOffsets[i].member == member)
+            return g_memberOffsets[i].offset;
+    fail("corrupt SPIR-V: push constant member %u has no Offset decoration", (unsigned)member);
+    return 0;
+}
+
+/* Checks a push constant block: members are float, vec2, vec3, vec4 or arrays of
+ * those, and the block fits the VU1 range. Returns its size in bytes. */
+static uint32_t check_push_block(const IdInfo *ids, uint32_t structType, const char *name)
+{
+    const IdInfo *s = &ids[structType];
+    uint32_t bytes = 0;
+
+    if (s->type != T_STRUCT)
+        fail("push constant '%s' is not a block; declare it as "
+             "'layout(push_constant) uniform Name { ... } %s;'", name, name);
+    for (int m = 0; m < s->memberCount; m++) {
+        uint32_t t = s->members[m], off = member_offset(structType, (uint32_t)m), end;
+        if (ids[t].type == T_ARRAY) {
+            if (!type_size(ids, ids[t].elemType))
+                fail("member %d of push constant block '%s' is an array of something other than "
+                     "float, vec2, vec3 or vec4, which is not supported yet", m, name);
+            end = off + ids[t].stride * ids[t].elemCount;
+        } else if (type_size(ids, t)) {
+            end = off + 4 * (uint32_t)type_size(ids, t);
+        } else if (ids[t].type == T_INT && ids[t].width == 32) {
+            end = off + 4;   /* may be declared; using it in arithmetic is rejected */
+        } else {
+            fail("member %d of push constant block '%s' is something other than float, "
+                 "vec2, vec3, vec4, int or an array of vectors (matrices and nested blocks "
+                 "are not supported yet)", m, name);
+        }
+        if (end > bytes)
+            bytes = end;
+    }
+    if (bytes > PVK_VU1_PUSH_QWORDS * 16)
+        fail("push constant block '%s' is %u bytes; ps2vk reserves %d bytes of VU1 memory "
+             "for push constants", name, (unsigned)bytes, PVK_VU1_PUSH_QWORDS * 16);
+    return bytes;
 }
 
 /* Defines value id (a float or vecN of `size` fields) as the given fields: a
@@ -362,15 +431,21 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     uint32_t bound = code[3];
     int inFunction = 0, functions = 0;
 
-    if (bound > MAX_IDS)
+    /* Ids past the SPIR-V bound stand for the push constant qwords. */
+    if (bound + PVK_VU1_PUSH_QWORDS > MAX_IDS)
         fail("shader is too large (%u ids)", (unsigned)bound);
 
     memset(sh, 0, sizeof(*sh));
     sh->execModel = ~0u;
     sh->colorLocation = -1;
-    for (uint32_t i = 0; i < bound; i++) {
+    sh->pushBase = bound;
+    for (uint32_t i = 0; i < bound + PVK_VU1_PUSH_QWORDS; i++) {
         ids[i].location = ids[i].builtin = ids[i].structPosMember = -1;
-        ids[i].fromInput = -1;
+        ids[i].fromInput = ids[i].fromPush = -1;
+    }
+    for (int q = 0; q < PVK_VU1_PUSH_QWORDS; q++) {
+        ids[sh->pushBase + q].kind = ID_VALUE;
+        ids[sh->pushBase + q].fromPush = q;
     }
 
     /* Pass 1: decorations, types, constants and global variables. */
@@ -402,10 +477,20 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[w[1]].location = (int)w[3];
             else if (w[2] == DecBuiltIn)
                 ids[w[1]].builtin = (int)w[3];
+            else if (w[2] == DecArrayStride)
+                ids[w[1]].stride = w[3];
             break;
         case OpMemberDecorate:
-            if (w[3] == DecBuiltIn && w[4] == BuiltInPosition)
+            if (w[3] == DecBuiltIn && w[4] == BuiltInPosition) {
                 ids[w[1]].structPosMember = (int)w[2];
+            } else if (w[3] == DecOffset) {
+                if (g_memberOffsetCount == MAX_MEMBER_OFFSETS)
+                    fail("shader has too many block members (max %d)", MAX_MEMBER_OFFSETS);
+                g_memberOffsets[g_memberOffsetCount].structType = w[1];
+                g_memberOffsets[g_memberOffsetCount].member = w[2];
+                g_memberOffsets[g_memberOffsetCount].offset = w[4];
+                g_memberOffsetCount++;
+            }
             break;
         case OpTypeFloat:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_FLOAT; ids[w[1]].width = w[2];
@@ -419,13 +504,19 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             break;
         case OpTypeStruct:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_STRUCT;
+            ids[w[1]].members = &w[2]; ids[w[1]].memberCount = (int)(n - 2);
+            break;
+        case OpTypeArray:
+            ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_ARRAY;
+            ids[w[1]].elemType = w[2];
+            ids[w[1]].elemCount = ids[w[3]].kind == ID_CONST ? ids[w[3]].value : 0;
             break;
         case OpTypePointer:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_POINTER;
             ids[w[1]].storage = w[2]; ids[w[1]].elemType = w[3];
             break;
         case OpTypeImage: case OpTypeSampler: case OpTypeSampledImage: case OpTypeMatrix:
-        case OpTypeVoid: case OpTypeBool: case OpTypeArray: case OpTypeRuntimeArray:
+        case OpTypeVoid: case OpTypeBool: case OpTypeRuntimeArray:
         case OpTypeFunction:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_OTHER;
             break;
@@ -452,9 +543,14 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             uint32_t type = w[1], id = w[2], storage = w[3];
             ids[id].kind = ID_VAR;
             ids[id].varType = type;
-            if (!inFunction && storage != ScInput && storage != ScOutput)
-                fail("'%s' is a uniform, push constant or buffer; this version of "
-                     "ps2vk-shaderc supports only shader inputs and outputs",
+            if (!inFunction && storage == ScPushConstant && sh->execModel == ExecFragment)
+                fail("fragment shader reads push constant '%s': the GS cannot read per-draw "
+                     "values. Push constants are only available in vertex shaders",
+                     ids[id].name ? ids[id].name : "variable");
+            if (!inFunction && storage != ScInput && storage != ScOutput && storage != ScPushConstant)
+                fail("'%s' is a uniform or buffer; this version of ps2vk-shaderc supports "
+                     "only shader inputs, outputs and push constants (uniform blocks need "
+                     "pipeline layouts, which are not implemented yet)",
                      ids[id].name ? ids[id].name : "variable");
             if (inFunction && storage == ScFunction)
                 fail("local variables are not supported yet");
@@ -502,6 +598,11 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 sh->inputs[sh->inputCount].location = ids[id].location;
                 sh->inputs[sh->inputCount].var = id;
                 sh->inputCount++;
+            } else if (storage == ScPushConstant) {
+                if (sh->pushVar)
+                    fail("shader has two push constant blocks; only one is allowed");
+                sh->pushVar = id;
+                sh->pushBytes = check_push_block(ids, pointee, name);
             } else if (storage == ScOutput) {
                 if (ids[pointee].type == T_STRUCT && ids[pointee].structPosMember >= 0) {
                     sh->positionVar = id; /* gl_PerVertex block */
@@ -569,8 +670,29 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 break;
             case OpLoad: {
                 uint32_t id = w[2], ptr = w[3];
+                if (ids[ptr].kind == ID_PTR && ids[ptr].fromPush >= 0) {
+                    /* A push constant member: its qword is loaded into a register in
+                     * the prologue, so this reads that register in place... */
+                    int size = type_size(ids, w[1]);
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    if (size > 1 && ids[ptr].comp) {
+                        /* ...unless it is a vec2/vec3 past field x (vec2 at offset 8):
+                         * arithmetic expects vectors in the leading fields, so copy it. */
+                        Field fl[4];
+                        for (int j = 0; j < size; j++) {
+                            fl[j].src = sh->pushBase + (uint32_t)ids[ptr].fromPush;
+                            fl[j].comp = ids[ptr].comp + j;
+                        }
+                        define_map(ids, sh, OpLoad, id, w[1], fl, size);
+                        break;
+                    }
+                    ids[id].fromPush = ids[ptr].fromPush;
+                    ids[id].comp = ids[ptr].comp;
+                    break;
+                }
                 if ((ids[ptr].kind != ID_VAR && ids[ptr].kind != ID_PTR) || ids[ptr].fromInput < 0)
-                    fail("%s shader reads something other than a vertex input", stage);
+                    fail("%s shader reads something other than a vertex input or push constant", stage);
                 ids[id].kind = ID_VALUE;
                 ids[id].valType = w[1];
                 ids[id].fromInput = ids[ptr].fromInput;
@@ -681,6 +803,55 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             }
             case OpAccessChain: {
                 uint32_t id = w[2], base = w[3];
+                if (base && base == sh->pushVar) {
+                    /* pc.member, pc.array[i], pc.member.z: a constant byte offset into
+                     * the push constant range, which VU1 memory holds as qwords. */
+                    uint32_t type = ids[ids[base].varType].elemType, off = 0;
+                    int size;
+
+                    for (uint32_t i = 4; i < n; i++) {
+                        uint32_t idx = w[i], v;
+                        if (ids[idx].kind != ID_CONST)
+                            fail("vertex shader indexes push constants with a value computed at "
+                                 "run time; only constant indices are supported so far");
+                        v = ids[idx].value;
+                        if (ids[type].type == T_STRUCT) {
+                            if (v >= (uint32_t)ids[type].memberCount)
+                                fail("corrupt SPIR-V: push constant member index out of range");
+                            off += member_offset(type, v);
+                            type = ids[type].members[v];
+                        } else if (ids[type].type == T_ARRAY) {
+                            if (v >= ids[type].elemCount)
+                                fail("vertex shader reads element %u of a push constant array "
+                                     "of %u", (unsigned)v, (unsigned)ids[type].elemCount);
+                            off += ids[type].stride * v;
+                            type = ids[type].elemType;
+                        } else if (ids[type].type == T_VECTOR) {
+                            if (v >= ids[type].elemCount)
+                                fail("corrupt SPIR-V: push constant component index out of range");
+                            off += 4 * v;
+                            type = ids[type].elemType;
+                        } else {
+                            fail("corrupt SPIR-V: push constant access chain indexes a scalar");
+                        }
+                    }
+                    size = type_size(ids, type);
+                    if (!size && ids[type].type == T_INT)
+                        size = 1;   /* loadable; any arithmetic on it is rejected */
+                    if (!size)
+                        fail("vertex shader reads a whole push constant block or array; "
+                             "read its float, vec2, vec3 or vec4 members one at a time");
+                    if (off % 16 + 4 * (uint32_t)size > 16)
+                        fail("push constant member at byte %u crosses a 16-byte boundary, "
+                             "which VU1 cannot read as one value", (unsigned)off);
+                    if (off + 4 * (uint32_t)size > sh->pushBytes)
+                        fail("corrupt SPIR-V: push constant read past the end of the block");
+                    ids[id].kind = ID_PTR;
+                    ids[id].fromPush = (int)(off / 16);
+                    ids[id].comp = (int)(off % 16 / 4);
+                    sh->pushUsed[off / 16] = 1;
+                    break;
+                }
                 if (ids[base].kind == ID_VAR && ids[base].fromInput >= 0) {
                     /* in.w read straight from the input: glslang emits this instead of
                      * OpCompositeExtract when debug info is on. */
@@ -810,7 +981,8 @@ static int reg_alloc(Regs *r)
 static void reg_release(Regs *r, const IdInfo *ids, uint32_t id, int at)
 {
     id = root(ids, id);
-    if (ids[id].kind == ID_VALUE && ids[id].fromInput < 0 && r->lastUse[id] <= at && r->reg[id]) {
+    if (ids[id].kind == ID_VALUE && ids[id].fromInput < 0 && ids[id].fromPush < 0 &&
+        r->lastUse[id] <= at && r->reg[id]) {
         r->busy[r->reg[id]] = 0;
         r->reg[id] = 0;
     }
@@ -990,12 +1162,19 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     for (i = 0; i < MAX_IDS; i++)
         if ((ids[i].kind == ID_VALUE || ids[i].kind == ID_VAR) && ids[i].fromInput >= 0)
             r.reg[i] = 10 + ids[i].fromInput;
+    /* Push constant qwords the shader reads stay in registers for the whole program. */
+    for (i = 0; i < PVK_VU1_PUSH_QWORDS; i++)
+        if (sh->pushUsed[i])
+            r.reg[sh->pushBase + i] = reg_alloc(&r);
+    for (i = 0; i < MAX_IDS; i++)
+        if (ids[i].kind == ID_VALUE && ids[i].fromPush >= 0)
+            r.reg[i] = r.reg[sh->pushBase + ids[i].fromPush];
 
     fprintf(f, "; Generated by ps2vk-shaderc from %s. Do not edit.\n", g_src);
     fprintf(f, ";\n; VU1 registers:\n");
     fprintf(f, ";   VF01 viewport scale, VF02 viewport offset, VF03 color scale\n");
     fprintf(f, ";   VF10.. shader inputs, VF20 gl_Position, VF21 color output\n");
-    fprintf(f, ";   VF05-VF09, VF18-VF19, VF25-VF31 constants and temporaries\n");
+    fprintf(f, ";   VF05-VF09, VF18-VF19, VF25-VF31 push constants, constants and temporaries\n");
     fprintf(f, ";   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer\n\n");
     fprintf(f, "\t\t.vu\n\t\t.align 4\n");
     fprintf(f, "\t\t.global\t%s_CodeStart\n\t\t.global\t%s_CodeEnd\n", sym, sym);
@@ -1008,6 +1187,13 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     vu(f, "NOP", buf, NULL);
     snprintf(buf, sizeof(buf), "lq            VF03,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_COLOR_SCALE);
     vu(f, "NOP", buf, NULL);
+    for (i = 0; i < PVK_VU1_PUSH_QWORDS; i++) {
+        if (!sh->pushUsed[i])
+            continue;
+        snprintf(buf, sizeof(buf), "lq            VF%02d,%d(VI00)", r.reg[sh->pushBase + i], PVK_VU1_PUSH_ADDR + i);
+        snprintf(buf2, sizeof(buf2), "push constants, bytes %d..%d", i * 16, i * 16 + 15);
+        vu(f, "NOP", buf, buf2);
+    }
     snprintf(buf, sizeof(buf), "iaddiu        VI01,VI00,%d", PVK_VU1_INPUT_ADDR);
     vu(f, "NOP", buf, "input base");
     snprintf(buf, sizeof(buf), "lq            VF04,%d(VI01)", PVK_VU1_INPUT_GIFTAG);
@@ -1124,6 +1310,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         fprintf(f, "%s%d", i ? ", " : " ", sh->inputs[i].location);
     fprintf(f, " },\n");
     fprintf(f, "    .colorOutputLocation = %d,\n", sh->colorValue ? sh->colorLocation : -1);
+    fprintf(f, "    .pushConstantBytes = %u,\n", (unsigned)sh->pushBytes);
     fprintf(f, "    .colorInputLocation = -1,\n");
     fprintf(f, "};\n");
     fclose(f);

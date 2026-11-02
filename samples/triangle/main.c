@@ -1,7 +1,9 @@
 /*
  * ps2vk triangle sample: clear the screen and draw one triangle whose
- * corners are red, green and blue, using only ps2vk calls.
+ * corners are red, green and blue, using only ps2vk calls. The triangle
+ * circles the screen: its position is a push constant set every frame.
  */
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -87,8 +89,11 @@ int main(void)
 
     printf("triangle: running\n");
 
-    for (;;) {
+    for (unsigned frame = 0;; frame++) {
         uint32_t imageIndex;
+        /* One lap every 4 seconds at 60 Hz, in clip space (y down). */
+        float angle = (float)frame * (2.0f * 3.14159265f / 240.0f);
+        float offset[4] = { 0.3f * cosf(angle), 0.3f * sinf(angle), 0.0f, 0.0f };
 
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
@@ -103,6 +108,7 @@ int main(void)
         };
         pvkCmdBeginRendering(cmd, &rendering);
         pvkCmdBindPipeline(cmd, pipeline);
+        pvkCmdPushConstants(cmd, 0, sizeof(offset), offset);
         pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
         pvkCmdDraw(cmd, 3, 0);
         pvkCmdEndRendering(cmd);

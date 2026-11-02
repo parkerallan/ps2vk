@@ -12,5 +12,6 @@ const PvkShaderCode pos_only_vert = {
     .inputCount = 1,
     .inputLocations = { 0 },
     .colorOutputLocation = -1,
+    .pushConstantBytes = 0,
     .colorInputLocation = -1,
 };

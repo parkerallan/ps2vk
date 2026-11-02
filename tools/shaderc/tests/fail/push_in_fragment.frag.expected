@@ -1,0 +1,1 @@
+push_in_fragment.frag: error: fragment shader reads push constant 'pc': the GS cannot read per-draw values. Push constants are only available in vertex shaders

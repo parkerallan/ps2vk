@@ -2,8 +2,9 @@
  * VU1 data memory layout shared by the ps2vk runtime and tools/shaderc.
  * Addresses are in qwords (16 bytes); VU1 data memory holds 1024.
  *
- *   0   context: viewport scale, viewport offset, color scale
- *   8   input:   GIF tag for this batch, vertex count (x), then vertices
+ *   0   context: viewport scale, viewport offset, color scale (per pipeline)
+ *   4   push constants: 8 qwords = 128 bytes, written by pvkCmdPushConstants
+ *   16  input:   GIF tag for this batch, vertex count (x), then vertices
  *   512 output:  GIF tag, then per vertex RGBAQ, XYZ2 (sent with XGKICK)
  */
 #ifndef PS2VK_VU1_LAYOUT_H
@@ -15,7 +16,10 @@
 #define PVK_VU1_CTX_COLOR_SCALE     2
 #define PVK_VU1_CONTEXT_QWORDS    3
 
-#define PVK_VU1_INPUT_ADDR        8
+#define PVK_VU1_PUSH_ADDR         4
+#define PVK_VU1_PUSH_QWORDS       8   /* PVK_MAX_PUSH_CONSTANT_BYTES / 16 */
+
+#define PVK_VU1_INPUT_ADDR        16
 #define PVK_VU1_INPUT_GIFTAG      0
 #define PVK_VU1_INPUT_COUNT       1
 #define PVK_VU1_INPUT_HEADER      2   /* qwords before the first vertex */

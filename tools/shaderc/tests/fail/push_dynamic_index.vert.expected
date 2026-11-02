@@ -1,0 +1,1 @@
+push_dynamic_index.vert:14: error: vertex shader indexes push constants with a value computed at run time; only constant indices are supported so far

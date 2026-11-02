@@ -8,7 +8,7 @@ EE_DVP  = dvp-as
 EE_BIN  = triangle.elf
 EE_OBJS = main.o build/tri_vert.o build/tri_vert_vu1.o build/tri_frag.o
 EE_INCS = -I$(PS2VK)/include
-EE_LIBS = -L$(PS2VK)/lib -lps2vk -ldraw -lgraph -lpacket2 -ldma
+EE_LIBS = -L$(PS2VK)/lib -lps2vk -ldraw -lgraph -lpacket2 -ldma -lm
 EE_WARNFLAGS = -Wall -Wextra
 
 all: $(EE_BIN)

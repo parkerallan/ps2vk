@@ -26,7 +26,7 @@ Status: ✓ = implemented. *Italic notes* mark features the PS2 can't do nativel
 | | Pipeline layouts: declare what resources a pipeline's shaders read | `VkPipelineLayout` | `PvkPipelineLayout` | Fixes the VU1 context-memory layout and which GS texture registers are used |
 | | Descriptor sets: bind a texture and constants in one call | `VkDescriptorSetLayout`, `VkDescriptorPool`, `VkDescriptorSet`, `vkUpdateDescriptorSets`, `vkCmdBindDescriptorSets` | Same names with `Pvk`/`pvk` | Prebuilt packet: `UNPACK` constants to VU1 + `DIRECT` GS `TEX0`/`TEX1`/`CLAMP`; bound with a DMA `CALL` |
 | | Uniform buffers: constant blocks such as camera matrix, lights | `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` | `PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` | VIF `UNPACK` into the VU1 context area |
-| | Push constants: small per-draw values written into the command list | `VkPushConstantRange`, `vkCmdPushConstants` | `pvkCmdPushConstants` | Inline `UNPACK` to a reserved VU1 range |
+| ✓ | Push constants: small per-draw values written into the command list | `VkPushConstantRange`, `vkCmdPushConstants` | `pvkCmdPushConstants` | Inline `UNPACK` to VU1 qwords 4-11 (128 bytes), after a VIF `FLUSH` so a running batch is not overwritten; `pvkCmdDraw` checks the shader's block was set |
 | | Specialization constants: one GLSL shader, several baked variants | `VkSpecializationInfo` | `PvkSpecializationInfo` | shaderc emits variants, or constants patched at pipeline creation |
 | | Dynamic state: change viewport/scissor/blend constant while recording | `VkPipelineDynamicStateCreateInfo`, `vkCmdSetViewport`, `vkCmdSetScissor`, `vkCmdSetBlendConstants` | `pvkCmdSetViewport`, `pvkCmdSetScissor`, `pvkCmdSetBlendConstants` | Viewport: VU1 context write; scissor `SCISSOR`; blend `ALPHA.FIX` |
 | | Interrupt-driven fences: hardware notifies the CPU instead of polling; allows multiple frames in flight | `VkFence`, `vkWaitForFences` | `PvkFence`, `pvkWaitForFences` | GS `SIGNAL` with a label per fence, `INTC_GS` handler, EE semaphore (as ps2gl does) |
@@ -99,7 +99,8 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | ✓ | Swizzles, constructors, component access | `OpVectorShuffle`, `OpCompositeConstruct`, `OpCompositeExtract` | Composed into one per-field map at compile time: `v.w` and `v.xyz` are read in place (broadcast operands, write masks); anything else is a grouped masked `MOVE` or `ADD` from `VF00`, which also supplies 0 and 1 |
 | | Matrices and matrix × vector | `OpMatrixTimesVector`, `OpTypeMatrix` | VU1 `MULA`/`MADDA`/`MADD` chain (4 instructions) |
 | | Built-in functions | `OpExtInst` GLSL.std.450 (`Normalize`, `Pow`, `Sin`, …), `OpDot` | VU1 `DIV`/`SQRT`/`RSQRT`, EFU (`ESIN`, `EEXP`, `ERSQRT`, …) |
-| | Uniform blocks and push constants | `OpVariable` `Uniform`/`PushConstant` | Loads from the VU1 context area defined by the pipeline layout |
+| ✓ | Push constants | `OpVariable` `PushConstant`, `OpAccessChain` with constant indices, `OpLoad` | Each qword the shader reads is loaded once in the prologue (`LQ` from the push range) and read in place; float/vec2/vec3/vec4 members and arrays of them, 128 bytes max |
+| | Uniform blocks | `OpVariable` `Uniform` | Loads from the VU1 context area defined by the pipeline layout |
 | | Uniform arrays with dynamic indexing | `OpAccessChain` with a variable index | VU1 integer registers as addresses |
 | | Local variables and functions | `OpVariable` `Function`, `OpFunctionCall` | Inlined by `spirv-opt`, kept in registers |
 | | `if`/`else` and loops | `OpBranch`, `OpBranchConditional`, `OpLoopMerge` | Unrolled, or VU1 `IBNE`/`IBEQ` branches |
@@ -129,7 +130,7 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | Status | Sample | Exercises |
 | --- | --- | --- |
 | ✓ | Clear | Swapchain, rendering, fences |
-| ✓ | Triangle | Pipeline, vertex buffer, shaders |
+| ✓ | Triangle | Pipeline, vertex buffer, shaders, push constants (the triangle circles the screen) |
 | | Textured cube | Depth buffer, textures, uniforms, indexed drawing |
 | | Lighting | Light uniforms, per-vertex lighting |
 | | Skinning | Bone matrices, animation |

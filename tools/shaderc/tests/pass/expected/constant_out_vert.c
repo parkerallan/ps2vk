@@ -12,5 +12,6 @@ const PvkShaderCode constant_out_vert = {
     .inputCount = 1,
     .inputLocations = { 0 },
     .colorOutputLocation = 0,
+    .pushConstantBytes = 0,
     .colorInputLocation = -1,
 };
