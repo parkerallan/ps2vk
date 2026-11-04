@@ -1,1 +1,1 @@
-mat_vector_times_matrix.vert:12: error: vertex shader uses OpVectorTimesMatrix (vector * matrix: write it as matrix * vector), which this version of ps2vk-shaderc does not compile yet. Only +, -, *, /, negation, matrix * vector, swizzles and vector constructors of inputs, push constants and constants are supported so far
+mat_vector_times_matrix.vert:12: error: vertex shader uses OpVectorTimesMatrix (vector * matrix: write it as matrix * vector), which this version of ps2vk-shaderc does not compile yet

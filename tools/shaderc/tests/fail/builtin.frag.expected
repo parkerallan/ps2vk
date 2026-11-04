@@ -1,0 +1,1 @@
+builtin.frag:10: error: fragment shader uses OpExtInst (a GLSL built-in function): the GS cannot run code per pixel. Only 'outColor = <interpolated color input>;' is supported so far

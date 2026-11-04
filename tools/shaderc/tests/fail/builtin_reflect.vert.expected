@@ -1,0 +1,1 @@
+builtin_reflect.vert:9: error: vertex shader calls reflect(), which this version of ps2vk-shaderc does not compile yet

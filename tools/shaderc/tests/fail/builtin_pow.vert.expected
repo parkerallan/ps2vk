@@ -1,0 +1,1 @@
+builtin_pow.vert:8: error: vertex shader calls pow(): VU1 has no logarithm unit

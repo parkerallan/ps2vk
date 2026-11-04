@@ -20,7 +20,13 @@ Those coming from Vulkan will find the same design pattern, where we write a com
 
 ## Status
 
-Draws a Gouraud-shaded triangle from GLSL vertex and fragment shaders, running in PCSX2. Vertex shaders can currently use vector arithmetic, swizzles and constructors, push constants, and matrix × vector products.
+Draws a Gouraud-shaded triangle from GLSL vertex and fragment shaders, running in PCSX2. Vertex shaders support:
+
+- vector arithmetic
+- swizzles and constructors
+- push constants
+- matrix × vector
+- math built-ins
 
 ## Setup
 

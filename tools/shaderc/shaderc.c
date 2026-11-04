@@ -1,8 +1,8 @@
 /*
- * ps2vk-shaderc: compiles SPIR-V (from glslangValidator) for the PS2.
+ * ps2vk-shaderc: compiles SPIR-V (glslangValidator -V) for the PS2.
  *
- *   vertex shader   -> VU1 microcode (.vsm for dvp-as) + PvkShaderCode (.c)
- *   fragment shader -> GS settings in a PvkShaderCode (.c)
+ *   .vert --glslangValidator--> .spv --shaderc--> .vsm + .c --dvp-as--> .o + .c  (VU1 microcode + PvkShaderCode)
+ *   .frag --glslangValidator--> .spv --shaderc--> .c                            (GS settings in a PvkShaderCode)
  *
  * This version accepts:
  *
@@ -10,7 +10,8 @@
  *             push constants (a block of float/vec2/vec3/vec4/matrix members and
  *             arrays of vectors, up to 128 bytes) and float/vec4/matrix constants
  *             with +, -, *, / and negation, matrix * vector, swizzles (v.xyz,
- *             v.bgra), component reads (v.w) and vector constructors
+ *             v.bgra), component reads (v.w), vector constructors and math
+ *             built-ins
  *   fragment: <color output> = <interpolated color input>;
  *
  * Anything else is rejected with an error that says why, the way a Vulkan
@@ -60,6 +61,46 @@ enum { BuiltInPosition = 0 };
 enum { ScUniformConstant = 0, ScInput = 1, ScUniform = 2, ScOutput = 3, ScFunction = 7,
        ScPushConstant = 9, ScStorageBuffer = 12 };
 enum { ExecVertex = 0, ExecFragment = 4 };
+
+/* GLSL.std.450 instruction numbers. */
+enum {
+    GlslTrunc = 3, GlslFAbs = 4, GlslFloor = 8, GlslCeil = 9, GlslFract = 10,
+    GlslSin = 13, GlslCos = 14, GlslExp = 27, GlslExp2 = 29, GlslSqrt = 31,
+    GlslInverseSqrt = 32, GlslFMin = 37, GlslFMax = 40, GlslFClamp = 43, GlslFMix = 46,
+    GlslLength = 66, GlslCross = 68, GlslNormalize = 69
+};
+
+enum { EXT_TODO, EXT_OK, EXT_NO_LOG, EXT_INTEGER };
+typedef struct { uint32_t num; const char *name; int nargs; int status; } ExtFn;
+
+static const ExtFn g_extFns[] = {
+    { 1, "round", 1, EXT_TODO },       { 2, "roundEven", 1, EXT_TODO },  { 3, "trunc", 1, EXT_OK },
+    { 4, "abs", 1, EXT_OK },           { 5, "abs", 1, EXT_INTEGER },     { 6, "sign", 1, EXT_TODO },
+    { 7, "sign", 1, EXT_INTEGER },     { 8, "floor", 1, EXT_OK },        { 9, "ceil", 1, EXT_OK },
+    { 10, "fract", 1, EXT_OK },        { 11, "radians", 1, EXT_TODO },   { 12, "degrees", 1, EXT_TODO },
+    { 13, "sin", 1, EXT_OK },          { 14, "cos", 1, EXT_OK },         { 15, "tan", 1, EXT_TODO },
+    { 16, "asin", 1, EXT_TODO },       { 17, "acos", 1, EXT_TODO },      { 18, "atan", 1, EXT_TODO },
+    { 19, "sinh", 1, EXT_TODO },       { 20, "cosh", 1, EXT_TODO },      { 21, "tanh", 1, EXT_TODO },
+    { 25, "atan", 2, EXT_TODO },       { 26, "pow", 2, EXT_NO_LOG },     { 27, "exp", 1, EXT_OK },
+    { 28, "log", 1, EXT_NO_LOG },      { 29, "exp2", 1, EXT_OK },        { 30, "log2", 1, EXT_NO_LOG },
+    { 31, "sqrt", 1, EXT_OK },         { 32, "inversesqrt", 1, EXT_OK }, { 33, "determinant", 1, EXT_TODO },
+    { 34, "inverse", 1, EXT_TODO },    { 35, "modf", 2, EXT_TODO },      { 37, "min", 2, EXT_OK },
+    { 38, "min", 2, EXT_INTEGER },     { 39, "min", 2, EXT_INTEGER },    { 40, "max", 2, EXT_OK },
+    { 41, "max", 2, EXT_INTEGER },     { 42, "max", 2, EXT_INTEGER },    { 43, "clamp", 3, EXT_OK },
+    { 44, "clamp", 3, EXT_INTEGER },   { 45, "clamp", 3, EXT_INTEGER },  { 46, "mix", 3, EXT_OK },
+    { 47, "mix", 3, EXT_INTEGER },     { 48, "step", 2, EXT_TODO },      { 49, "smoothstep", 3, EXT_TODO },
+    { 50, "fma", 3, EXT_TODO },        { 66, "length", 1, EXT_OK },      { 67, "distance", 2, EXT_TODO },
+    { 68, "cross", 2, EXT_OK },        { 69, "normalize", 1, EXT_OK },   { 70, "faceforward", 3, EXT_TODO },
+    { 71, "reflect", 2, EXT_TODO },    { 72, "refract", 3, EXT_TODO },
+};
+
+static const ExtFn *ext_fn(uint32_t num)
+{
+    for (size_t i = 0; i < sizeof(g_extFns) / sizeof(g_extFns[0]); i++)
+        if (g_extFns[i].num == num)
+            return &g_extFns[i];
+    return NULL;
+}
 
 /* What we know about each SPIR-V result id. */
 typedef enum { ID_NONE, ID_TYPE, ID_CONST, ID_VAR, ID_VALUE, ID_PTR } IdKind;
@@ -172,8 +213,7 @@ static void unsupported(uint32_t op, const char *stage)
         fail("fragment shader uses %s: the GS cannot run code per pixel. "
              "Only 'outColor = <interpolated color input>;' is supported so far", what);
     fail("vertex shader uses %s, which this version of ps2vk-shaderc does not "
-         "compile yet. Only +, -, *, /, negation, matrix * vector, swizzles and vector "
-         "constructors of inputs, push constants and constants are supported so far", what);
+         "compile yet", what);
 }
 
 static uint32_t *read_spirv(const char *path, size_t *words)
@@ -263,6 +303,7 @@ static const char *mask_n(int n)
  */
 typedef struct {
     uint32_t op;
+    uint32_t ext;                   /* OpExtInst: the GLSL.std.450 instruction */
     uint32_t result;
     uint32_t ops[MAX_OPERANDS];     /* operand ids: up to 4 columns and a vector */
     int      nops;
@@ -283,6 +324,7 @@ static int is_map_op(uint32_t op)
 
 typedef struct {
     uint32_t execModel;
+    uint32_t glsl450;               /* id of the GLSL.std.450 import, 0 if none */
     Var      inputs[MAX_INPUTS];
     int      inputCount;
     Var      outputs[MAX_OUTPUTS];  /* location outputs only */
@@ -524,6 +566,12 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             break;
         case OpString:
             ids[w[1]].name = (const char *)&w[2];
+            break;
+        case OpExtInstImport:
+            if (strcmp((const char *)&w[2], "GLSL.std.450"))
+                fail("shader imports extended instruction set '%s', which is not supported",
+                     (const char *)&w[2]);
+            sh->glsl450 = w[1];
             break;
         case OpName:
             ids[w[1]].name = (const char *)&w[2];
@@ -840,6 +888,73 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 }
                 b->ops[cols] = v;
                 b->nops = cols + 1;
+                break;
+            }
+            case OpDot: case OpExtInst: {
+                uint32_t id = w[2], ext = op == OpExtInst ? w[4] : 0;
+                const uint32_t *args = op == OpExtInst ? &w[5] : &w[3];
+                int nargs = op == OpExtInst ? (int)(n - 5) : 2, size, argSize;
+                const ExtFn *fn = NULL;
+                const char *name = "dot";
+                BodyOp *b;
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                if (op == OpExtInst) {
+                    if (w[3] != sh->glsl450)
+                        fail("corrupt SPIR-V: OpExtInst from an instruction set other than GLSL.std.450");
+                    fn = ext_fn(ext);
+                    if (!fn)
+                        fail("vertex shader calls GLSL.std.450 instruction %u, which this version "
+                             "of ps2vk-shaderc does not compile", (unsigned)ext);
+                    name = fn->name;
+                    if (fn->status == EXT_NO_LOG)
+                        fail("vertex shader calls %s(): VU1 has no logarithm unit", name);
+                    if (fn->status == EXT_INTEGER)
+                        fail("vertex shader calls %s() on integers; VU1 computes with floats only", name);
+                    if (fn->status == EXT_TODO)
+                        fail("vertex shader calls %s(), which this version of ps2vk-shaderc does "
+                             "not compile yet", name);
+                    if (nargs != fn->nargs)
+                        fail("corrupt SPIR-V: %s() called with %d arguments", name, nargs);
+                }
+                ids[id].kind = ID_VALUE;
+                ids[id].valType = w[1];
+                size = value_size(ids, id, stage);
+                argSize = value_size(ids, args[0], stage);
+                for (int i = 1; i < nargs; i++)
+                    if (value_size(ids, args[i], stage) != argSize)
+                        fail("corrupt SPIR-V: %s() arguments differ in size", name);
+                if (op == OpDot || ext == GlslLength) {
+                    if (argSize < 2)
+                        fail("vertex shader calls %s() on a float; it takes a vec2, vec3 or vec4", name);
+                    if (size != 1)
+                        fail("corrupt SPIR-V: %s() result is not a float", name);
+                    ids[id].comp = 0;
+                } else if (ext == GlslNormalize) {
+                    if (argSize < 2)
+                        fail("vertex shader calls normalize() on a float; it takes a vec2, vec3 or vec4");
+                    if (size != argSize)
+                        fail("corrupt SPIR-V: normalize() result differs in size from its argument");
+                } else if (ext == GlslCross) {
+                    if (argSize != 3 || size != 3)
+                        fail("vertex shader calls cross() on something other than two vec3s");
+                } else {
+                    if (size != argSize)
+                        fail("corrupt SPIR-V: %s() result differs in size from its arguments", name);
+                    if (size == 1)
+                        ids[id].comp = ext == GlslSqrt || ext == GlslInverseSqrt ? 0 : ids[args[0]].comp;
+                }
+                if (sh->bodyCount == MAX_BODY)
+                    fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+                b = &sh->body[sh->bodyCount++];
+                b->op = op;
+                b->ext = ext;
+                b->result = id;
+                b->line = g_line;
+                for (int i = 0; i < nargs; i++)
+                    b->ops[i] = args[i];
+                b->nops = nargs;
                 break;
             }
             case OpCompositeExtract: {
@@ -1208,6 +1323,223 @@ static void emit_map(FILE *f, const BodyOp *b, int d, const int *regs, int size,
     }
 }
 
+/* Returns the pending comment once; later instructions of the same op get none. */
+static const char *take(const char **comment)
+{
+    const char *s = *comment;
+    *comment = NULL;
+    return s;
+}
+
+/* "maxy.x", "abs.xyz": mnemonic, optional broadcast field, destination mask. */
+static const char *mn(const char *base, char bc, const char *mask)
+{
+    static char s[24];
+    if (bc)
+        snprintf(s, sizeof(s), "%s%c.%s", base, bc, mask);
+    else
+        snprintf(s, sizeof(s), "%s.%s", base, mask);
+    return s;
+}
+
+static void emit_u(FILE *f, const char **comment, const char *mnemonic, const char *fmt, ...)
+{
+    char ops[48], buf[64];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(ops, sizeof(ops), fmt, ap);
+    va_end(ap);
+    snprintf(buf, sizeof(buf), "%-14s%s", mnemonic, ops);
+    vu(f, buf, "NOP", take(comment));
+}
+
+static void emit_l(FILE *f, const char **comment, const char *mnemonic, const char *fmt, ...)
+{
+    char ops[48], buf[64];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(ops, sizeof(ops), fmt, ap);
+    va_end(ap);
+    if (ops[0])
+        snprintf(buf, sizeof(buf), "%-14s%s", mnemonic, ops);
+    else
+        snprintf(buf, sizeof(buf), "%s", mnemonic);
+    vu(f, "NOP", buf, take(comment));
+}
+
+static void emit_loi(FILE *f, const char **comment, uint32_t bits)
+{
+    char ins[64], val[32];
+
+    loi_text(bits, ins, sizeof(ins), val, sizeof(val));
+    vu(f, "NOP", ins, *comment ? take(comment) : val);
+}
+
+/* d = a op b; a scalar broadcasts b's field. */
+static void emit_bin(FILE *f, const char **comment, const char *base, const char *dest, int size,
+                     int d, int a, int bb, int cb)
+{
+    static const char field[] = "xyzw";
+    if (size == 1)
+        emit_u(f, comment, mn(base, field[cb], dest), "VF%02d,VF%02d,VF%02d%c", d, a, bb, field[cb]);
+    else
+        emit_u(f, comment, mn(base, 0, dest), "VF%02d,VF%02d,VF%02d", d, a, bb);
+}
+
+/* d.x = dot(a, b) over n fields. */
+static void emit_dot(FILE *f, const char **comment, int d, int a, int bb, int n)
+{
+    static const char field[] = "xyzw";
+    emit_u(f, comment, mn("mul", 0, mask_n(n)), "VF%02d,VF%02d,VF%02d", d, a, bb);
+    for (int i = 1; i < n; i++)
+        emit_u(f, comment, mn("add", field[i], "x"), "VF%02d,VF%02d,VF%02d%c", d, d, d, field[i]);
+}
+
+/* d.c = Q. */
+static void emit_from_q(FILE *f, const char **comment, int d, char c)
+{
+    char m[8];
+    snprintf(m, sizeof(m), "%c", c);
+    if (c == 'w')
+        emit_u(f, comment, mn("mulq", 0, m), "VF%02d,VF00,Q", d);
+    else
+        emit_u(f, comment, mn("addq", 0, m), "VF%02d,VF00,Q", d);
+}
+
+/* floor(a) = (a + 1.5 * 2^23) - 1.5 * 2^23, relying on VU1 truncation; |a| < 2^22.
+ * ceil subtracts first. */
+static void emit_floor(FILE *f, const char **comment, const char *dest, int d, int a, int ceil)
+{
+    emit_loi(f, comment, 0x4b400000);
+    emit_u(f, comment, mn(ceil ? "subi" : "addi", 0, dest), "VF%02d,VF%02d,I", d, a);
+    emit_u(f, comment, mn(ceil ? "addi" : "subi", 0, dest), "VF%02d,VF%02d,I", d, d);
+}
+
+/* Runs an EFU instruction on each field of d in place, through P. */
+static void emit_efu(FILE *f, const char **comment, const char *efu, const char *dest, int d)
+{
+    for (const char *c = dest; *c; c++) {
+        char m[2] = { *c, 0 };
+        emit_l(f, comment, efu, "P,VF%02d%c", d, *c);
+        emit_l(f, comment, "waitp", "");
+        emit_l(f, comment, mn("mfp", 0, m), "VF%02d,P", d);
+    }
+}
+
+static const char *body_name(const BodyOp *b)
+{
+    static char s[32];
+    if (b->op == OpExtInst) {
+        snprintf(s, sizeof(s), "%s()", ext_fn(b->ext)->name);
+        return s;
+    }
+    if (b->op == OpDot)
+        return "dot()";
+    return op_name(b->op);
+}
+
+/* dot() and the GLSL built-ins. d never aliases an operand, so it doubles as scratch;
+ * a scalar result sits in the first operand's field (ca) and broadcasts cb, cc. */
+static void emit_builtin(FILE *f, const BodyOp *b, int size, int argSize, const char *dest, int d,
+                         const int *regs, int ca, int cb, int cc, const char *line)
+{
+    static const char field[] = "xyzw";
+    const char *c = line;
+    int a = regs[0], bb = regs[1], t = regs[2];
+    uint32_t ext = b->op == OpDot ? 0 : b->ext;
+
+    if (b->op == OpDot) {
+        emit_dot(f, &c, d, a, bb, argSize);
+        return;
+    }
+    switch (ext) {
+    case GlslFAbs:
+        emit_u(f, &c, mn("abs", 0, dest), "VF%02d,VF%02d", d, a);
+        break;
+    case GlslFMin: case GlslFMax:
+        emit_bin(f, &c, ext == GlslFMin ? "mini" : "max", dest, size, d, a, bb, cb);
+        break;
+    case GlslFClamp:
+        emit_bin(f, &c, "max", dest, size, d, a, bb, cb);
+        emit_bin(f, &c, "mini", dest, size, d, d, t, cc);
+        break;
+    case GlslFMix:
+        /* a + (b - a) * t */
+        emit_u(f, &c, mn("mulaw", 0, dest), "ACC,VF%02d,VF00w", a);
+        if (size == 1 && cb != ca) {
+            emit_u(f, &c, mn("add", field[cb], dest), "VF%02d,VF00,VF%02d%c", d, bb, field[cb]);
+            emit_u(f, &c, mn("sub", 0, dest), "VF%02d,VF%02d,VF%02d", d, d, a);
+        } else {
+            emit_u(f, &c, mn("sub", 0, dest), "VF%02d,VF%02d,VF%02d", d, bb, a);
+        }
+        emit_bin(f, &c, "madd", dest, size, d, d, t, cc);
+        break;
+    case GlslFloor: case GlslCeil:
+        emit_floor(f, &c, dest, d, a, ext == GlslCeil);
+        break;
+    case GlslFract:
+        emit_floor(f, &c, dest, d, a, 0);
+        emit_u(f, &c, mn("sub", 0, dest), "VF%02d,VF%02d,VF%02d", d, a, d);
+        break;
+    case GlslTrunc:
+        emit_u(f, &c, mn("ftoi0", 0, dest), "VF%02d,VF%02d", d, a);
+        emit_u(f, &c, mn("itof0", 0, dest), "VF%02d,VF%02d", d, d);
+        break;
+    case GlslSqrt: case GlslInverseSqrt:
+        for (int i = 0; i < size; i++) {
+            char sa = size == 1 ? field[ca] : field[i], dc = size == 1 ? 'x' : field[i];
+            if (ext == GlslSqrt)
+                emit_l(f, &c, "sqrt", "Q,VF%02d%c", a, sa);
+            else
+                emit_l(f, &c, "rsqrt", "Q,VF00w,VF%02d%c", a, sa);
+            emit_l(f, &c, "waitq", "");
+            emit_from_q(f, &c, d, dc);
+        }
+        break;
+    case GlslLength:
+        emit_dot(f, &c, d, a, a, argSize);
+        emit_l(f, &c, "sqrt", "Q,VF%02dx", d);
+        emit_l(f, &c, "waitq", "");
+        emit_from_q(f, &c, d, 'x');
+        break;
+    case GlslNormalize:
+        emit_dot(f, &c, d, a, a, size);
+        emit_l(f, &c, "rsqrt", "Q,VF00w,VF%02dx", d);
+        emit_l(f, &c, "waitq", "");
+        emit_u(f, &c, mn("mulq", 0, dest), "VF%02d,VF%02d,Q", d, a);
+        break;
+    case GlslCross:
+        emit_u(f, &c, "opmula.xyz", "ACC,VF%02d,VF%02d", a, bb);
+        emit_u(f, &c, "opmsub.xyz", "VF%02d,VF%02d,VF%02d", d, bb, a);
+        break;
+    case GlslSin: case GlslCos:
+        /* ESIN holds for -pi..pi: x - 2pi * floor((x + pi) / 2pi); cos(x) = sin(x + pi/2). */
+        if (ext == GlslCos) {
+            emit_loi(f, &c, 0x3fc90fdb);
+            emit_u(f, &c, mn("addi", 0, dest), "VF%02d,VF%02d,I", d, a);
+            a = d;
+        }
+        emit_u(f, &c, mn("mulaw", 0, dest), "ACC,VF%02d,VF00w", a);
+        emit_loi(f, &c, 0x40490fdb);
+        emit_u(f, &c, mn("addi", 0, dest), "VF%02d,VF%02d,I", d, a);
+        emit_loi(f, &c, 0x3e22f983);
+        emit_u(f, &c, mn("muli", 0, dest), "VF%02d,VF%02d,I", d, d);
+        emit_floor(f, &c, dest, d, d, 0);
+        emit_loi(f, &c, 0x40c90fdb);
+        emit_u(f, &c, mn("msubi", 0, dest), "VF%02d,VF%02d,I", d, d);
+        emit_efu(f, &c, "esin", dest, d);
+        break;
+    case GlslExp: case GlslExp2:
+        /* EEXP computes e^-x. */
+        emit_loi(f, &c, ext == GlslExp ? 0xbf800000 : 0xbf317218);
+        emit_u(f, &c, mn("muli", 0, dest), "VF%02d,VF%02d,I", d, a);
+        emit_efu(f, &c, "eexp", dest, d);
+        break;
+    }
+}
+
 /* Emits body op b into register d; regs[] holds each operand's register. */
 static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, const int *regs)
 {
@@ -1216,14 +1548,15 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, con
     int a = regs[0], bb = regs[1];
     int cols = b->nops - 1, vreg = regs[cols];   /* matrix * vector */
     int ca = ids[b->ops[0]].comp, cb = b->nops > 1 ? ids[b->ops[1]].comp : 0;
+    int cc = b->nops > 2 ? ids[b->ops[2]].comp : 0;
     const char *dest = size == 1 ? &"x\0y\0z\0w"[ca * 2] : mask_n(size);
     char buf[64], line[96];
     int i;
 
     if (b->line)
-        snprintf(line, sizeof(line), "line %u: %s", (unsigned)b->line, op_name(b->op));
+        snprintf(line, sizeof(line), "line %u: %s", (unsigned)b->line, body_name(b));
     else
-        snprintf(line, sizeof(line), "%s", op_name(b->op));
+        snprintf(line, sizeof(line), "%s", body_name(b));
 
     switch (b->op) {
     case OpFAdd: case OpFSub: case OpFMul: {
@@ -1286,6 +1619,10 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, con
         break;
     case OpVectorShuffle: case OpCompositeConstruct: case OpCompositeExtract:
         emit_map(f, b, d, regs, size, line);
+        break;
+    case OpDot: case OpExtInst:
+        emit_builtin(f, b, size, type_size(ids, ids[b->ops[0]].valType), dest, d, regs,
+                     ca, cb, cc, line);
         break;
     }
 }
@@ -1385,8 +1722,9 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     for (i = 0; i < sh->bodyCount; i++) {
         const BodyOp *b = &sh->body[i];
         /* Shuffles and constructors read fields they have already written if the
-         * result shares an operand's register, so they get a distinct one. */
-        int distinct = is_map_op(b->op), d = 0;
+         * result shares an operand's register, so they and the built-ins get a
+         * distinct one. */
+        int distinct = is_map_op(b->op) || b->op == OpDot || b->op == OpExtInst, d = 0;
         int regs[MAX_OPERANDS] = { 0 };
 
         if (b->dead)

@@ -1,0 +1,1 @@
+builtin_length_float.vert:8: error: vertex shader calls length() on a float; it takes a vec2, vec3 or vec4
