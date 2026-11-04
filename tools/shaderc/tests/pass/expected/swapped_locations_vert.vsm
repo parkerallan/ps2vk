@@ -5,6 +5,8 @@
 ;   VF10.. shader inputs, VF20 gl_Position, VF21 color output
 ;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, constants and temporaries
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
+;   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),
+;   VI10 first vertex
 
 		.vu
 		.align 4
@@ -19,10 +21,22 @@ swapped_locations_vert_CodeStart:
          NOP                                      lq            VF04,0(VI01)               ; GIF tag for this batch
          NOP                                      ilw.x         VI02,1(VI01)               ; vertex count
          NOP                                      iaddiu        VI03,VI01,2                ; first vertex
+         NOP                                      ilw.y         VI09,1(VI01)               ; index list offset, 0 = vertices in order
+         NOP                                      iadd          VI10,VI03,VI00             ; first vertex, kept for indexed fetches
+         NOP                                      iadd          VI06,VI01,VI09             ; index pointer
          NOP                                      iaddiu        VI04,VI00,512              ; output base
          sub.xyzw      VF23,VF00,VF00             sq            VF04,0(VI04)               ; XYZ2 w = 0 (ADC off)
          NOP                                      iaddiu        VI05,VI04,1                ; output pointer
 swapped_locations_vert_loop:
+; indexed batch: the next vertex is first vertex + index * 2
+         NOP                                      ibeq          VI09,VI00,swapped_locations_vert_fetch ; vertices in order: VI03 already points at the next one
+         NOP                                      NOP                                      ; branch delay slot
+         NOP                                      ilw.x         VI07,0(VI06)               ; index
+         NOP                                      iaddiu        VI06,VI06,1
+         NOP                                      iadd          VI07,VI07,VI07
+         NOP                                      iadd          VI08,VI00,VI07             ; index * qwords per vertex
+         NOP                                      iadd          VI03,VI10,VI08             ; vertex it refers to
+swapped_locations_vert_fetch:
 ; load inputs (location order)
          NOP                                      lq            VF10,0(VI03)               ; location 0
          NOP                                      lq            VF11,1(VI03)               ; location 1

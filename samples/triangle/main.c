@@ -3,6 +3,7 @@
  * corners are red, green and blue, using only ps2vk calls. The triangle
  * circles the screen: its position is a translation in a mat4 push constant
  * set every frame, and the vertex shader multiplies each position by it.
+ * The corners are drawn through an index buffer.
  */
 #include <math.h>
 #include <stdio.h>
@@ -33,6 +34,8 @@ static const float vertices[] = {
     -0.6f,  0.6f, 0.5f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f,
 };
 
+static const uint16_t indices[] = { 0, 1, 2 };
+
 int main(void)
 {
     PvkInstance instance;
@@ -41,7 +44,7 @@ int main(void)
     PvkSwapchain swapchain;
     PvkImage images[2];
     uint32_t imageCount = 2;
-    PvkBuffer vertexBuffer;
+    PvkBuffer vertexBuffer, indexBuffer;
     PvkShaderModule vs, fs;
     PvkPipeline pipeline;
     PvkCommandBuffer cmd;
@@ -65,6 +68,12 @@ int main(void)
     CHECK(pvkMapMemory(device, vertexBuffer, &mapped));
     memcpy(mapped, vertices, sizeof(vertices));
     pvkUnmapMemory(device, vertexBuffer);
+
+    PvkBufferCreateInfo indexInfo = { .size = sizeof(indices) };
+    CHECK(pvkCreateBuffer(device, &indexInfo, &indexBuffer));
+    CHECK(pvkMapMemory(device, indexBuffer, &mapped));
+    memcpy(mapped, indices, sizeof(indices));
+    pvkUnmapMemory(device, indexBuffer);
 
     PvkShaderModuleCreateInfo vsInfo = { .code = &tri_vert };
     PvkShaderModuleCreateInfo fsInfo = { .code = &tri_frag };
@@ -117,7 +126,8 @@ int main(void)
         pvkCmdBindPipeline(cmd, pipeline);
         pvkCmdPushConstants(cmd, 0, sizeof(mvp), mvp);
         pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
-        pvkCmdDraw(cmd, 3, 0);
+        pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
+        pvkCmdDrawIndexed(cmd, 3, 0, 0);
         pvkCmdEndRendering(cmd);
         CHECK(pvkEndCommandBuffer(cmd));
 

@@ -601,6 +601,24 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, uint32_t offset, uint32_t size, c
  */
 void pvkCmdBindVertexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset);
 
+/** @brief Size of the indices in an index buffer. */
+typedef enum PvkIndexType {
+    PVK_INDEX_TYPE_UINT16 = 0 /**< 16-bit indices, the only size VU1 reads. */
+} PvkIndexType;
+
+/**
+ * @brief Binds the index buffer for the following pvkCmdDrawIndexed() calls.
+ *
+ * The indices are read by the CPU when a draw is recorded and copied into the
+ * command buffer, so the index buffer may change after the draw.
+ *
+ * @param cmd The command buffer.
+ * @param buffer The buffer holding the indices.
+ * @param offset Byte offset of the first index; must be a multiple of 2.
+ * @param type Must be PVK_INDEX_TYPE_UINT16.
+ */
+void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, PvkIndexType type);
+
 /**
  * @brief Draws vertices from the bound vertex buffer.
  *
@@ -613,6 +631,22 @@ void pvkCmdBindVertexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offse
  * @param firstVertex Index of the first vertex.
  */
 void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t firstVertex);
+
+/**
+ * @brief Draws vertices from the bound vertex buffer in the order the bound
+ *        index buffer gives.
+ *
+ * Needs what pvkCmdDraw() needs plus an index buffer. The vertices a batch
+ * refers to are sent to VU1 as one block, so index lists that stay local in
+ * the vertex buffer (a mesh in draw order) use the least DMA; VU1 then fetches
+ * each vertex by its index. Only whole triangles are drawn.
+ *
+ * @param cmd The command buffer.
+ * @param indexCount Number of indices to draw.
+ * @param firstIndex Position of the first index in the index buffer.
+ * @param vertexOffset Added to every index before it selects a vertex.
+ */
+void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset);
 
 /** @} */
 

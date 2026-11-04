@@ -96,6 +96,8 @@ struct PvkCommandBuffer_T {
     int         gsStateDirty; /* FRAME/ZBUF/TEST must be re-sent before the next draw */
     PvkBuffer   vertexBuffer;
     size_t      vertexOffset;
+    PvkBuffer   indexBuffer;  /* or NULL */
+    size_t      indexOffset;
     uint8_t     push[PVK_MAX_PUSH_CONSTANT_BYTES]; /* what VU1's push constant range holds */
     uint32_t    pushSet;      /* bytes set so far (high-water mark) */
     int         recording;

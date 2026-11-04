@@ -4,7 +4,8 @@
  *
  *   0   context: viewport scale, viewport offset, color scale (per pipeline)
  *   4   push constants: 8 qwords = 128 bytes, written by pvkCmdPushConstants
- *   16  input:   GIF tag for this batch, vertex count (x), then vertices
+ *   16  input:   GIF tag for this batch, a count qword, then vertices, then
+ *       for an indexed batch the 16-bit indices, one per qword (VIF UNPACK S_16)
  *   512 output:  GIF tag, then per vertex RGBAQ, XYZ2 (sent with XGKICK)
  */
 #ifndef PS2VK_VU1_LAYOUT_H
@@ -21,7 +22,8 @@
 
 #define PVK_VU1_INPUT_ADDR        16
 #define PVK_VU1_INPUT_GIFTAG      0
-#define PVK_VU1_INPUT_COUNT       1
+#define PVK_VU1_INPUT_COUNT       1   /* x: vertices to process; y: qword offset from the
+                                         input base of the index list, 0 = vertices in order */
 #define PVK_VU1_INPUT_HEADER      2   /* qwords before the first vertex */
 
 #define PVK_VU1_OUTPUT_ADDR       512

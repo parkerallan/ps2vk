@@ -90,6 +90,8 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
     cmd->gsStateDirty = 0;
     cmd->vertexBuffer = NULL;
     cmd->vertexOffset = 0;
+    cmd->indexBuffer  = NULL;
+    cmd->indexOffset  = 0;
     cmd->pushSet      = 0;
     cmd->rendering    = 0;
     cmd->failed       = 0;
@@ -346,41 +348,137 @@ void pvkCmdBindVertexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offse
     cmd->vertexOffset = offset;
 }
 
+void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, PvkIndexType type)
+{
+    if (type != PVK_INDEX_TYPE_UINT16) {
+        pvk_error("pvkCmdBindIndexBuffer: only PVK_INDEX_TYPE_UINT16 is supported\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (offset & 1) {
+        pvk_error("index buffer offset must be a multiple of 2\n");
+        cmd->failed = 1;
+        return;
+    }
+    cmd->indexBuffer = buffer;
+    cmd->indexOffset = offset;
+}
+
+/* What every draw needs: rendering, a pipeline whose depth format matches the
+ * attachment, a vertex buffer and the push constants the shader reads. Sends
+ * the GS state if it changed. Fails the buffer and returns 0 otherwise. */
+static int draw_ready(PvkCommandBuffer cmd, const char *name)
+{
+    PvkPipeline p = cmd->pipeline;
+
+    if (!cmd->rendering || !p || !cmd->vertexBuffer) {
+        pvk_error("%s needs pvkCmdBeginRendering, a pipeline and a vertex buffer\n", name);
+        cmd->failed = 1;
+        return 0;
+    }
+    if (p->vs->pushConstantBytes > cmd->pushSet) {
+        pvk_error("%s: vertex shader '%s' reads %u bytes of push constants but only %u "
+                  "were set with pvkCmdPushConstants\n", name, p->vs->name,
+                  (unsigned)p->vs->pushConstantBytes, (unsigned)cmd->pushSet);
+        cmd->failed = 1;
+        return 0;
+    }
+    if (p->depthFormat != (cmd->depthImage ? cmd->depthImage->format : PVK_FORMAT_UNDEFINED)) {
+        pvk_error("%s: the pipeline's depthAttachmentFormat (%d) does not match the depth "
+                  "attachment of pvkCmdBeginRendering (%d)\n", name, (int)p->depthFormat,
+                  cmd->depthImage ? (int)cmd->depthImage->format : (int)PVK_FORMAT_UNDEFINED);
+        cmd->failed = 1;
+        return 0;
+    }
+
+    if (cmd->gsStateDirty) {
+        if (!cmd_reserve(cmd, 7))
+            return 0;
+        cmd_gs_state(cmd);
+    }
+    return 1;
+}
+
+/* VU1 input memory a batch can fill, after the header. */
+#define PVK_BATCH_INPUT_QWORDS (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER)
+
+/* Most indices in one batch: whole triangles that fit the output area. */
+#define PVK_BATCH_MAX_INDICES \
+    (((PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / PVK_VU1_OUTPUT_PER_VERTEX) / 3 * 3)
+
+/* Chain qwords a batch of `vertexQwords` of vertices and `indices` indices
+ * needs, including the flush and the program start. */
+static uint32_t batch_qwords(uint32_t vertexQwords, uint32_t indices)
+{
+    uint32_t n = 8 + 2 * (vertexQwords / PVK_MAX_UNPACK_QWORDS + 1);
+    if (indices)
+        n += 1 + (8 + 2 * indices + 15) / 16;
+    return n;
+}
+
+/* Batch header: the GIF tag VU1 copies to its output, how many vertices to
+ * process and, for an indexed batch, where the index list starts. The
+ * previous batch must be finished (VU1 done, output kicked) before its input
+ * and output memory is overwritten, so a flush comes first. */
+static void batch_begin(PvkCommandBuffer cmd, uint32_t count, uint32_t indexOffset)
+{
+    cmd_flush(cmd);
+    packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_INPUT_ADDR, 0);
+    packet2_add_2x_s64(cmd->packet,
+                       GIF_SET_TAG(count, 1, 1, cmd->pipeline->prim, GIF_FLG_PACKED, 2),
+                       GIF_REG_RGBAQ | (GIF_REG_XYZ2 << 4));
+    packet2_add_u32(cmd->packet, count);
+    packet2_add_u32(cmd->packet, indexOffset);
+    packet2_add_u32(cmd->packet, 0);
+    packet2_add_u32(cmd->packet, 0);
+    packet2_utils_vu_close_unpack(cmd->packet);
+}
+
+/* Vertices go straight from the buffer to VU1 memory (DMA REF, no copy). */
+static void batch_vertices(PvkCommandBuffer cmd, uint32_t dest, const uint8_t *src, uint32_t qwords)
+{
+    uint32_t sent = 0;
+
+    while (sent < qwords) {
+        uint32_t chunk = qwords - sent < PVK_MAX_UNPACK_QWORDS ? qwords - sent : PVK_MAX_UNPACK_QWORDS;
+        packet2_utils_vu_add_unpack_data(cmd->packet, dest + sent, (void *)(src + (size_t)sent * 16), chunk, 0);
+        sent += chunk;
+    }
+}
+
+/* Indices, less `base`, copied into the chain: VIF UNPACK S_16 expands each
+ * 16-bit value to one VU1 qword, so VU1 reads them with ILW. */
+static void batch_indices(PvkCommandBuffer cmd, uint32_t dest, const uint16_t *idx, uint32_t count, uint32_t base)
+{
+    uint32_t i;
+
+    packet2_chain_open_cnt(cmd->packet, 0, 0, 0);
+    packet2_vif_stcycl(cmd->packet, 0, 0x0101, 0);
+    packet2_vif_open_unpack(cmd->packet, P2_UNPACK_S_16, dest, 0, 0, 1, 0);
+    for (i = 0; i < count; i += 2) {
+        uint32_t word = idx[i] - base;
+        if (i + 1 < count)
+            word |= (uint32_t)(idx[i + 1] - base) << 16;
+        packet2_add_u32(cmd->packet, word);
+    }
+    while ((u32)cmd->packet->next & 15)
+        packet2_add_u32(cmd->packet, 0); /* VIF NOPs up to the qword boundary */
+    packet2_vif_close_unpack_manual(cmd->packet, count);
+    packet2_chain_close_tag(cmd->packet);
+}
+
 void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t firstVertex)
 {
     PvkPipeline p = cmd->pipeline;
     uint8_t *base;
     uint32_t done = 0;
 
-    if (!cmd->rendering || !p || !cmd->vertexBuffer) {
-        pvk_error("pvkCmdDraw needs pvkCmdBeginRendering, a pipeline and a vertex buffer\n");
-        cmd->failed = 1;
+    if (!draw_ready(cmd, "pvkCmdDraw"))
         return;
-    }
-    if (p->vs->pushConstantBytes > cmd->pushSet) {
-        pvk_error("pvkCmdDraw: vertex shader '%s' reads %u bytes of push constants but only %u "
-                  "were set with pvkCmdPushConstants\n", p->vs->name,
-                  (unsigned)p->vs->pushConstantBytes, (unsigned)cmd->pushSet);
-        cmd->failed = 1;
-        return;
-    }
     if (cmd->vertexOffset + (size_t)(firstVertex + vertexCount) * p->vertexStride > cmd->vertexBuffer->size) {
         pvk_error("pvkCmdDraw reads past the end of the vertex buffer\n");
         cmd->failed = 1;
         return;
-    }
-    if (p->depthFormat != (cmd->depthImage ? cmd->depthImage->format : PVK_FORMAT_UNDEFINED)) {
-        pvk_error("pvkCmdDraw: the pipeline's depthAttachmentFormat (%d) does not match the depth "
-                  "attachment of pvkCmdBeginRendering (%d)\n", (int)p->depthFormat,
-                  cmd->depthImage ? (int)cmd->depthImage->format : (int)PVK_FORMAT_UNDEFINED);
-        cmd->failed = 1;
-        return;
-    }
-
-    if (cmd->gsStateDirty) {
-        if (!cmd_reserve(cmd, 7))
-            return;
-        cmd_gs_state(cmd);
     }
 
     vertexCount -= vertexCount % 3; /* whole triangles only */
@@ -389,36 +487,101 @@ void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t firstVertex
     while (done < vertexCount) {
         uint32_t n      = vertexCount - done < p->maxBatch ? vertexCount - done : p->maxBatch;
         uint32_t qwords = n * p->inputQwords;
-        uint32_t sent   = 0;
 
-        if (!cmd_reserve(cmd, 8 + 2 * (qwords / PVK_MAX_UNPACK_QWORDS + 1)))
+        if (!cmd_reserve(cmd, batch_qwords(qwords, 0)))
             return;
+        batch_begin(cmd, n, 0);
+        batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER, base + (size_t)done * p->vertexStride, qwords);
+        packet2_utils_vu_add_start_program(cmd->packet, 0);
+        done += n;
+    }
+}
 
-        /* The previous batch must be finished (VU1 done, output kicked)
-         * before its input and output memory is overwritten. */
-        cmd_flush(cmd);
+void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset)
+{
+    PvkPipeline p = cmd->pipeline;
+    const uint16_t *idx;
+    const uint8_t *vertices;
+    size_t vertexSlots;
+    uint32_t done = 0;
 
-        /* Batch header: the GIF tag VU1 copies to its output, and the count. */
-        packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_INPUT_ADDR, 0);
-        packet2_add_2x_s64(cmd->packet,
-                           GIF_SET_TAG(n, 1, 1, p->prim, GIF_FLG_PACKED, 2),
-                           GIF_REG_RGBAQ | (GIF_REG_XYZ2 << 4));
-        packet2_add_u32(cmd->packet, n);
-        packet2_add_u32(cmd->packet, 0);
-        packet2_add_u32(cmd->packet, 0);
-        packet2_add_u32(cmd->packet, 0);
-        packet2_utils_vu_close_unpack(cmd->packet);
+    if (!draw_ready(cmd, "pvkCmdDrawIndexed"))
+        return;
+    if (!cmd->indexBuffer) {
+        pvk_error("pvkCmdDrawIndexed needs an index buffer bound with pvkCmdBindIndexBuffer\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (cmd->indexOffset + (size_t)(firstIndex + indexCount) * 2 > cmd->indexBuffer->size) {
+        pvk_error("pvkCmdDrawIndexed reads past the end of the index buffer\n");
+        cmd->failed = 1;
+        return;
+    }
 
-        /* Vertices go straight from the buffer to VU1 memory (DMA REF, no copy). */
-        while (sent < qwords) {
-            uint32_t chunk = qwords - sent < PVK_MAX_UNPACK_QWORDS ? qwords - sent : PVK_MAX_UNPACK_QWORDS;
-            packet2_utils_vu_add_unpack_data(cmd->packet,
-                                             PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + sent,
-                                             base + (size_t)done * p->vertexStride + (size_t)sent * 16,
-                                             chunk, 0);
-            sent += chunk;
+    indexCount -= indexCount % 3; /* whole triangles only */
+    idx         = (const uint16_t *)((const uint8_t *)cmd->indexBuffer->data + cmd->indexOffset) + firstIndex;
+    vertices    = (const uint8_t *)cmd->vertexBuffer->data + cmd->vertexOffset;
+    vertexSlots = (cmd->vertexBuffer->size - cmd->vertexOffset) / p->vertexStride;
+
+    while (done < indexCount) {
+        uint32_t lo = idx[done], hi = lo, n = 0, k, vq;
+        int64_t first;
+
+        /* Grow the batch a triangle at a time while its indices and the run of
+         * vertices they span (sent as one block, so they need no copy) fit. */
+        while (done + n < indexCount && n < PVK_BATCH_MAX_INDICES) {
+            uint32_t l = lo, h = hi;
+            for (k = 0; k < 3; k++) {
+                uint32_t v = idx[done + n + k];
+                if (v < l) l = v;
+                if (v > h) h = v;
+            }
+            if ((h - l + 1) * p->inputQwords + n + 3 > PVK_BATCH_INPUT_QWORDS)
+                break;
+            lo = l;
+            hi = h;
+            n += 3;
         }
 
+        if (n == 0) {
+            /* One triangle whose vertices lie too far apart for a block: send
+             * the three vertices one by one, as an in-order batch. */
+            if (!cmd_reserve(cmd, 8 + 2 * 3))
+                return;
+            for (k = 0; k < 3; k++) {
+                first = (int64_t)idx[done + k] + vertexOffset;
+                if (first < 0 || first >= (int64_t)vertexSlots) {
+                    pvk_error("pvkCmdDrawIndexed: index %u + vertexOffset %d is outside the vertex buffer\n",
+                              (unsigned)idx[done + k], (int)vertexOffset);
+                    cmd->failed = 1;
+                    return;
+                }
+            }
+            batch_begin(cmd, 3, 0);
+            for (k = 0; k < 3; k++)
+                batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + k * p->inputQwords,
+                               vertices + (size_t)((int64_t)idx[done + k] + vertexOffset) * p->vertexStride,
+                               p->inputQwords);
+            packet2_utils_vu_add_start_program(cmd->packet, 0);
+            done += 3;
+            continue;
+        }
+
+        first = (int64_t)lo + vertexOffset;
+        if (first < 0 || (int64_t)hi + vertexOffset >= (int64_t)vertexSlots) {
+            pvk_error("pvkCmdDrawIndexed: indices %u..%u + vertexOffset %d reach outside the vertex buffer\n",
+                      (unsigned)lo, (unsigned)hi, (int)vertexOffset);
+            cmd->failed = 1;
+            return;
+        }
+        vq = (hi - lo + 1) * p->inputQwords;
+
+        if (!cmd_reserve(cmd, batch_qwords(vq, n)))
+            return;
+        batch_begin(cmd, n, PVK_VU1_INPUT_HEADER + vq);
+        batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER,
+                       vertices + (size_t)first * p->vertexStride, vq);
+        batch_indices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + vq, idx + done, n, lo);
         packet2_utils_vu_add_start_program(cmd->packet, 0);
         done += n;
     }

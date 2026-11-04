@@ -45,7 +45,7 @@ Status: ✓ = implemented. *Italic notes* mark features the PS2 can't do nativel
 | ✓ | Triangle lists | `VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST` | `PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST` | GS `PRIM` = triangle |
 | | Triangle strips and fans: shared vertices, less data | `VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP`, `..._TRIANGLE_FAN` | Same enum values | GS `PRIM` = strip/fan; VU1 batches overlap by 2 vertices |
 | | Points, lines, line strips | `VK_PRIMITIVE_TOPOLOGY_POINT_LIST`, `..._LINE_LIST`, `..._LINE_STRIP` | Same enum values, plus `PVK_PRIMITIVE_TOPOLOGY_SPRITE_LIST` for the GS's native rectangles | GS `PRIM` = point/line/line strip/sprite |
-| | Indexed drawing: reuse vertices through an index list | `vkCmdBindIndexBuffer`, `vkCmdDrawIndexed`, `VK_INDEX_TYPE_UINT16` | `pvkCmdBindIndexBuffer`, `pvkCmdDrawIndexed` | Indices and vertices unpacked to VU1, which fetches by index (ps2gl's indexed renderer) |
+| ✓ | Indexed drawing: reuse vertices through an index list | `vkCmdBindIndexBuffer`, `vkCmdDrawIndexed`, `VK_INDEX_TYPE_UINT16` | `pvkCmdBindIndexBuffer`, `pvkCmdDrawIndexed` | A batch sends the run of vertices its indices span as one `UNPACK` (no copy) and the indices as `UNPACK S_16`, one qword each, copied into the chain; the batch header's `y` field points VU1 at the list and the generated loop fetches first vertex + index × qwords (integer adds, no multiply). Batches grow a triangle at a time while both fit; a triangle spanning too far is sent as three single-vertex unpacks |
 | | Instanced drawing: same mesh many times in one call | `instanceCount` in `vkCmdDraw`, `VK_VERTEX_INPUT_RATE_INSTANCE` | `instanceCount` parameter, per-instance attributes | Per-instance data unpacked to VU1; VU1 loops the mesh per instance |
 | | Indirect drawing: draw parameters read from a buffer | `vkCmdDrawIndirect`, `VkDrawIndirectCommand` | `pvkCmdDrawIndirect` | EE reads the parameters when the command buffer is built |
 | | Multiple vertex buffers: attributes in separate buffers | `vkCmdBindVertexBuffers`, `VkVertexInputBindingDescription` | `pvkCmdBindVertexBuffers`, binding descriptions | One `UNPACK` per binding with VIF `STCYCL` to interleave in VU1 memory |
@@ -130,7 +130,7 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | Status | Sample | Exercises |
 | --- | --- | --- |
 | ✓ | Clear | Swapchain, rendering, fences |
-| ✓ | Triangle | Pipeline, vertex buffer, shaders, a mat4 push constant (the triangle circles the screen), NTSC display mode |
+| ✓ | Triangle | Pipeline, vertex and index buffers, shaders, a mat4 push constant (the triangle circles the screen), NTSC display mode |
 | | Textured cube | Depth buffer, textures, uniforms, indexed drawing |
 | | Lighting | Light uniforms, per-vertex lighting |
 | | Skinning | Bone matrices, animation |

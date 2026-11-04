@@ -1200,6 +1200,27 @@ static void vu(FILE *f, const char *upper, const char *lower, const char *commen
 }
 
 /*
+ * VI08 = VI07 * qwords, the VU1 memory offset of an indexed vertex. VU1's
+ * integer unit has no multiply or shift, so VI07 is doubled for each bit of
+ * the count and the set bits are summed; at most 6 instructions for 8 inputs.
+ */
+static void emit_index_scale(FILE *f, uint32_t qwords)
+{
+    int first = 1;
+    char buf[64];
+
+    for (uint32_t bit = 1; bit <= qwords; bit <<= 1) {
+        if (qwords & bit) {
+            snprintf(buf, sizeof(buf), "iadd          VI08,VI%s,VI07", first ? "00" : "08");
+            vu(f, "NOP", buf, first ? "index * qwords per vertex" : NULL);
+            first = 0;
+        }
+        if ((bit << 1) <= qwords)
+            vu(f, "NOP", "iadd          VI07,VI07,VI07", NULL);
+    }
+}
+
+/*
  * VF registers free for constants and shader temporaries. The rest hold the
  * prologue constants (VF01-VF04), inputs (VF10-VF17) and epilogue values (VF20-VF24).
  */
@@ -1659,7 +1680,9 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, ";   VF01 viewport scale, VF02 viewport offset, VF03 color scale\n");
     fprintf(f, ";   VF10.. shader inputs, VF20 gl_Position, VF21 color output\n");
     fprintf(f, ";   VF05-VF09, VF18-VF19, VF25-VF31 push constants, constants and temporaries\n");
-    fprintf(f, ";   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer\n\n");
+    fprintf(f, ";   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer\n");
+    fprintf(f, ";   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),\n");
+    fprintf(f, ";   VI10 first vertex\n\n");
     fprintf(f, "\t\t.vu\n\t\t.align 4\n");
     fprintf(f, "\t\t.global\t%s_CodeStart\n\t\t.global\t%s_CodeEnd\n", sym, sym);
     fprintf(f, "%s_CodeStart:\n", sym);
@@ -1686,6 +1709,10 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     vu(f, "NOP", buf, "vertex count");
     snprintf(buf, sizeof(buf), "iaddiu        VI03,VI01,%d", PVK_VU1_INPUT_HEADER);
     vu(f, "NOP", buf, "first vertex");
+    snprintf(buf, sizeof(buf), "ilw.y         VI09,%d(VI01)", PVK_VU1_INPUT_COUNT);
+    vu(f, "NOP", buf, "index list offset, 0 = vertices in order");
+    vu(f, "NOP", "iadd          VI10,VI03,VI00", "first vertex, kept for indexed fetches");
+    vu(f, "NOP", "iadd          VI06,VI01,VI09", "index pointer");
     snprintf(buf, sizeof(buf), "iaddiu        VI04,VI00,%d", PVK_VU1_OUTPUT_ADDR);
     vu(f, "NOP", buf, "output base");
     vu(f, "sub.xyzw      VF23,VF00,VF00", "sq            VF04,0(VI04)", "XYZ2 w = 0 (ADC off)");
@@ -1711,6 +1738,15 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     }
 
     fprintf(f, "%s_loop:\n", sym);
+    fprintf(f, "; indexed batch: the next vertex is first vertex + index * %u\n", (unsigned)sh->inputCount);
+    snprintf(buf, sizeof(buf), "ibeq          VI09,VI00,%s_fetch", sym);
+    vu(f, "NOP", buf, "vertices in order: VI03 already points at the next one");
+    vu(f, "NOP", "NOP", "branch delay slot");
+    vu(f, "NOP", "ilw.x         VI07,0(VI06)", "index");
+    vu(f, "NOP", "iaddiu        VI06,VI06,1", NULL);
+    emit_index_scale(f, sh->inputCount);
+    vu(f, "NOP", "iadd          VI03,VI10,VI08", "vertex it refers to");
+    fprintf(f, "%s_fetch:\n", sym);
     fprintf(f, "; load inputs (location order)\n");
     for (i = 0; i < sh->inputCount; i++) {
         snprintf(buf, sizeof(buf), "lq            VF%02d,%d(VI03)", 10 + i, i);
