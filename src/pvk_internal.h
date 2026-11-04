@@ -45,9 +45,17 @@ struct PvkDevice_T {
     struct PvkQueue_T queue;
 };
 
+/* Color images keep libdraw's framebuffer_t (the swapchain presents from it);
+ * depth images reuse its address/width/height with a GS_PSMZ_* psm. */
 struct PvkImage_T {
+    PvkFormat     format;
     framebuffer_t fb;
 };
+
+/* GS psm for a PvkFormat, or -1. */
+int pvk_gs_psm(PvkFormat format);
+/* Largest depth value a depth format stores; depth is flipped so near = this. */
+float pvk_depth_max(PvkFormat format);
 
 struct PvkSwapchain_T {
     uint32_t          width, height;
@@ -73,6 +81,9 @@ struct PvkPipeline_T {
     uint32_t vertexStride;    /* bytes per vertex in the vertex buffer */
     uint32_t maxBatch;        /* vertices per VU1 run */
     u64      prim;            /* GS PRIM value for the GIF tag */
+    PvkFormat depthFormat;    /* depth attachment it draws with, or UNDEFINED */
+    uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */
+    uint32_t zmsk;            /* GS ZBUF.ZMSK: 1 = no depth writes */
     float    context[PVK_VU1_CONTEXT_QWORDS * 4] __attribute__((aligned(16)));
 };
 
@@ -80,6 +91,9 @@ struct PvkCommandBuffer_T {
     PvkDevice   device;
     packet2_t  *packet;       /* VIF1 DMA chain */
     PvkPipeline pipeline;
+    PvkImage    colorImage;   /* attachments of the current pvkCmdBeginRendering */
+    PvkImage    depthImage;   /* or NULL */
+    int         gsStateDirty; /* FRAME/ZBUF/TEST must be re-sent before the next draw */
     PvkBuffer   vertexBuffer;
     size_t      vertexOffset;
     uint8_t     push[PVK_MAX_PUSH_CONSTANT_BYTES]; /* what VU1's push constant range holds */

@@ -110,7 +110,7 @@ int main(void)
             .colorAttachment = {
                 .image      = images[imageIndex],
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
-                .clearValue = { { 0.1f, 0.1f, 0.2f, 1.0f } },
+                .clearValue = { .color = { { 0.1f, 0.1f, 0.2f, 1.0f } } },
             },
         };
         pvkCmdBeginRendering(cmd, &rendering);

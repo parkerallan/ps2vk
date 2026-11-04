@@ -5,8 +5,49 @@
 
 #include "pvk_internal.h"
 
-/* Largest 24-bit depth value; depth is flipped so near = large (GS tests are >=). */
-#define PVK_GS_DEPTH_MAX 16777215.0f
+/* Depth test and writes. Depth is stored flipped (near = large) because the GS
+ * only compares with >= and >, so Vulkan's LESS becomes GS GREATER. */
+static PvkResult setup_depth(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info)
+{
+    const PvkPipelineDepthStencilStateCreateInfo *ds = &info->depthStencil;
+
+    switch (info->depthAttachmentFormat) {
+    case PVK_FORMAT_UNDEFINED:
+    case PVK_FORMAT_Z32:
+    case PVK_FORMAT_Z24:
+    case PVK_FORMAT_Z16:
+        break;
+    default:
+        pvk_error("pipeline: depthAttachmentFormat must be a depth format or PVK_FORMAT_UNDEFINED\n");
+        return PVK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    p->depthFormat = info->depthAttachmentFormat;
+
+    if (!ds->depthTestEnable) {
+        /* Vulkan: no test means no writes either. GS ZTE = 0 is not allowed,
+         * so an always-passing test with writes masked does the same. */
+        p->ztst = ZTEST_METHOD_ALLPASS;
+        p->zmsk = 1;
+        return PVK_SUCCESS;
+    }
+    if (p->depthFormat == PVK_FORMAT_UNDEFINED) {
+        pvk_error("pipeline: depthTestEnable needs a depthAttachmentFormat\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+
+    switch (ds->depthCompareOp) {
+    case PVK_COMPARE_OP_NEVER:         p->ztst = ZTEST_METHOD_ALLFAIL;       break;
+    case PVK_COMPARE_OP_LESS:          p->ztst = ZTEST_METHOD_GREATER;       break;
+    case PVK_COMPARE_OP_LESS_OR_EQUAL: p->ztst = ZTEST_METHOD_GREATER_EQUAL; break;
+    case PVK_COMPARE_OP_ALWAYS:        p->ztst = ZTEST_METHOD_ALLPASS;       break;
+    default:
+        pvk_error("pipeline: depthCompareOp %d is not one the GS can do; use LESS, "
+                  "LESS_OR_EQUAL, ALWAYS or NEVER\n", (int)ds->depthCompareOp);
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    p->zmsk = ds->depthWriteEnable ? 0 : 1;
+    return PVK_SUCCESS;
+}
 
 static PvkResult validate_shaders(const PvkShaderCode *vs, const PvkShaderCode *fs)
 {
@@ -83,7 +124,7 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     const PvkViewport *vp   = &info->viewport;
     PvkPipeline p;
     PvkResult res;
-    float *ctx;
+    float *ctx, depthMax;
 
     (void)device;
 
@@ -108,15 +149,22 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     p->maxBatch     = max_batch_vertices(p->inputQwords);
     p->prim         = GS_SET_PRIM(PRIM_TRIANGLE, fs->gouraud, fs->textured, 0, 0, 0, 0, 0, 0);
 
-    /* Vulkan viewport transform, in GS primitive coordinates: x and y go
-     * from NDC [-1, 1] (y down) to pixels, z from [0, 1] to flipped 24-bit depth. */
+    if ((res = setup_depth(p, info)) != PVK_SUCCESS) {
+        free(p);
+        return res;
+    }
+    depthMax = pvk_depth_max(p->depthFormat);
+
+    /* Vulkan viewport transform, in GS primitive coordinates: x and y go from
+     * NDC [-1, 1] (y down) to pixels, z from [0, 1] to the depth format's
+     * flipped integer range. */
     ctx = p->context;
     ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 0]  = vp->width * 0.5f;
     ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 1]  = vp->height * 0.5f;
-    ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 2]  = -PVK_GS_DEPTH_MAX * (vp->maxDepth - vp->minDepth);
+    ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 2]  = -depthMax * (vp->maxDepth - vp->minDepth);
     ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 0] = PVK_GS_ORIGIN + vp->x + vp->width * 0.5f;
     ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 1] = PVK_GS_ORIGIN + vp->y + vp->height * 0.5f;
-    ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 2] = PVK_GS_DEPTH_MAX * (1.0f - vp->minDepth);
+    ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 2] = depthMax * (1.0f - vp->minDepth);
     /* Colors 0..1 to GS 0..255; GS alpha 128 means 1.0. */
     ctx[PVK_VU1_CTX_COLOR_SCALE * 4 + 0] = 255.0f;
     ctx[PVK_VU1_CTX_COLOR_SCALE * 4 + 1] = 255.0f;

@@ -85,6 +85,9 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
 {
     packet2_reset(cmd->packet, 0);
     cmd->pipeline     = NULL;
+    cmd->colorImage   = NULL;
+    cmd->depthImage   = NULL;
+    cmd->gsStateDirty = 0;
     cmd->vertexBuffer = NULL;
     cmd->vertexOffset = 0;
     cmd->pushSet      = 0;
@@ -115,38 +118,159 @@ PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd)
     return cmd->failed ? PVK_ERROR_VALIDATION_FAILED : PVK_SUCCESS;
 }
 
+/* GS ZBUF.ZSM for a depth format. */
+static int gs_zsm(PvkFormat format)
+{
+    switch (format) {
+    case PVK_FORMAT_Z16: return GS_ZBUF_16;
+    case PVK_FORMAT_Z24: return GS_ZBUF_24;
+    default:             return GS_ZBUF_32;
+    }
+}
+
+static int is_depth_format(PvkFormat format)
+{
+    return format == PVK_FORMAT_Z32 || format == PVK_FORMAT_Z24 || format == PVK_FORMAT_Z16;
+}
+
+/* Vulkan depth 0..1 to the flipped integer the depth buffer stores. */
+static uint32_t gs_depth(float depth, PvkFormat format)
+{
+    if (depth < 0.0f) depth = 0.0f;
+    if (depth > 1.0f) depth = 1.0f;
+    return (uint32_t)((1.0f - depth) * pvk_depth_max(format));
+}
+
+/* One packed A+D register write. */
+static qword_t *gs_ad(qword_t *q, u64 value, u64 reg)
+{
+    q->dw[0] = value;
+    q->dw[1] = reg;
+    return q + 1;
+}
+
+/* GS primitive coordinate (12.4 fixed point) of a framebuffer pixel. */
+static int gs_coord(int32_t pixel)
+{
+    return (int)((PVK_GS_ORIGIN + (float)pixel) * 16.0f);
+}
+
+/* The GS fills sprites fastest in narrow vertical strips. */
+#define PVK_CLEAR_STRIP 32
+
+static uint32_t clear_strips(const PvkRect2D *area)
+{
+    return (area->width + PVK_CLEAR_STRIP - 1) / PVK_CLEAR_STRIP;
+}
+
+/* Fill the render area with the clear values: one sprite pass that writes the
+ * color buffer, the depth buffer, or both, masking the one that isn't cleared.
+ * Uses 5 + 2 * clear_strips(area) qwords. */
+static qword_t *cmd_clear(qword_t *q, const PvkRenderingInfo *info, int clearColor, int clearDepth)
+{
+    const PvkRect2D *area = &info->renderArea;
+    const framebuffer_t *fb = &info->colorAttachment.image->fb;
+    const PvkImage depth = info->depthAttachment.image;
+    const float *rgba = info->colorAttachment.clearValue.color.float32;
+    union { float f; u32 u; } one = { 1.0f };
+    uint32_t strips = clear_strips(area);
+    uint32_t z = 0, s;
+    int y0 = gs_coord(area->y), y1 = gs_coord(area->y + (int32_t)area->height);
+
+    if (clearDepth)
+        z = gs_depth(info->depthAttachment.clearValue.depthStencil.depth, depth->format);
+
+    q = gs_ad(q, GIF_SET_TAG(5 + 2 * strips, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, clearColor ? 0 : 0xFFFFFFFF), GS_REG_FRAME);
+    q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
+                             clearDepth ? 0 : 1), GS_REG_ZBUF);
+    q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, ZTEST_METHOD_ALLPASS), GS_REG_TEST);
+    q = gs_ad(q, GS_SET_PRIM(PRIM_SPRITE, 0, 0, 0, 0, 0, 0, 0, 0), GS_REG_PRIM);
+    q = gs_ad(q, GS_SET_RGBAQ((int)(rgba[0] * 255.0f), (int)(rgba[1] * 255.0f),
+                              (int)(rgba[2] * 255.0f), (int)(rgba[3] * 128.0f), one.u), GS_REG_RGBAQ);
+    for (s = 0; s < strips; s++) {
+        int32_t x0 = area->x + (int32_t)(s * PVK_CLEAR_STRIP);
+        int32_t x1 = x0 + PVK_CLEAR_STRIP;
+        if (x1 > area->x + (int32_t)area->width)
+            x1 = area->x + (int32_t)area->width;
+        q = gs_ad(q, GS_SET_XYZ(gs_coord(x0), y0, z), GS_REG_XYZ2);
+        q = gs_ad(q, GS_SET_XYZ(gs_coord(x1), y1, z), GS_REG_XYZ2);
+    }
+    return q;
+}
+
 void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 {
     const PvkRenderingAttachmentInfo *color = &info->colorAttachment;
-    const PvkRect2D *area = &info->renderArea;
+    const PvkRenderingAttachmentInfo *depth = &info->depthAttachment;
+    int clearColor = color->loadOp == PVK_ATTACHMENT_LOAD_OP_CLEAR;
+    int clearDepth = depth->image && depth->loadOp == PVK_ATTACHMENT_LOAD_OP_CLEAR;
     zbuffer_t z = { 0 };
     qword_t *q;
 
-    if (!cmd_reserve(cmd, 72))
+    if (!color->image || color->image->format != PVK_FORMAT_CT32) {
+        pvk_error("pvkCmdBeginRendering: the color attachment must be a PVK_FORMAT_CT32 image\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (depth->image) {
+        if (!is_depth_format(depth->image->format)) {
+            pvk_error("pvkCmdBeginRendering: the depth attachment is not a depth image\n");
+            cmd->failed = 1;
+            return;
+        }
+        if (depth->image->fb.width != color->image->fb.width) {
+            pvk_error("pvkCmdBeginRendering: the depth attachment (%u wide) must be as wide as the "
+                      "color attachment (%u): the GS gives both one width\n",
+                      (unsigned)depth->image->fb.width, (unsigned)color->image->fb.width);
+            cmd->failed = 1;
+            return;
+        }
+    }
+
+    if (!cmd_reserve(cmd, 28 + (clearColor || clearDepth ? 5 + 2 * clear_strips(&info->renderArea) : 0)))
         return;
 
-    /* No depth buffer yet: depth test always passes and nothing is written. */
-    z.enable = DRAW_DISABLE;
-    z.method = ZTEST_METHOD_ALLPASS;
-    z.zsm    = GS_ZBUF_32;
-    z.mask   = 1;
+    /* ZBUF for the environment; the test and write mask come from the pipeline at draw time. */
+    z.enable  = depth->image != NULL;
+    z.method  = ZTEST_METHOD_ALLPASS;
+    z.address = depth->image ? depth->image->fb.address : 0;
+    z.zsm     = depth->image ? gs_zsm(depth->image->format) : GS_ZBUF_32;
+    z.mask    = 1;
 
     q = cmd_open_direct(cmd);
     q = draw_setup_environment(q, 0, &color->image->fb, &z);
     q = draw_primitive_xyoffset(q, 0, PVK_GS_ORIGIN, PVK_GS_ORIGIN);
-    q = draw_disable_tests(q, 0, &z);
-    if (color->loadOp == PVK_ATTACHMENT_LOAD_OP_CLEAR) {
-        /* libdraw adds 2048 to the rectangle it is given (its START_OFFSET). */
-        q = draw_clear(q, 0,
-                       PVK_GS_ORIGIN - 2048.0f + area->x, PVK_GS_ORIGIN - 2048.0f + area->y,
-                       area->width, area->height,
-                       (int)(color->clearValue.float32[0] * 255.0f),
-                       (int)(color->clearValue.float32[1] * 255.0f),
-                       (int)(color->clearValue.float32[2] * 255.0f));
-    }
+    if (clearColor || clearDepth)
+        q = cmd_clear(q, info, clearColor, clearDepth);
     cmd_close_direct(cmd, q);
 
-    cmd->rendering = 1;
+    cmd->colorImage   = color->image;
+    cmd->depthImage   = depth->image;
+    cmd->gsStateDirty = 1;
+    cmd->rendering    = 1;
+}
+
+/* FRAME, ZBUF and TEST for drawing with the bound pipeline into the current
+ * attachments. Sent before the first draw after pvkCmdBeginRendering or
+ * pvkCmdBindPipeline. Uses 7 qwords of the chain. */
+static void cmd_gs_state(PvkCommandBuffer cmd)
+{
+    const framebuffer_t *fb = &cmd->colorImage->fb;
+    const PvkImage depth = cmd->depthImage;
+    const PvkPipeline p = cmd->pipeline;
+    qword_t *q;
+
+    q = cmd_open_direct(cmd);
+    q = gs_ad(q, GIF_SET_TAG(3, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, 0), GS_REG_FRAME);
+    q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
+                             depth ? p->zmsk : 1), GS_REG_ZBUF);
+    /* No alpha test (Vulkan has none); depth test from the pipeline. */
+    q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
+    cmd_close_direct(cmd, q);
+
+    cmd->gsStateDirty = 0;
 }
 
 void pvkCmdEndRendering(PvkCommandBuffer cmd)
@@ -173,7 +297,8 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
         packet2_add_float(cmd->packet, pipeline->context[i]);
     packet2_utils_vu_close_unpack(cmd->packet);
 
-    cmd->pipeline = pipeline;
+    cmd->pipeline     = pipeline;
+    cmd->gsStateDirty = 1; /* its depth test and write mask */
 }
 
 void pvkCmdPushConstants(PvkCommandBuffer cmd, uint32_t offset, uint32_t size, const void *data)
@@ -243,6 +368,19 @@ void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t firstVertex
         pvk_error("pvkCmdDraw reads past the end of the vertex buffer\n");
         cmd->failed = 1;
         return;
+    }
+    if (p->depthFormat != (cmd->depthImage ? cmd->depthImage->format : PVK_FORMAT_UNDEFINED)) {
+        pvk_error("pvkCmdDraw: the pipeline's depthAttachmentFormat (%d) does not match the depth "
+                  "attachment of pvkCmdBeginRendering (%d)\n", (int)p->depthFormat,
+                  cmd->depthImage ? (int)cmd->depthImage->format : (int)PVK_FORMAT_UNDEFINED);
+        cmd->failed = 1;
+        return;
+    }
+
+    if (cmd->gsStateDirty) {
+        if (!cmd_reserve(cmd, 7))
+            return;
+        cmd_gs_state(cmd);
     }
 
     vertexCount -= vertexCount % 3; /* whole triangles only */

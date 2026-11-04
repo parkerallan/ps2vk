@@ -39,7 +39,10 @@ typedef enum PvkResult {
 typedef enum PvkFormat {
     PVK_FORMAT_UNDEFINED = 0,       /**< No format. */
     PVK_FORMAT_R32G32B32A32_SFLOAT, /**< Vertex attribute: 4 floats. */
-    PVK_FORMAT_CT32                 /**< GS PSMCT32 color image (RGBA, 8 bits each). */
+    PVK_FORMAT_CT32,                /**< GS PSMCT32 color image (RGBA, 8 bits each). */
+    PVK_FORMAT_Z32,                 /**< GS PSMZ32 depth image (like VK_FORMAT_D32). */
+    PVK_FORMAT_Z24,                 /**< GS PSMZ24 depth image (like VK_FORMAT_X8_D24). */
+    PVK_FORMAT_Z16                  /**< GS PSMZ16 depth image (like VK_FORMAT_D16). */
 } PvkFormat;
 
 /** @} */
@@ -115,6 +118,47 @@ PvkResult pvkDeviceWaitIdle(PvkDevice device);
 
 /* ======================================================================== */
 /**
+ * @defgroup images Images
+ * @brief Pixel memory in GS VRAM: framebuffers and depth buffers.
+ * @{
+ */
+
+/** @brief An image in GS VRAM, such as a swapchain framebuffer or a depth buffer. */
+typedef struct PvkImage_T         *PvkImage;
+
+/** @brief Parameters for pvkCreateImage(). */
+typedef struct PvkImageCreateInfo {
+    uint32_t  width;  /**< Width in pixels; a depth buffer must be as wide as the framebuffer it is used with. */
+    uint32_t  height; /**< Height in pixels. */
+    PvkFormat format; /**< PVK_FORMAT_Z32, PVK_FORMAT_Z24 or PVK_FORMAT_Z16. */
+} PvkImageCreateInfo;
+
+/**
+ * @brief Allocates an image in GS VRAM.
+ *
+ * Only depth formats can be created this way for now; color images come from
+ * the swapchain. GS VRAM is handed out in creation order and never reclaimed,
+ * so create images once, after the swapchain.
+ *
+ * @param device The device.
+ * @param info Image parameters.
+ * @param[out] image The new image.
+ * @return PVK_SUCCESS, PVK_ERROR_FORMAT_NOT_SUPPORTED, PVK_ERROR_OUT_OF_DEVICE_MEMORY
+ *         or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ */
+PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkImage *image);
+
+/**
+ * @brief Destroys an image created with pvkCreateImage(). Its VRAM stays allocated.
+ * @param device The device.
+ * @param image Image to destroy.
+ */
+void      pvkDestroyImage(PvkDevice device, PvkImage image);
+
+/** @} */
+
+/* ======================================================================== */
+/**
  * @defgroup swapchain Swapchain
  * @brief The framebuffers shown on the TV, and presenting them.
  * @{
@@ -122,8 +166,6 @@ PvkResult pvkDeviceWaitIdle(PvkDevice device);
 
 /** @brief The framebuffers shown on the TV in turn. */
 typedef struct PvkSwapchain_T     *PvkSwapchain;
-/** @brief An image in GS VRAM, such as a swapchain framebuffer. */
-typedef struct PvkImage_T         *PvkImage;
 
 /**
  * @brief The video mode the swapchain is shown in, like a VK_KHR_display mode.
@@ -332,6 +374,36 @@ typedef struct PvkViewport {
     float maxDepth; /**< Depth for clip-space z = 1, usually 1. */
 } PvkViewport;
 
+/**
+ * @brief Depth comparisons. Values match Vulkan's VkCompareOp.
+ *
+ * The GS only compares with >= and >, so ps2vk stores depth flipped (near is
+ * large) and supports the comparisons that map onto that: LESS,
+ * LESS_OR_EQUAL, ALWAYS and NEVER. The others are rejected at pipeline creation.
+ */
+typedef enum PvkCompareOp {
+    PVK_COMPARE_OP_NEVER            = 0, /**< Nothing passes. GS ZTST = 0. */
+    PVK_COMPARE_OP_LESS             = 1, /**< Nearer wins. GS ZTST = GREATER on flipped depth. */
+    PVK_COMPARE_OP_EQUAL            = 2, /**< Not supported. */
+    PVK_COMPARE_OP_LESS_OR_EQUAL    = 3, /**< Nearer or equal wins. GS ZTST = GEQUAL on flipped depth. */
+    PVK_COMPARE_OP_GREATER          = 4, /**< Not supported. */
+    PVK_COMPARE_OP_NOT_EQUAL        = 5, /**< Not supported. */
+    PVK_COMPARE_OP_GREATER_OR_EQUAL = 6, /**< Not supported. */
+    PVK_COMPARE_OP_ALWAYS           = 7  /**< Everything passes. GS ZTST = 1. */
+} PvkCompareOp;
+
+/**
+ * @brief Depth test and write control, like VkPipelineDepthStencilStateCreateInfo.
+ *
+ * All zeros means no depth test and no depth writes, which is what a pipeline
+ * without a depth attachment needs. There is no stencil buffer on the GS.
+ */
+typedef struct PvkPipelineDepthStencilStateCreateInfo {
+    uint32_t     depthTestEnable;  /**< Nonzero to compare against the depth attachment. GS TEST.ZTE/ZTST. */
+    uint32_t     depthWriteEnable; /**< Nonzero to write passing depths; ignored when the test is off. GS ZBUF.ZMSK. */
+    PvkCompareOp depthCompareOp;   /**< Comparison when the test is on. */
+} PvkPipelineDepthStencilStateCreateInfo;
+
 /** @brief Parameters for pvkCreateGraphicsPipeline(). */
 typedef struct PvkGraphicsPipelineCreateInfo {
     PvkShaderModule                vertexShader;   /**< Vertex shader module. */
@@ -341,6 +413,8 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     const PvkVertexInputAttribute *attributes;     /**< One per vertex shader input. */
     PvkPrimitiveTopology           topology;       /**< Must be PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST. */
     PvkViewport                    viewport;       /**< Viewport, fixed for this pipeline. */
+    PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none (like VkPipelineRenderingCreateInfo). Sets the depth range the viewport maps to. */
+    PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth test and write control. */
 } PvkGraphicsPipelineCreateInfo;
 
 /**
@@ -363,7 +437,9 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  * @brief Creates a graphics pipeline.
  *
  * Checks that the shaders match each other and the vertex layout, and
- * precomputes the viewport transform and GS primitive settings.
+ * precomputes the viewport transform, GS primitive settings and depth test.
+ * A depth test needs a depthAttachmentFormat, and the comparison must be one
+ * the GS can do (see PvkCompareOp).
  *
  * @param device The device.
  * @param info Pipeline parameters.
@@ -409,6 +485,18 @@ typedef struct PvkClearColorValue {
     float float32[4]; /**< Red, green, blue, alpha, each 0 to 1. */
 } PvkClearColorValue;
 
+/** @brief A clear depth. */
+typedef struct PvkClearDepthStencilValue {
+    float    depth;   /**< Depth to fill with, 0 to 1; usually 1 (far). */
+    uint32_t stencil; /**< Unused: the GS has no stencil buffer. */
+} PvkClearDepthStencilValue;
+
+/** @brief The value an attachment is cleared to; which member is used depends on the attachment. */
+typedef union PvkClearValue {
+    PvkClearColorValue        color;        /**< For the color attachment. */
+    PvkClearDepthStencilValue depthStencil; /**< For the depth attachment. */
+} PvkClearValue;
+
 /** @brief A rectangle in pixels. */
 typedef struct PvkRect2D {
     int32_t  x;      /**< Left edge. */
@@ -417,17 +505,24 @@ typedef struct PvkRect2D {
     uint32_t height; /**< Height. */
 } PvkRect2D;
 
-/** @brief The image to render into and how to start it. */
+/** @brief An image to render into and how to start it. */
 typedef struct PvkRenderingAttachmentInfo {
-    PvkImage            image;      /**< Target image, e.g. a swapchain image. */
+    PvkImage            image;      /**< Target image: a swapchain image, or a depth image; NULL for no attachment. */
     PvkAttachmentLoadOp loadOp;     /**< What to do with its contents first. */
-    PvkClearColorValue  clearValue; /**< Color used when loadOp is CLEAR. */
+    PvkClearValue       clearValue; /**< Value used when loadOp is CLEAR. */
 } PvkRenderingAttachmentInfo;
 
-/** @brief Parameters for pvkCmdBeginRendering(), like Vulkan 1.3 dynamic rendering. */
+/**
+ * @brief Parameters for pvkCmdBeginRendering(), like Vulkan 1.3 dynamic rendering.
+ *
+ * The depth attachment is optional (image NULL). When present it must be as
+ * wide as the color attachment, since the GS gives both buffers one width, and
+ * the pipelines drawn with it must name its format in depthAttachmentFormat.
+ */
 typedef struct PvkRenderingInfo {
     PvkRect2D                  renderArea;      /**< Area to render (and clear). */
     PvkRenderingAttachmentInfo colorAttachment; /**< The color image. */
+    PvkRenderingAttachmentInfo depthAttachment; /**< The depth image, or image NULL for none. */
 } PvkRenderingInfo;
 
 /**
@@ -461,9 +556,13 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd);
 PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd);
 
 /**
- * @brief Starts rendering into an image, clearing it if requested.
+ * @brief Starts rendering into a color image and optionally a depth image, clearing them if requested.
+ *
+ * Sets GS FRAME, ZBUF and XYOFFSET. A clear is a sprite fill over the render
+ * area; depth and color are cleared in one pass when both ask for it.
+ *
  * @param cmd The command buffer.
- * @param info Target image, render area and load operation.
+ * @param info Target images, render area and load operations.
  */
 void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info);
 
@@ -506,7 +605,8 @@ void pvkCmdBindVertexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offse
  * @brief Draws vertices from the bound vertex buffer.
  *
  * Must be called between pvkCmdBeginRendering() and pvkCmdEndRendering(),
- * with a pipeline and vertex buffer bound. Only whole triangles are drawn.
+ * with a pipeline and vertex buffer bound. The pipeline's depthAttachmentFormat
+ * must match the depth attachment (or its absence). Only whole triangles are drawn.
  *
  * @param cmd The command buffer.
  * @param vertexCount Number of vertices to draw.

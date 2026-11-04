@@ -56,8 +56,8 @@ Status: ✓ = implemented. *Italic notes* mark features the PS2 can't do nativel
 
 | Status | Feature | Vulkan | ps2vk | PS2 implementation |
 | --- | --- | --- | --- | --- |
-| | Depth buffer: near objects hide far ones | `VkImage` with `D16`/`D24`/`D32` format, `pDepthAttachment` in `VkRenderingInfo` | Depth `PvkFormat`s, depth attachment in `PvkRenderingInfo` | GS `ZBUF` with `PSMZ16`/`PSMZ24`/`PSMZ32` |
-| | Depth test and write control | `VkPipelineDepthStencilStateCreateInfo` | `PvkPipelineDepthStencilStateCreateInfo` | GS `TEST.ZTE`/`ZTST`, `ZBUF.ZMSK`; depth flipped because the GS only has ≥ and > tests |
+| ✓ | Depth buffer: near objects hide far ones | `VkImage` with `D16`/`D24`/`D32` format, `pDepthAttachment` in `VkRenderingInfo` | `PVK_FORMAT_Z32/Z24/Z16`, `pvkCreateImage` (depth formats only so far), `depthAttachment` in `PvkRenderingInfo` with a `PvkClearValue` union | GS `ZBUF` with `PSMZ16`/`PSMZ24`/`PSMZ32`, page aligned in VRAM; must be as wide as the framebuffer (one `FBW`); a clear is one sprite pass writing color, depth or both with the other masked (`FBMSK`/`ZMSK`) |
+| ✓ | Depth test and write control | `VkPipelineDepthStencilStateCreateInfo` | `PvkPipelineDepthStencilStateCreateInfo` and `depthAttachmentFormat` in the pipeline; `PvkCompareOp` LESS, LESS_OR_EQUAL, ALWAYS, NEVER | GS `TEST.ZTE`/`ZTST`, `ZBUF.ZMSK`, sent before the first draw after a bind or begin; depth flipped because the GS only has ≥ and > tests, scaled to the format's range (Z32 stops below 2³¹ for `ftoi0`); the alpha test is off |
 | | Images you can render into and sample: render to texture | `vkCreateImage` with usage `COLOR_ATTACHMENT` + `SAMPLED`, `vkCreateImageView` | `pvkCreateImage`, `pvkCreateImageView` | `FRAME` points at the texture's VRAM; `TEX0` later reads the same address |
 | | Load/store ops | `VkAttachmentLoadOp`, `VkAttachmentStoreOp` | `PvkAttachmentLoadOp`, `PvkAttachmentStoreOp` | Clear = sprite fill; load/store/don't care = nothing (GS draws straight into VRAM) |
 | | Color write mask | `VkPipelineColorBlendAttachmentState.colorWriteMask` | Same field | GS `FRAME.FBMSK` |
