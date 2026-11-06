@@ -6,13 +6,16 @@
  *
  * This version accepts:
  *
- *   vertex:   gl_Position and an optional color output computed from vec4 inputs,
- *             push constants (a block of float/vec2/vec3/vec4/matrix members and
+ *   vertex:   gl_Position, an optional vec4 color output and an optional vec2
+ *             texture coordinate output computed from vec4 inputs, push
+ *             constants (a block of float/vec2/vec3/vec4/matrix members and
  *             arrays of vectors, up to 128 bytes) and float/vec4/matrix constants
  *             with +, -, *, / and negation, matrix * vector, swizzles (v.xyz,
  *             v.bgra), component reads (v.w), vector constructors and math
  *             built-ins
- *   fragment: <color output> = <interpolated color input>;
+ *   fragment: outColor = vColor;                      (Gouraud)
+ *             outColor = texture(tex, vUV);           (GS TFX decal)
+ *             outColor = texture(tex, vUV) * vColor;  (GS TFX modulate)
  *
  * Anything else is rejected with an error that says why, the way a Vulkan
  * driver rejects a shader that uses a feature the device lacks.
@@ -29,7 +32,6 @@
 
 #define MAX_IDS     4096
 #define MAX_INPUTS  8
-#define MAX_OUTPUTS 8
 #define MAX_BODY    256
 #define MAX_OPERANDS 5
 
@@ -46,7 +48,7 @@ enum {
     OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
     OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
     OpCompositeExtract = 81, OpTranspose = 84, OpSampledImage = 86,
-    OpImageSampleImplicitLod = 87,
+    OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
     OpFNegate = 127, OpFAdd = 129, OpFSub = 131, OpFMul = 133, OpFDiv = 136,
     OpVectorTimesScalar = 142, OpMatrixTimesScalar = 143, OpVectorTimesMatrix = 144,
     OpMatrixTimesVector = 145, OpMatrixTimesMatrix = 146, OpOuterProduct = 147, OpDot = 148,
@@ -56,7 +58,7 @@ enum {
 };
 
 enum { DecBlock = 2, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
-       DecBuiltIn = 11, DecLocation = 30, DecOffset = 35 };
+       DecBuiltIn = 11, DecLocation = 30, DecBinding = 33, DecOffset = 35 };
 enum { BuiltInPosition = 0 };
 enum { ScUniformConstant = 0, ScInput = 1, ScUniform = 2, ScOutput = 3, ScFunction = 7,
        ScPushConstant = 9, ScStorageBuffer = 12 };
@@ -104,7 +106,8 @@ static const ExtFn *ext_fn(uint32_t num)
 
 /* What we know about each SPIR-V result id. */
 typedef enum { ID_NONE, ID_TYPE, ID_CONST, ID_VAR, ID_VALUE, ID_PTR } IdKind;
-typedef enum { T_OTHER, T_FLOAT, T_INT, T_VECTOR, T_MATRIX, T_STRUCT, T_POINTER, T_ARRAY } TypeKind;
+typedef enum { T_OTHER, T_FLOAT, T_INT, T_VECTOR, T_MATRIX, T_STRUCT, T_POINTER, T_ARRAY,
+               T_SAMPLER /* sampler2D: OpTypeSampledImage */ } TypeKind;
 
 typedef struct {
     IdKind   kind;
@@ -125,6 +128,7 @@ typedef struct {
     /* variables and pointers */
     uint32_t varType;        /* pointer type id */
     int      location;       /* -1 if none */
+    int      binding;        /* -1 if none */
     int      builtin;        /* -1 if none */
     int      structPosMember;/* gl_PerVertex: member index decorated Position */
     int      isPosition;     /* pointer that targets gl_Position */
@@ -135,11 +139,16 @@ typedef struct {
     uint32_t aliasOf;        /* id whose register this value shares, 0 if its own */
     int      comp;           /* field (0..3) holding a scalar value */
     int      mapOp;          /* 1 + body index of the shuffle/constructor that builds it, 0 if none */
+    /* fragment shaders: what a value is, since the GS has fixed functions only */
+    int      texel;          /* TEXEL_* */
     const char *name;
 } IdInfo;
 
+enum { TEXEL_NONE, TEXEL_SAMPLER, TEXEL_SAMPLE, TEXEL_SAMPLE_TIMES_COLOR };
+
 typedef struct {
     int location;
+    int size;                /* 4 (a color) or 2 (a texture coordinate) */
     uint32_t var;
 } Var;
 
@@ -179,6 +188,7 @@ static const char *op_name(uint32_t op)
     case OpCompositeConstruct: return "OpCompositeConstruct (a vector constructor)";
     case OpCompositeExtract: return "OpCompositeExtract (a component read)";
     case OpSampledImage: case OpImageSampleImplicitLod: return "texture sampling";
+    case OpImageSampleExplicitLod: return "textureLod() (a texture read at an explicit level of detail)";
     case OpFNegate: return "OpFNegate (negation)";
     case OpFAdd: return "OpFAdd (addition)";
     case OpFSub: return "OpFSub (subtraction)";
@@ -211,7 +221,8 @@ static void unsupported(uint32_t op, const char *stage)
 
     if (!strcmp(stage, "fragment"))
         fail("fragment shader uses %s: the GS cannot run code per pixel. "
-             "Only 'outColor = <interpolated color input>;' is supported so far", what);
+             "Only 'outColor = <color input>;', 'outColor = texture(<sampler>, <texcoord input>);' "
+             "and their product are supported so far", what);
     fail("vertex shader uses %s, which this version of ps2vk-shaderc does not "
          "compile yet", what);
 }
@@ -237,13 +248,6 @@ static uint32_t *read_spirv(const char *path, size_t *words)
         fail("%s is not a SPIR-V binary (bad magic number)", path);
     *words = size / 4;
     return data;
-}
-
-static int is_vec4_float(const IdInfo *ids, uint32_t type)
-{
-    const IdInfo *t = &ids[type];
-    return t->type == T_VECTOR && t->elemCount == 4 &&
-           ids[t->elemType].type == T_FLOAT && ids[t->elemType].width == 32;
 }
 
 static int is_float(const IdInfo *ids, uint32_t type)
@@ -327,8 +331,15 @@ typedef struct {
     uint32_t glsl450;               /* id of the GLSL.std.450 import, 0 if none */
     Var      inputs[MAX_INPUTS];
     int      inputCount;
-    Var      outputs[MAX_OUTPUTS];  /* location outputs only */
-    int      outputCount;
+    int      colorInput;            /* fragment: index into inputs[] of the vec4 input, -1 if none */
+    int      texcoordInput;         /* fragment: index into inputs[] of the vec2 input, -1 if none */
+    uint32_t samplerVar;            /* fragment: the sampler2D variable, 0 if none */
+    int      samplerBinding;        /* its binding, -1 if none */
+    int      textureFunction;       /* fragment: GS TEX0.TFX, 0 modulate, 1 decal */
+    uint32_t colorVar;              /* vertex: the vec4 output variable, 0 if none */
+    uint32_t texcoordVar;           /* vertex: the vec2 output variable, 0 if none */
+    int      texcoordLocation;      /* -1 if none */
+    uint32_t texcoordValue;         /* value id stored to the texcoord output, 0 if never */
     uint32_t pushVar;               /* push constant block variable, 0 if none */
     uint32_t pushBytes;             /* size of the push constant block */
     uint32_t pushBase;              /* synthetic id of push constant qword 0 (then qword 1, ...) */
@@ -535,10 +546,11 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 
     memset(sh, 0, sizeof(*sh));
     sh->execModel = ~0u;
-    sh->colorLocation = -1;
+    sh->colorLocation = sh->texcoordLocation = -1;
+    sh->colorInput = sh->texcoordInput = sh->samplerBinding = -1;
     sh->pushBase = bound;
     for (uint32_t i = 0; i < bound + PVK_VU1_PUSH_QWORDS; i++) {
-        ids[i].location = ids[i].builtin = ids[i].structPosMember = -1;
+        ids[i].location = ids[i].binding = ids[i].builtin = ids[i].structPosMember = -1;
         ids[i].fromInput = ids[i].fromPush = -1;
     }
     for (int q = 0; q < PVK_VU1_PUSH_QWORDS; q++) {
@@ -579,6 +591,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         case OpDecorate:
             if (w[2] == DecLocation)
                 ids[w[1]].location = (int)w[3];
+            else if (w[2] == DecBinding)
+                ids[w[1]].binding = (int)w[3];
             else if (w[2] == DecBuiltIn)
                 ids[w[1]].builtin = (int)w[3];
             else if (w[2] == DecArrayStride)
@@ -624,7 +638,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_MATRIX;
             ids[w[1]].elemType = w[2]; ids[w[1]].elemCount = w[3];
             break;
-        case OpTypeImage: case OpTypeSampler: case OpTypeSampledImage:
+        case OpTypeSampledImage:
+            ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_SAMPLER;
+            break;
+        case OpTypeImage: case OpTypeSampler:
         case OpTypeVoid: case OpTypeBool: case OpTypeRuntimeArray:
         case OpTypeFunction:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_OTHER;
@@ -660,11 +677,20 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 fail("fragment shader reads push constant '%s': the GS cannot read per-draw "
                      "values. Push constants are only available in vertex shaders",
                      ids[id].name ? ids[id].name : "variable");
-            if (!inFunction && storage != ScInput && storage != ScOutput && storage != ScPushConstant)
+            if (!inFunction && storage == ScUniformConstant && ids[ids[type].elemType].type == T_SAMPLER) {
+                if (sh->execModel != ExecFragment)
+                    fail("vertex shader declares sampler '%s': VU1 cannot read textures. "
+                         "Sample in the fragment shader instead",
+                         ids[id].name ? ids[id].name : "variable");
+            } else if (!inFunction && storage == ScUniformConstant) {
+                fail("'%s' is a separate texture or sampler; the GS binds both together, "
+                     "so declare a sampler2D", ids[id].name ? ids[id].name : "variable");
+            } else if (!inFunction && storage != ScInput && storage != ScOutput && storage != ScPushConstant) {
                 fail("'%s' is a uniform or buffer; this version of ps2vk-shaderc supports "
-                     "only shader inputs, outputs and push constants (uniform blocks need "
-                     "pipeline layouts, which are not implemented yet)",
+                     "only shader inputs, outputs, push constants and a sampler2D (uniform "
+                     "blocks need pipeline layouts, which are not implemented yet)",
                      ids[id].name ? ids[id].name : "variable");
+            }
             if (inFunction && storage == ScFunction)
                 fail("local variables are not supported yet");
             break;
@@ -700,17 +726,41 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             const char *name = ids[id].name ? ids[id].name : "variable";
 
             if (storage == ScInput) {
+                int size = type_size(ids, pointee);
+
                 if (ids[id].builtin >= 0)
                     fail("built-in input '%s' is not supported", name);
                 if (ids[id].location < 0)
                     fail("input '%s' has no location", name);
-                if (!is_vec4_float(ids, pointee))
-                    fail("input '%s' must be a vec4 for now", name);
+                if (sh->execModel == ExecVertex) {
+                    if (size != 4)
+                        fail("input '%s' must be a vec4 for now", name);
+                } else if (size == 4) {
+                    if (sh->colorInput >= 0)
+                        fail("fragment shader has two vec4 inputs; the GS interpolates only one color");
+                    sh->colorInput = sh->inputCount;
+                } else if (size == 2) {
+                    if (sh->texcoordInput >= 0)
+                        fail("fragment shader has two vec2 inputs; the GS interpolates only one "
+                             "texture coordinate pair");
+                    sh->texcoordInput = sh->inputCount;
+                } else {
+                    fail("fragment input '%s' must be a vec4 (the color) or a vec2 (the texture "
+                         "coordinate); the GS interpolates nothing else", name);
+                }
                 if (sh->inputCount == MAX_INPUTS)
                     fail("too many inputs (max %d)", MAX_INPUTS);
                 sh->inputs[sh->inputCount].location = ids[id].location;
+                sh->inputs[sh->inputCount].size = size;
                 sh->inputs[sh->inputCount].var = id;
                 sh->inputCount++;
+            } else if (storage == ScUniformConstant) {
+                if (sh->samplerVar)
+                    fail("fragment shader declares two samplers; the GS reads one texture per draw");
+                if (ids[id].binding < 0)
+                    fail("sampler '%s' has no binding", name);
+                sh->samplerVar = id;
+                sh->samplerBinding = ids[id].binding;
             } else if (storage == ScPushConstant) {
                 if (sh->pushVar)
                     fail("shader has two push constant blocks; only one is allowed");
@@ -725,15 +775,27 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 } else if (ids[id].builtin >= 0) {
                     fail("built-in output '%s' is not supported", name);
                 } else {
+                    int size = type_size(ids, pointee);
+
                     if (ids[id].location < 0)
                         fail("output '%s' has no location", name);
-                    if (!is_vec4_float(ids, pointee))
-                        fail("output '%s' must be a vec4 for now", name);
-                    if (sh->outputCount == MAX_OUTPUTS)
-                        fail("too many outputs");
-                    sh->outputs[sh->outputCount].location = ids[id].location;
-                    sh->outputs[sh->outputCount].var = id;
-                    sh->outputCount++;
+                    if (size == 4) {
+                        if (sh->colorVar)
+                            fail("shader has 2 color outputs; the GS can interpolate only one color");
+                        sh->colorVar = id;
+                        sh->colorLocation = ids[id].location;
+                    } else if (size == 2 && sh->execModel == ExecVertex) {
+                        if (sh->texcoordVar)
+                            fail("vertex shader has 2 texture coordinate outputs; the GS "
+                                 "interpolates only one pair (S, T)");
+                        sh->texcoordVar = id;
+                        sh->texcoordLocation = ids[id].location;
+                    } else if (sh->execModel == ExecVertex) {
+                        fail("vertex output '%s' must be a vec4 (the color) or a vec2 (the "
+                             "texture coordinate); the GS interpolates nothing else", name);
+                    } else {
+                        fail("fragment output '%s' must be a vec4", name);
+                    }
                 }
             }
         }
@@ -746,18 +808,21 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             if (sh->inputs[j].location < sh->inputs[i].location) {
                 Var t = sh->inputs[i]; sh->inputs[i] = sh->inputs[j]; sh->inputs[j] = t;
             }
-    for (int i = 0; i < sh->inputCount; i++)
+    for (int i = 0; i < sh->inputCount; i++) {
         ids[sh->inputs[i].var].fromInput = i;
+        if (sh->execModel == ExecFragment) {
+            if (sh->inputs[i].size == 4)
+                sh->colorInput = i;
+            else
+                sh->texcoordInput = i;
+        }
+    }
 
-    if (sh->outputCount > 1)
-        fail("shader has %d color outputs; the GS can interpolate only one color", sh->outputCount);
-    if (sh->outputCount == 1)
-        sh->colorLocation = sh->outputs[0].location;
     if (sh->execModel == ExecFragment) {
-        if (sh->outputCount != 1 || sh->colorLocation != 0)
+        if (!sh->colorVar || sh->colorLocation != 0)
             fail("fragment shader must have exactly one vec4 output at location 0");
-        if (sh->inputCount > 1)
-            fail("fragment shader has %d inputs; the GS interpolates only one color", sh->inputCount);
+        if (sh->samplerVar && sh->texcoordInput < 0)
+            fail("fragment shader declares a sampler but has no vec2 input to sample it with");
     }
 
     /* Pass 2: the function body. */
@@ -809,6 +874,12 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     ids[id].comp = ids[ptr].comp;
                     break;
                 }
+                if (ptr && ptr == sh->samplerVar) {
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    ids[id].texel = TEXEL_SAMPLER;
+                    break;
+                }
                 if ((ids[ptr].kind != ID_VAR && ids[ptr].kind != ID_PTR) || ids[ptr].fromInput < 0)
                     fail("%s shader reads something other than a vertex input or push constant", stage);
                 ids[id].kind = ID_VALUE;
@@ -817,11 +888,53 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[id].comp = ids[ptr].comp;   /* in.w loaded through an access chain */
                 break;
             }
+            case OpImageSampleImplicitLod: {
+                /* texture(tex, vUV): the GS does it, provided the coordinate is the
+                 * interpolated vec2 input as is. */
+                uint32_t id = w[2], sampler = w[3], coord = w[4];
+
+                if (sh->execModel != ExecFragment)
+                    unsupported(op, stage);
+                if (ids[sampler].kind != ID_VALUE || ids[sampler].texel != TEXEL_SAMPLER)
+                    fail("corrupt SPIR-V: texture() called on something other than the sampler");
+                if (ids[coord].kind != ID_VALUE || ids[coord].fromInput != sh->texcoordInput ||
+                    ids[coord].comp || n != 5)
+                    fail("fragment shader samples with a coordinate other than its vec2 input "
+                         "as is; the GS reads S and T straight from the vertex");
+                ids[id].kind = ID_VALUE;
+                ids[id].valType = w[1];
+                ids[id].texel = TEXEL_SAMPLE;
+                break;
+            }
             case OpFAdd: case OpFSub: case OpFMul: case OpFDiv: case OpFNegate:
             case OpVectorTimesScalar: {
                 BodyOp *b;
                 int size;
 
+                if (sh->execModel == ExecFragment && op == OpFMul) {
+                    /* texture(...) * vColor, either way round: GS modulate. */
+                    uint32_t a = w[3], c = w[4];
+                    if (ids[a].kind == ID_VALUE && ids[a].texel == TEXEL_SAMPLE &&
+                        ids[c].kind == ID_VALUE && ids[c].fromInput == sh->colorInput && sh->colorInput >= 0) {
+                        /* a * c as written */
+                    } else if (ids[c].kind == ID_VALUE && ids[c].texel == TEXEL_SAMPLE &&
+                               ids[a].kind == ID_VALUE && ids[a].fromInput == sh->colorInput && sh->colorInput >= 0) {
+                        /* c * a */
+                    } else {
+                        fail("fragment shader multiplies something other than the texture sample "
+                             "by the color input; the GS can only modulate the texture by the "
+                             "vertex color");
+                    }
+                    ids[w[2]].kind = ID_VALUE;
+                    ids[w[2]].valType = w[1];
+                    ids[w[2]].texel = TEXEL_SAMPLE_TIMES_COLOR;
+                    break;
+                }
+                if (sh->execModel == ExecFragment && (op == OpFAdd || op == OpFSub) &&
+                    ((ids[w[3]].kind == ID_VALUE && ids[w[3]].texel == TEXEL_SAMPLE) ||
+                     (ids[w[4]].kind == ID_VALUE && ids[w[4]].texel == TEXEL_SAMPLE)))
+                    fail("fragment shader adds to the texture sample; the GS combines a texture "
+                         "with the vertex color only by multiplying (modulate) or ignoring it (decal)");
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 ids[w[2]].kind = ID_VALUE;
@@ -1126,16 +1239,33 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 uint32_t ptr = w[1], val = w[2];
 
                 if (sh->execModel == ExecFragment) {
-                    if (ids[val].kind != ID_VALUE || ids[val].fromInput < 0)
-                        fail("%s shader stores a computed value; only copying an input "
-                             "unchanged is supported so far", stage);
-                } else if (value_size(ids, val, stage) != 4) {
-                    fail("%s shader stores something other than a vec4 to an output", stage);
+                    if (ids[val].kind != ID_VALUE)
+                        fail("fragment shader stores a computed value; only the color input, "
+                             "the texture sample or their product can be written");
+                    if (ids[val].texel == TEXEL_NONE && ids[val].fromInput != sh->colorInput)
+                        fail("fragment shader writes its vec2 input as the color; only the color "
+                             "input, the texture sample or their product can be written");
+                    if (ids[val].texel == TEXEL_SAMPLER)
+                        fail("corrupt SPIR-V: fragment shader stores the sampler itself");
+                    if (ptr != sh->colorVar)
+                        fail("fragment shader writes to something other than its output");
+                    sh->colorValue = val;
+                    sh->textureFunction = ids[val].texel == TEXEL_SAMPLE ? 1 : 0;
+                    break;
                 }
                 if (ids[ptr].isPosition) {
+                    if (value_size(ids, val, stage) != 4)
+                        fail("vertex shader stores something other than a vec4 to gl_Position");
                     sh->positionValue = val;
-                } else if (sh->outputCount == 1 && ptr == sh->outputs[0].var) {
+                } else if (ptr && ptr == sh->colorVar) {
+                    if (value_size(ids, val, stage) != 4)
+                        fail("vertex shader stores something other than a vec4 to the color output");
                     sh->colorValue = val;
+                } else if (ptr && ptr == sh->texcoordVar) {
+                    if (value_size(ids, val, stage) != 2)
+                        fail("vertex shader stores something other than a vec2 to the texture "
+                             "coordinate output");
+                    sh->texcoordValue = val;
                 } else {
                     fail("%s shader writes to something other than its outputs", stage);
                 }
@@ -1161,6 +1291,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             used[root(ids, sh->positionValue)] = 1;
         if (sh->colorValue)
             used[root(ids, sh->colorValue)] = 1;
+        if (sh->texcoordValue)
+            used[root(ids, sh->texcoordValue)] = 1;
         for (int i = 0; i < sh->bodyCount; i++)
             if (is_map_op(sh->body[i].op) && !used[sh->body[i].result])
                 sh->body[i].dead = 1;
@@ -1169,10 +1301,13 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     if (sh->execModel == ExecVertex) {
         if (!sh->positionValue)
             fail("vertex shader never writes gl_Position");
-        if (sh->outputCount == 1 && !sh->colorValue)
+        if (sh->colorVar && !sh->colorValue)
             fail("vertex shader declares a color output but never writes it");
+        if (sh->texcoordVar && !sh->texcoordValue)
+            fail("vertex shader declares a texture coordinate output but never writes it");
     } else if (!sh->colorValue) {
-        fail("fragment shader must write 'outColor = <color input>;'");
+        fail("fragment shader must write 'outColor = <color input>;' or "
+             "'outColor = texture(<sampler>, <texcoord input>);'");
     }
 }
 
@@ -1664,6 +1799,10 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     r.lastUse[root(ids, sh->positionValue)] = MAX_BODY;
     if (sh->colorValue)
         r.lastUse[root(ids, sh->colorValue)] = MAX_BODY;
+    if (sh->texcoordValue) {
+        r.lastUse[root(ids, sh->texcoordValue)] = MAX_BODY;
+        r.busy[PVK_VU1_TEXCOORD_REG] = 1;   /* the STQ output lives there */
+    }
     for (i = 0; i < MAX_IDS; i++)
         if ((ids[i].kind == ID_VALUE || ids[i].kind == ID_VAR) && ids[i].fromInput >= 0)
             r.reg[i] = 10 + ids[i].fromInput;
@@ -1679,6 +1818,8 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, ";\n; VU1 registers:\n");
     fprintf(f, ";   VF01 viewport scale, VF02 viewport offset, VF03 color scale\n");
     fprintf(f, ";   VF10.. shader inputs, VF20 gl_Position, VF21 color output\n");
+    if (sh->texcoordValue)
+        fprintf(f, ";   VF%02d texture coordinate output (S, T, Q)\n", PVK_VU1_TEXCOORD_REG);
     fprintf(f, ";   VF05-VF09, VF18-VF19, VF25-VF31 push constants, constants and temporaries\n");
     fprintf(f, ";   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer\n");
     fprintf(f, ";   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),\n");
@@ -1718,13 +1859,17 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     vu(f, "sub.xyzw      VF23,VF00,VF00", "sq            VF04,0(VI04)", "XYZ2 w = 0 (ADC off)");
     vu(f, "NOP", "iaddiu        VI05,VI04,1", "output pointer");
 
-    for (i = 0; i <= sh->bodyCount + 1; i++) {
+    for (i = 0; i <= sh->bodyCount + 2; i++) {
         uint32_t use[MAX_OPERANDS] = { 0 };
         if (i < sh->bodyCount) {
             for (int j = 0; j < sh->body[i].nops && !sh->body[i].dead; j++)
                 use[j] = sh->body[i].ops[j];
+        } else if (i == sh->bodyCount) {
+            use[0] = sh->positionValue;
+        } else if (i == sh->bodyCount + 1) {
+            use[0] = sh->colorValue;
         } else {
-            use[0] = i == sh->bodyCount ? sh->positionValue : sh->colorValue;
+            use[0] = sh->texcoordValue;
         }
         for (int j = 0; j < MAX_OPERANDS; j++) {
             uint32_t c = use[j] ? root(ids, use[j]) : 0;
@@ -1785,20 +1930,42 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     } else {
         vu(f, "NOP", "move.xyzw     VF21,VF00", "no color output: black");
     }
+    if (sh->texcoordValue) {
+        snprintf(buf, sizeof(buf), "move.xy       VF%02d,VF%02d", PVK_VU1_TEXCOORD_REG,
+                 reg_of(&r, ids, sh->texcoordValue));
+        snprintf(buf2, sizeof(buf2), "texture coordinate output, location %d", sh->texcoordLocation);
+        vu(f, "NOP", buf, buf2);
+    }
 
     fprintf(f, "; epilogue: perspective divide, viewport, GS formats, store\n");
     vu(f, "NOP", "div           Q,VF00w,VF20w", "Q = 1 / w");
     vu(f, "NOP", "waitq", NULL);
     vu(f, "mulq.xyz      VF22,VF20,Q", "NOP", NULL);
+    if (sh->texcoordValue) {
+        /* The GS interpolates S/w, T/w and Q = 1/w and divides per pixel, which
+         * makes the texture perspective correct. */
+        snprintf(buf, sizeof(buf), "mulq.xy       VF%02d,VF%02d,Q", PVK_VU1_TEXCOORD_REG, PVK_VU1_TEXCOORD_REG);
+        vu(f, buf, "NOP", "S / w, T / w");
+        snprintf(buf, sizeof(buf), "addq.z        VF%02d,VF00,Q", PVK_VU1_TEXCOORD_REG);
+        vu(f, buf, "NOP", "Q = 1 / w");
+    }
     vu(f, "mul.xyz       VF22,VF22,VF01", "NOP", "viewport scale");
     vu(f, "add.xyz       VF22,VF22,VF02", "NOP", "viewport offset");
     vu(f, "ftoi4.xy      VF23,VF22", "NOP", "x, y to 12.4 fixed point");
     vu(f, "ftoi0.z       VF23,VF22", "NOP", "z to integer depth");
     vu(f, "mul.xyzw      VF24,VF21,VF03", "NOP", "color 0..1 to GS range");
     vu(f, "ftoi0.xyzw    VF24,VF24", "NOP", NULL);
-    vu(f, "NOP", "sq            VF24,0(VI05)", "RGBAQ");
-    vu(f, "NOP", "sq            VF23,1(VI05)", "XYZ2 (draws)");
-    snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX);
+    if (sh->texcoordValue) {
+        snprintf(buf, sizeof(buf), "sq            VF%02d,0(VI05)", PVK_VU1_TEXCOORD_REG);
+        vu(f, "NOP", buf, "ST (and Q)");
+        vu(f, "NOP", "sq            VF24,1(VI05)", "RGBAQ");
+        vu(f, "NOP", "sq            VF23,2(VI05)", "XYZ2 (draws)");
+        snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED);
+    } else {
+        vu(f, "NOP", "sq            VF24,0(VI05)", "RGBAQ");
+        vu(f, "NOP", "sq            VF23,1(VI05)", "XYZ2 (draws)");
+        snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX);
+    }
     vu(f, "NOP", buf, NULL);
     snprintf(buf, sizeof(buf), "iaddiu        VI03,VI03,%d", sh->inputCount);
     vu(f, "NOP", buf, NULL);
@@ -1831,8 +1998,10 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         fprintf(f, "%s%d", i ? ", " : " ", sh->inputs[i].location);
     fprintf(f, " },\n");
     fprintf(f, "    .colorOutputLocation = %d,\n", sh->colorValue ? sh->colorLocation : -1);
+    fprintf(f, "    .texcoordOutputLocation = %d,\n", sh->texcoordValue ? sh->texcoordLocation : -1);
     fprintf(f, "    .pushConstantBytes = %u,\n", (unsigned)sh->pushBytes);
     fprintf(f, "    .colorInputLocation = -1,\n");
+    fprintf(f, "    .texcoordInputLocation = -1,\n");
     fprintf(f, "};\n");
     fclose(f);
 }
@@ -1840,17 +2009,31 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
 static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base, const char *sym)
 {
     FILE *f = open_out(base, ".c");
+    int texel = ids[sh->colorValue].texel;
+    int usesColor = texel == TEXEL_NONE || texel == TEXEL_SAMPLE_TIMES_COLOR;
+    int usesTexture = texel != TEXEL_NONE;
 
     fprintf(f, "/* Generated by ps2vk-shaderc from %s. Do not edit. */\n", g_src);
     fprintf(f, "#include \"ps2vk.h\"\n\n");
-    fprintf(f, "/* outColor = interpolated color: Gouraud shading, no texture. */\n");
+    if (texel == TEXEL_NONE)
+        fprintf(f, "/* outColor = interpolated color: Gouraud shading, no texture. */\n");
+    else if (texel == TEXEL_SAMPLE)
+        fprintf(f, "/* outColor = texture sample: GS decal, the vertex color is ignored. */\n");
+    else
+        fprintf(f, "/* outColor = texture sample * interpolated color: GS modulate. */\n");
     fprintf(f, "const PvkShaderCode %s = {\n", sym);
     fprintf(f, "    .stage = PVK_SHADER_STAGE_FRAGMENT,\n");
     fprintf(f, "    .name = \"%s\",\n", g_src);
     fprintf(f, "    .colorOutputLocation = -1,\n");
-    fprintf(f, "    .colorInputLocation = %d,\n", sh->inputs[ids[sh->colorValue].fromInput].location);
-    fprintf(f, "    .gouraud = 1,\n");
-    fprintf(f, "    .textured = 0,\n");
+    fprintf(f, "    .texcoordOutputLocation = -1,\n");
+    fprintf(f, "    .colorInputLocation = %d,\n",
+            usesColor && sh->colorInput >= 0 ? sh->inputs[sh->colorInput].location : -1);
+    fprintf(f, "    .texcoordInputLocation = %d,\n",
+            usesTexture ? sh->inputs[sh->texcoordInput].location : -1);
+    fprintf(f, "    .gouraud = %d,\n", usesColor ? 1 : 0);
+    fprintf(f, "    .textured = %d,\n", usesTexture ? 1 : 0);
+    fprintf(f, "    .textureFunction = %d,\n", usesTexture ? sh->textureFunction : 0);
+    fprintf(f, "    .samplerBinding = %d,\n", usesTexture ? sh->samplerBinding : -1);
     fprintf(f, "};\n");
     fclose(f);
 }

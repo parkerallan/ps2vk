@@ -77,6 +77,7 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
         fb->height  = sc->height;
         fb->psm     = GS_PSM_32;
         fb->mask    = 0;
+        pvk_image_texture_params(&sc->images[i]);
     }
 
     /* Sets the video mode and shows image 0. */

@@ -1,0 +1,1 @@
+tex_in_vertex.vert: error: vertex shader declares sampler 'heightMap': VU1 cannot read textures. Sample in the fragment shader instead

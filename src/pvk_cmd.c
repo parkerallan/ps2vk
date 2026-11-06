@@ -88,6 +88,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
     cmd->colorImage   = NULL;
     cmd->depthImage   = NULL;
     cmd->gsStateDirty = 0;
+    cmd->texture      = NULL;
     cmd->vertexBuffer = NULL;
     cmd->vertexOffset = 0;
     cmd->indexBuffer  = NULL;
@@ -253,26 +254,130 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
     cmd->rendering    = 1;
 }
 
+/* Chain qwords cmd_gs_state() uses. */
+#define PVK_GS_STATE_QWORDS 11
+
 /* FRAME, ZBUF and TEST for drawing with the bound pipeline into the current
- * attachments. Sent before the first draw after pvkCmdBeginRendering or
- * pvkCmdBindPipeline. Uses 7 qwords of the chain. */
+ * attachments, plus TEX0, TEX1 and CLAMP for the bound texture when the
+ * pipeline samples one. Sent before the first draw after pvkCmdBeginRendering,
+ * pvkCmdBindPipeline or pvkCmdBindTexture. */
 static void cmd_gs_state(PvkCommandBuffer cmd)
 {
     const framebuffer_t *fb = &cmd->colorImage->fb;
     const PvkImage depth = cmd->depthImage;
     const PvkPipeline p = cmd->pipeline;
+    int textured = p->fs->textured;
     qword_t *q;
 
     q = cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG(3, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GIF_SET_TAG(textured ? 7 : 3, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, 0), GS_REG_FRAME);
     q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
                              depth ? p->zmsk : 1), GS_REG_ZBUF);
     /* No alpha test (Vulkan has none); depth test from the pipeline. */
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
+    if (textured) {
+        const PvkImage t = cmd->texture;
+        /* The texture's alpha is used (TCC), the function comes from the fragment
+         * shader. Until samplers exist: bilinear filtering, no mipmaps, repeat. */
+        q = gs_ad(q, GS_SET_TEX0(t->fb.address >> 6, t->tbw, t->fb.psm, t->tw, t->th, TEXTURE_COMPONENTS_RGBA,
+                                 p->fs->textureFunction, 0, 0, 0, 0, 0), GS_REG_TEX0);
+        q = gs_ad(q, GS_SET_TEX1(LOD_USE_K, 0, LOD_MAG_LINEAR, LOD_MIN_LINEAR, 0, 0, 0), GS_REG_TEX1);
+        q = gs_ad(q, GS_SET_CLAMP(WRAP_REPEAT, WRAP_REPEAT, 0, 0, 0, 0), GS_REG_CLAMP);
+        /* The texture cache may hold texels from before an upload or a render into it. */
+        q = gs_ad(q, GS_SET_TEXFLUSH(0), GS_REG_TEXFLUSH);
+    }
     cmd_close_direct(cmd, q);
 
     cmd->gsStateDirty = 0;
+}
+
+void pvkCmdBindTexture(PvkCommandBuffer cmd, PvkImage image)
+{
+    if (image && image->format != PVK_FORMAT_CT32) {
+        pvk_error("pvkCmdBindTexture: only PVK_FORMAT_CT32 images can be sampled\n");
+        cmd->failed = 1;
+        return;
+    }
+    cmd->texture      = image;
+    cmd->gsStateDirty = 1;
+}
+
+/* Most qwords of image data in one GIF IMAGE packet: NLOOP is 15 bits, and the
+ * DMA REF and VIF DIRECT counts are 16. */
+#define PVK_IMAGE_CHUNK_QWORDS 16384
+
+void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage image, const PvkBufferImageCopy *region)
+{
+    const PvkRect2D *r = &region->rect;
+    const uint8_t *src;
+    uint32_t qwords, sent = 0;
+    qword_t *q;
+
+    if (image->format != PVK_FORMAT_CT32) {
+        pvk_error("pvkCmdCopyBufferToImage: only PVK_FORMAT_CT32 images can be uploaded to\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (cmd->rendering) {
+        pvk_error("pvkCmdCopyBufferToImage must be called outside pvkCmdBeginRendering/pvkCmdEndRendering\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (r->x < 0 || r->y < 0 || r->width == 0 || r->height == 0 ||
+        (uint32_t)r->x + r->width > image->fb.width || (uint32_t)r->y + r->height > image->fb.height) {
+        pvk_error("pvkCmdCopyBufferToImage: the region (%d, %d, %ux%u) is outside the %ux%u image\n",
+                  (int)r->x, (int)r->y, (unsigned)r->width, (unsigned)r->height,
+                  (unsigned)image->fb.width, (unsigned)image->fb.height);
+        cmd->failed = 1;
+        return;
+    }
+    if ((r->width * r->height) % 4 || region->bufferOffset % 16) {
+        pvk_error("pvkCmdCopyBufferToImage: the GIF moves whole qwords: the region must hold a "
+                  "multiple of 4 pixels and bufferOffset must be a multiple of 16\n");
+        cmd->failed = 1;
+        return;
+    }
+    qwords = r->width * r->height * 4 / 16;
+    if (region->bufferOffset + (size_t)qwords * 16 > buffer->size) {
+        pvk_error("pvkCmdCopyBufferToImage reads past the end of the buffer\n");
+        cmd->failed = 1;
+        return;
+    }
+    src = (const uint8_t *)buffer->data + region->bufferOffset;
+
+    /* Chain: a DIRECT block with the transfer setup, then per chunk a DIRECT
+     * block holding the IMAGE tag and a REF tag streaming the pixels from the
+     * buffer through a DIRECT of its own (the two VIF codes in the REF tag). */
+    if (!cmd_reserve(cmd, 7 + 3 * ((qwords + PVK_IMAGE_CHUNK_QWORDS - 1) / PVK_IMAGE_CHUNK_QWORDS)))
+        return;
+
+    q = cmd_open_direct(cmd);
+    q = gs_ad(q, GIF_SET_TAG(4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_BITBLTBUF(0, 0, 0, image->fb.address >> 6, image->tbw, image->fb.psm), GS_REG_BITBLTBUF);
+    q = gs_ad(q, GS_SET_TRXPOS(0, 0, r->x, r->y, 0), GS_REG_TRXPOS);
+    q = gs_ad(q, GS_SET_TRXREG(r->width, r->height), GS_REG_TRXREG);
+    q = gs_ad(q, GS_SET_TRXDIR(0), GS_REG_TRXDIR); /* host to local */
+    packet2_update(cmd->packet, q);
+    packet2_vif_close_direct_auto(cmd->packet);
+    packet2_chain_close_tag(cmd->packet);
+
+    while (sent < qwords) {
+        uint32_t chunk = qwords - sent < PVK_IMAGE_CHUNK_QWORDS ? qwords - sent : PVK_IMAGE_CHUNK_QWORDS;
+        int last = sent + chunk == qwords;
+
+        packet2_chain_open_cnt(cmd->packet, 0, 0, 0);
+        packet2_vif_nop(cmd->packet, 0);
+        packet2_vif_open_direct(cmd->packet, 0);
+        packet2_add_2x_s64(cmd->packet, GIF_SET_TAG(chunk, last, 0, 0, GIF_FLG_IMAGE, 0), 0);
+        packet2_vif_close_direct_auto(cmd->packet);
+        packet2_chain_close_tag(cmd->packet);
+
+        packet2_chain_ref(cmd->packet, src + (size_t)sent * 16, chunk, 0, 0, 0);
+        packet2_vif_nop(cmd->packet, 0);
+        packet2_add_u32(cmd->packet, MAKE_VIF_CODE(chunk, 0, P2_VIF_DIRECT, 0));
+        sent += chunk;
+    }
 }
 
 void pvkCmdEndRendering(PvkCommandBuffer cmd)
@@ -391,8 +496,15 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         return 0;
     }
 
+    if (p->fs->textured && !cmd->texture) {
+        pvk_error("%s: fragment shader '%s' samples a texture but none is bound with pvkCmdBindTexture\n",
+                  name, p->fs->name);
+        cmd->failed = 1;
+        return 0;
+    }
+
     if (cmd->gsStateDirty) {
-        if (!cmd_reserve(cmd, 7))
+        if (!cmd_reserve(cmd, PVK_GS_STATE_QWORDS))
             return 0;
         cmd_gs_state(cmd);
     }
@@ -403,8 +515,10 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
 #define PVK_BATCH_INPUT_QWORDS (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER)
 
 /* Most indices in one batch: whole triangles that fit the output area. */
-#define PVK_BATCH_MAX_INDICES \
-    (((PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / PVK_VU1_OUTPUT_PER_VERTEX) / 3 * 3)
+static uint32_t batch_max_indices(const PvkPipeline p)
+{
+    return ((PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / p->outputQwords) / 3 * 3;
+}
 
 /* Chain qwords a batch of `vertexQwords` of vertices and `indices` indices
  * needs, including the flush and the program start. */
@@ -422,11 +536,16 @@ static uint32_t batch_qwords(uint32_t vertexQwords, uint32_t indices)
  * and output memory is overwritten, so a flush comes first. */
 static void batch_begin(PvkCommandBuffer cmd, uint32_t count, uint32_t indexOffset)
 {
+    const PvkPipeline p = cmd->pipeline;
+    u64 regs = p->outputQwords == PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED
+             ? GIF_REG_ST | (GIF_REG_RGBAQ << 4) | (GIF_REG_XYZ2 << 8)
+             : GIF_REG_RGBAQ | (GIF_REG_XYZ2 << 4);
+
     cmd_flush(cmd);
     packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_INPUT_ADDR, 0);
     packet2_add_2x_s64(cmd->packet,
-                       GIF_SET_TAG(count, 1, 1, cmd->pipeline->prim, GIF_FLG_PACKED, 2),
-                       GIF_REG_RGBAQ | (GIF_REG_XYZ2 << 4));
+                       GIF_SET_TAG(count, 1, 1, p->prim, GIF_FLG_PACKED, p->outputQwords),
+                       regs);
     packet2_add_u32(cmd->packet, count);
     packet2_add_u32(cmd->packet, indexOffset);
     packet2_add_u32(cmd->packet, 0);
@@ -529,7 +648,7 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t first
 
         /* Grow the batch a triangle at a time while its indices and the run of
          * vertices they span (sent as one block, so they need no copy) fit. */
-        while (done + n < indexCount && n < PVK_BATCH_MAX_INDICES) {
+        while (done + n < indexCount && n < batch_max_indices(p)) {
             uint32_t l = lo, h = hi;
             for (k = 0; k < 3; k++) {
                 uint32_t v = idx[done + n + k];

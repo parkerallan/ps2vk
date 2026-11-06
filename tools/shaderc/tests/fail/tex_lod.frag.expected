@@ -1,0 +1,1 @@
+tex_lod.frag:11: error: fragment shader uses textureLod() (a texture read at an explicit level of detail): the GS cannot run code per pixel. Only 'outColor = <color input>;', 'outColor = texture(<sampler>, <texcoord input>);' and their product are supported so far

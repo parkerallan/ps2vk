@@ -1,0 +1,1 @@
+tex_two_samplers.frag: error: fragment shader declares two samplers; the GS reads one texture per draw

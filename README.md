@@ -20,7 +20,7 @@ Those coming from Vulkan will find the same design pattern, where we write a com
 
 ## Status
 
-Draws an indexed, Gouraud-shaded triangle from GLSL vertex and fragment shaders, running in PCSX2. Vertex shaders support:
+Draws an indexed shapes and depth-tested, 3D geometry from GLSL vertex and fragment shaders, running in PCSX2. Vertex shaders support:
 
 - vector arithmetic
 - swizzles and constructors
@@ -57,4 +57,4 @@ export GSKIT=$PS2DEV/gsKit
 export PATH=$PATH:$PS2DEV/bin:$PS2DEV/ee/bin:$PS2DEV/iop/bin:$PS2DEV/dvp/bin:$PS2SDK/bin
 ```
 
-make builds `lib/libps2vk.a`, the shader compiler, and `samples/triangle/triangle.elf`. Boot the ELF in PCSX2 with System > Boot ELF.
+make builds `lib/libps2vk.a`, the shader compiler, `samples/triangle/triangle.elf` and `samples/cube/cube.elf`. Boot the ELF in PCSX2 with System > Boot ELF.

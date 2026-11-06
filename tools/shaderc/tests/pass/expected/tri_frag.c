@@ -6,7 +6,11 @@ const PvkShaderCode tri_frag = {
     .stage = PVK_SHADER_STAGE_FRAGMENT,
     .name = "tri.frag",
     .colorOutputLocation = -1,
+    .texcoordOutputLocation = -1,
     .colorInputLocation = 0,
+    .texcoordInputLocation = -1,
     .gouraud = 1,
     .textured = 0,
+    .textureFunction = 0,
+    .samplerBinding = -1,
 };

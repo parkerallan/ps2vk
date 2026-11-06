@@ -1,1 +1,1 @@
-swizzle.frag:10: error: fragment shader uses OpVectorShuffle (a swizzle): the GS cannot run code per pixel. Only 'outColor = <interpolated color input>;' is supported so far
+swizzle.frag:10: error: fragment shader uses OpVectorShuffle (a swizzle): the GS cannot run code per pixel. Only 'outColor = <color input>;', 'outColor = texture(<sampler>, <texcoord input>);' and their product are supported so far

@@ -1,0 +1,1 @@
+two_texcoords.vert: error: vertex shader has 2 texture coordinate outputs; the GS interpolates only one pair (S, T)

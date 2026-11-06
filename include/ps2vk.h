@@ -119,26 +119,27 @@ PvkResult pvkDeviceWaitIdle(PvkDevice device);
 /* ======================================================================== */
 /**
  * @defgroup images Images
- * @brief Pixel memory in GS VRAM: framebuffers and depth buffers.
+ * @brief Pixel memory in GS VRAM: framebuffers, depth buffers and textures.
  * @{
  */
 
-/** @brief An image in GS VRAM, such as a swapchain framebuffer or a depth buffer. */
+/** @brief An image in GS VRAM: a swapchain framebuffer, a depth buffer or a texture. */
 typedef struct PvkImage_T         *PvkImage;
 
 /** @brief Parameters for pvkCreateImage(). */
 typedef struct PvkImageCreateInfo {
-    uint32_t  width;  /**< Width in pixels; a depth buffer must be as wide as the framebuffer it is used with. */
-    uint32_t  height; /**< Height in pixels. */
-    PvkFormat format; /**< PVK_FORMAT_Z32, PVK_FORMAT_Z24 or PVK_FORMAT_Z16. */
+    uint32_t  width;  /**< Width in pixels; a depth buffer must be as wide as the framebuffer it is used with, a texture a power of two from 8 to 1024. */
+    uint32_t  height; /**< Height in pixels; a texture a power of two from 8 to 1024. */
+    PvkFormat format; /**< PVK_FORMAT_CT32 for a texture, or PVK_FORMAT_Z32, PVK_FORMAT_Z24 or PVK_FORMAT_Z16 for a depth buffer. */
 } PvkImageCreateInfo;
 
 /**
  * @brief Allocates an image in GS VRAM.
  *
- * Only depth formats can be created this way for now; color images come from
- * the swapchain. GS VRAM is handed out in creation order and never reclaimed,
- * so create images once, after the swapchain.
+ * A PVK_FORMAT_CT32 image is a texture: fill it with pvkCmdCopyBufferToImage()
+ * and sample it with pvkCmdBindTexture(). Depth formats make depth buffers.
+ * Framebuffers come from the swapchain. GS VRAM is handed out in creation
+ * order and never reclaimed, so create images once, after the swapchain.
  *
  * @param device The device.
  * @param info Image parameters.
@@ -345,11 +346,15 @@ typedef struct PvkShaderCode {
     uint32_t        inputCount;            /**< Vertex: number of inputs, each one vec4. */
     uint32_t        inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< Vertex: input locations, in the order VU1 reads them. */
     int32_t         colorOutputLocation;   /**< Vertex: location of the color output, or -1 if none. */
+    int32_t         texcoordOutputLocation;/**< Vertex: location of the vec2 texture coordinate output, or -1 if none. When set, VU1 emits ST, RGBAQ, XYZ2 per vertex instead of RGBAQ, XYZ2. */
     uint32_t        pushConstantBytes;     /**< Vertex: size of its push constant block, 0 if it has none. */
 
-    int32_t         colorInputLocation;    /**< Fragment: location of the color input, or -1 if none. */
+    int32_t         colorInputLocation;    /**< Fragment: location of the color input it uses, or -1 if none. */
+    int32_t         texcoordInputLocation; /**< Fragment: location of the vec2 input it samples with, or -1 if it does not sample. */
     uint32_t        gouraud;               /**< Fragment: GS PRIM.IIP (blend vertex colors). */
-    uint32_t        textured;              /**< Fragment: GS PRIM.TME (always 0 for now). */
+    uint32_t        textured;              /**< Fragment: GS PRIM.TME (reads a texture). */
+    uint32_t        textureFunction;       /**< Fragment: GS TEX0.TFX, 0 = modulate (texture * color), 1 = decal (texture only). */
+    int32_t         samplerBinding;        /**< Fragment: the sampler2D's binding, or -1 if it has none. */
 } PvkShaderCode;
 
 /** @brief Parameters for pvkCreateShaderModule(). */
@@ -618,6 +623,42 @@ typedef enum PvkIndexType {
  * @param type Must be PVK_INDEX_TYPE_UINT16.
  */
 void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, PvkIndexType type);
+
+/** @brief A region copied by pvkCmdCopyBufferToImage() (like VkBufferImageCopy). */
+typedef struct PvkBufferImageCopy {
+    size_t    bufferOffset; /**< Byte offset of the first pixel in the buffer; a multiple of 16. */
+    PvkRect2D rect;         /**< Destination rectangle in the image. The buffer holds its rows back to back, 4 bytes per pixel. */
+} PvkBufferImageCopy;
+
+/**
+ * @brief Uploads pixels from a buffer into a PVK_FORMAT_CT32 image.
+ *
+ * A GS host-to-local transfer (BITBLTBUF, TRXPOS, TRXREG, TRXDIR, then the
+ * pixels as a GIF IMAGE packet). The pixels stream straight from the buffer
+ * by DMA when the command buffer is submitted, so the buffer must stay
+ * unchanged until then. Must be called outside pvkCmdBeginRendering() /
+ * pvkCmdEndRendering(). The region must hold a multiple of 4 pixels.
+ *
+ * @param cmd The command buffer.
+ * @param buffer Source pixels, RGBA with 8 bits each (GS PSMCT32: alpha 0x80 is opaque).
+ * @param image Destination texture.
+ * @param region What to copy and where.
+ */
+void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage image, const PvkBufferImageCopy *region);
+
+/**
+ * @brief Binds the texture the following draws sample.
+ *
+ * A stand-in for descriptor sets until they exist: the fragment shader's
+ * sampler2D reads this image, whatever its binding number. Sampling is
+ * bilinear without mipmaps and wraps in both directions until samplers
+ * exist. Texture coordinates run 0..1 over the image. Draws with a pipeline
+ * whose fragment shader samples fail if no texture is bound.
+ *
+ * @param cmd The command buffer.
+ * @param image A PVK_FORMAT_CT32 image (a texture or a swapchain image), or NULL to unbind.
+ */
+void pvkCmdBindTexture(PvkCommandBuffer cmd, PvkImage image);
 
 /**
  * @brief Draws vertices from the bound vertex buffer.

@@ -1,1 +1,1 @@
-texture.frag: error: 'tex' is a uniform or buffer; this version of ps2vk-shaderc supports only shader inputs, outputs and push constants (uniform blocks need pipeline layouts, which are not implemented yet)
+texture.frag: error: fragment shader declares a sampler but has no vec2 input to sample it with

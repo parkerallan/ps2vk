@@ -12,6 +12,8 @@ const PvkShaderCode mat4_column_vert = {
     .inputCount = 1,
     .inputLocations = { 0 },
     .colorOutputLocation = -1,
+    .texcoordOutputLocation = -1,
     .pushConstantBytes = 64,
     .colorInputLocation = -1,
+    .texcoordInputLocation = -1,
 };

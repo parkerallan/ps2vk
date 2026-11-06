@@ -1,0 +1,1 @@
+tex_add_color.frag:12: error: fragment shader adds to the texture sample; the GS combines a texture with the vertex color only by multiplying (modulate) or ignoring it (decal)

@@ -7,7 +7,7 @@ EE_OBJS = src/pvk_device.o src/pvk_swapchain.o src/pvk_image.o src/pvk_memory.o 
 EE_INCS = -Iinclude
 EE_WARNFLAGS = -Wall -Wextra
 
-all: $(EE_LIB) shaderc clear triangle
+all: $(EE_LIB) shaderc clear triangle cube
 
 shaderc:
 	$(MAKE) -C tools/shaderc
@@ -17,6 +17,9 @@ clear: $(EE_LIB)
 
 triangle: $(EE_LIB) shaderc
 	$(MAKE) -C samples/triangle
+
+cube: $(EE_LIB) shaderc
+	$(MAKE) -C samples/cube
 
 test:
 	$(MAKE) -C tools/shaderc test
@@ -29,8 +32,9 @@ clean:
 	$(MAKE) -C tools/shaderc clean
 	$(MAKE) -C samples/clear clean
 	$(MAKE) -C samples/triangle clean
+	$(MAKE) -C samples/cube clean
 
-.PHONY: all shaderc clear triangle test docs clean
+.PHONY: all shaderc clear triangle cube test docs clean
 
 # The PS2 build rules come from ps2sdk. `make test` and `make docs` run on the
 # PC alone, so they work without PS2SDK set.

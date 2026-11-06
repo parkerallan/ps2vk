@@ -24,7 +24,7 @@ Status: ✓ = implemented. *Italic notes* mark features the PS2 can't do nativel
 | | Command pools: cheap creation and reset of many command buffers | `VkCommandPool`, `vkAllocateCommandBuffers`, `vkResetCommandPool` | `PvkCommandPool` | One memory arena that packet2 chains are carved from |
 | | Secondary command buffers: record once, replay every frame | `VK_COMMAND_BUFFER_LEVEL_SECONDARY`, `vkCmdExecuteCommands` | `pvkCmdExecuteCommands` | DMA `CALL` tag into the recorded chain, `RET` at its end |
 | | Pipeline layouts: declare what resources a pipeline's shaders read | `VkPipelineLayout` | `PvkPipelineLayout` | Fixes the VU1 context-memory layout and which GS texture registers are used |
-| | Descriptor sets: bind a texture and constants in one call | `VkDescriptorSetLayout`, `VkDescriptorPool`, `VkDescriptorSet`, `vkUpdateDescriptorSets`, `vkCmdBindDescriptorSets` | Same names with `Pvk`/`pvk` | Prebuilt packet: `UNPACK` constants to VU1 + `DIRECT` GS `TEX0`/`TEX1`/`CLAMP`; bound with a DMA `CALL` |
+| | Descriptor sets: bind a texture and constants in one call (*stand-in: `pvkCmdBindTexture` binds the one texture the fragment shader samples, its binding number ignored*) | `VkDescriptorSetLayout`, `VkDescriptorPool`, `VkDescriptorSet`, `vkUpdateDescriptorSets`, `vkCmdBindDescriptorSets` | Same names with `Pvk`/`pvk` | Prebuilt packet: `UNPACK` constants to VU1 + `DIRECT` GS `TEX0`/`TEX1`/`CLAMP`; bound with a DMA `CALL` |
 | | Uniform buffers: constant blocks such as camera matrix, lights | `VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` | `PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` | VIF `UNPACK` into the VU1 context area |
 | ✓ | Push constants: small per-draw values written into the command list | `VkPushConstantRange`, `vkCmdPushConstants` | `pvkCmdPushConstants` | Inline `UNPACK` to VU1 qwords 4-11 (128 bytes), after a VIF `FLUSH` so a running batch is not overwritten; `pvkCmdDraw` checks the shader's block was set |
 | | Specialization constants: one GLSL shader, several baked variants | `VkSpecializationInfo` | `PvkSpecializationInfo` | shaderc emits variants, or constants patched at pipeline creation |
@@ -80,9 +80,9 @@ Status: ✓ = implemented. *Italic notes* mark features the PS2 can't do nativel
 
 | Status | Feature | Vulkan | ps2vk | PS2 implementation |
 | --- | --- | --- | --- | --- |
-| | Texture upload | `vkCmdCopyBufferToImage`, `VkBufferImageCopy` | `pvkCmdCopyBufferToImage` | GIF `IMAGE` transfer with `BITBLTBUF`/`TRXPOS`/`TRXREG`/`TRXDIR` |
-| | Texture formats | `VkFormat`: `R8G8B8A8_UNORM`, `R8G8B8_UNORM`, `A1R5G5B5_UNORM_PACK16` | `PVK_FORMAT_CT32/CT24/CT16`, plus PS2-only palettized `PVK_FORMAT_T8`/`T4` with a color table image | GS `PSMCT32/24/16`, `PSMT8`/`PSMT4` with `TEX0.CBP`/`CPSM`/`CSM`/`CLD` |
-| | Samplers: filtering and wrap modes | `VkSampler`, `vkCreateSampler` | `PvkSampler`, `pvkCreateSampler` | GS `TEX1.MMAG`/`MMIN`, `CLAMP.WMS`/`WMT` (repeat, clamp, region) |
+| ✓ | Texture upload | `vkCmdCopyBufferToImage`, `VkBufferImageCopy` | `pvkCmdCopyBufferToImage` with a `PvkBufferImageCopy` (buffer offset + rectangle); `pvkCreateImage` with `PVK_FORMAT_CT32` makes the texture (power of two, 8 to 1024) | `BITBLTBUF`/`TRXPOS`/`TRXREG`/`TRXDIR` by VIF `DIRECT`, then the pixels as GIF `IMAGE` packets streamed from the buffer by DMA `REF` tags (16K qwords each, the `DIRECT` code in the tag), outside rendering. Bound textures get `TEX0`/`TEX1`/`CLAMP`/`TEXFLUSH` with the draw state |
+| | Texture formats (*CT32 only so far*) | `VkFormat`: `R8G8B8A8_UNORM`, `R8G8B8_UNORM`, `A1R5G5B5_UNORM_PACK16` | `PVK_FORMAT_CT32/CT24/CT16`, plus PS2-only palettized `PVK_FORMAT_T8`/`T4` with a color table image | GS `PSMCT32/24/16`, `PSMT8`/`PSMT4` with `TEX0.CBP`/`CPSM`/`CSM`/`CLD` |
+| | Samplers: filtering and wrap modes (*fixed to bilinear, no mipmaps, repeat so far*) | `VkSampler`, `vkCreateSampler` | `PvkSampler`, `pvkCreateSampler` | GS `TEX1.MMAG`/`MMIN`, `CLAMP.WMS`/`WMT` (repeat, clamp, region) |
 | | Mipmaps and LOD control | `mipLevels`, `VkSamplerMipmapMode`, `minLod`/`maxLod`/`mipLodBias` | Same fields | GS `MIPTBP1`/`MIPTBP2`, `TEX1.MXL`/`L`/`K` |
 | | Image views: sampling a render target or one mip level | `VkImageView`, `vkCreateImageView` | `PvkImageView`, `pvkCreateImageView` | `TEX0` at the image's VRAM address and format |
 
@@ -104,8 +104,8 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | | Uniform arrays with dynamic indexing | `OpAccessChain` with a variable index | VU1 integer registers as addresses |
 | | Local variables and functions | `OpVariable` `Function`, `OpFunctionCall` | Inlined by `spirv-opt`, kept in registers |
 | | `if`/`else` and loops | `OpBranch`, `OpBranchConditional`, `OpLoopMerge` | Unrolled, or VU1 `IBNE`/`IBEQ` branches |
-| | Texture coordinate and fog outputs | Extra `Output` variables | `ST`/`Q` and `FOG` in the GIF packet |
-| | Texture sampling in fragment shaders | `OpImageSampleImplicitLod` (+ `OpFMul`) | GS `TEX0.TFX` decal / modulate / highlight |
+| ✓ | Texture coordinate output | A `vec2` `Output` variable (a `vec4` output is the color) | Epilogue writes S/w, T/w, Q = 1/w in `VF19` and stores `ST`, `RGBAQ`, `XYZ2` (3 output qwords per vertex); `texcoordOutputLocation` in `PvkShaderCode`. *Fog output not yet* |
+| ✓ | Texture sampling in fragment shaders | `OpImageSampleImplicitLod` of a `sampler2D` with the `vec2` input as is, optionally `OpFMul` by the color input | GS `TEX0.TFX` decal (`texture()` alone) or modulate (`texture() * vColor`); `textured`, `textureFunction`, `samplerBinding`, `texcoordInputLocation` in `PvkShaderCode`. *Highlight, `textureLod` and anything else per pixel are rejected.* The runtime rejects textured pipelines until texture upload and binding exist |
 | | `discard` | `OpKill` / `OpDemoteToHelperInvocation` | GS alpha test `TEST.ATE` |
 | | Fog via `mix` | `OpExtInst` `FMix` | GS `PRIM.FGE` + `FOGCOL` |
 | | Runtime shader files | `vkCreateShaderModule` from file data | `.pvs` file loaded by `pvkCreateShaderModule` |
@@ -131,7 +131,7 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | --- | --- | --- |
 | ✓ | Clear | Swapchain, rendering, fences |
 | ✓ | Triangle | Pipeline, vertex and index buffers, shaders, a mat4 push constant (the triangle circles the screen), NTSC display mode |
-| | Textured cube | Depth buffer, textures, uniforms, indexed drawing |
+| ✓ | Textured cube | Depth buffer, a PNG read with libpng (ps2sdk-ports) from `host:` and uploaded once, decal sampling, a mat4 push constant, indexed drawing |
 | | Lighting | Light uniforms, per-vertex lighting |
 | | Skinning | Bone matrices, animation |
 | | Particles | Sprites, blending |

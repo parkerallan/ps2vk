@@ -1,5 +1,5 @@
-/* Images: pixel memory in GS VRAM. Depth buffers are created here; color
- * images come from the swapchain. */
+/* Images: pixel memory in GS VRAM. Depth buffers and textures are created
+ * here; framebuffers come from the swapchain. */
 #include <stdlib.h>
 
 #include "pvk_internal.h"
@@ -26,17 +26,46 @@ float pvk_depth_max(PvkFormat format)
     }
 }
 
+/* Smallest n with 2^n >= v. */
+static uint32_t log2_ceil(uint32_t v)
+{
+    uint32_t n = 0;
+    while ((1u << n) < v)
+        n++;
+    return n;
+}
+
+void pvk_image_texture_params(PvkImage image)
+{
+    /* TEX0 addresses textures in 64-texel wide columns, so anything narrower
+     * still occupies a 64-texel row in VRAM. */
+    image->tbw = (image->fb.width < 64 ? 64 : image->fb.width) / 64;
+    image->tw  = log2_ceil(image->fb.width);
+    image->th  = log2_ceil(image->fb.height);
+}
+
 PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkImage *image)
 {
     PvkImage img;
-    int psm, address;
+    int psm, address, alignment, width;
+    int depth = info->format == PVK_FORMAT_Z32 || info->format == PVK_FORMAT_Z24 || info->format == PVK_FORMAT_Z16;
 
     (void)device;
 
-    if (info->format != PVK_FORMAT_Z32 && info->format != PVK_FORMAT_Z24 && info->format != PVK_FORMAT_Z16) {
-        pvk_error("pvkCreateImage: only depth formats (PVK_FORMAT_Z32/Z24/Z16) can be created; "
-                  "color images come from the swapchain\n");
+    if (!depth && info->format != PVK_FORMAT_CT32) {
+        pvk_error("pvkCreateImage: format must be PVK_FORMAT_CT32 (a texture) or a depth format "
+                  "(PVK_FORMAT_Z32/Z24/Z16)\n");
         return PVK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    if (!depth) {
+        /* The GS addresses a texture by log2 size (TEX0.TW/TH), so a texture is a
+         * power of two on each side, up to the 1024 the GS samples. */
+        if (info->width < 8 || info->height < 8 || info->width > 1024 || info->height > 1024 ||
+            (info->width & (info->width - 1)) || (info->height & (info->height - 1))) {
+            pvk_error("pvkCreateImage: a PVK_FORMAT_CT32 texture must be a power of two from 8 to 1024 "
+                      "on each side (%ux%u given)\n", (unsigned)info->width, (unsigned)info->height);
+            return PVK_ERROR_FEATURE_NOT_PRESENT;
+        }
     }
     psm = pvk_gs_psm(info->format);
 
@@ -44,10 +73,14 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     if (!img)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
 
-    /* ZBUF addresses are in 8 KB pages, like FRAME. */
-    address = graph_vram_allocate((int)info->width, (int)info->height, psm, GRAPH_ALIGN_PAGE);
+    /* ZBUF addresses are in 8 KB pages, like FRAME; TEX0 addresses are in
+     * 256-byte blocks. A texture narrower than 64 texels still takes 64-texel rows. */
+    alignment = depth ? GRAPH_ALIGN_PAGE : GRAPH_ALIGN_BLOCK;
+    width     = !depth && info->width < 64 ? 64 : (int)info->width;
+    address   = graph_vram_allocate(width, (int)info->height, psm, alignment);
     if (address < 0) {
-        pvk_error("out of GS memory for a %ux%u depth image\n", (unsigned)info->width, (unsigned)info->height);
+        pvk_error("out of GS memory for a %ux%u %s image\n", (unsigned)info->width,
+                  (unsigned)info->height, depth ? "depth" : "texture");
         free(img);
         return PVK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
@@ -58,6 +91,7 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     img->fb.height  = info->height;
     img->fb.psm     = psm;
     img->fb.mask    = 0;
+    pvk_image_texture_params(img);
 
     *image = img;
     return PVK_SUCCESS;

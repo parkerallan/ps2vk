@@ -12,6 +12,8 @@ const PvkShaderCode tri_vert = {
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,
+    .texcoordOutputLocation = -1,
     .pushConstantBytes = 0,
     .colorInputLocation = -1,
+    .texcoordInputLocation = -1,
 };

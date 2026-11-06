@@ -46,14 +46,20 @@ struct PvkDevice_T {
 };
 
 /* Color images keep libdraw's framebuffer_t (the swapchain presents from it);
- * depth images reuse its address/width/height with a GS_PSMZ_* psm. */
+ * depth images reuse its address/width/height with a GS_PSMZ_* psm. A CT32
+ * image can also be sampled: TEX0 takes its address, texture buffer width
+ * and log2 size. */
 struct PvkImage_T {
     PvkFormat     format;
     framebuffer_t fb;
+    uint32_t      tbw;        /* GS TEX0.TBW / BITBLTBUF.DBW: buffer width in 64-texel units */
+    uint32_t      tw, th;     /* GS TEX0.TW/TH: log2 of the width and height */
 };
 
 /* GS psm for a PvkFormat, or -1. */
 int pvk_gs_psm(PvkFormat format);
+/* Fills tbw/tw/th from fb.width and fb.height. */
+void pvk_image_texture_params(PvkImage image);
 /* Largest depth value a depth format stores; depth is flipped so near = this. */
 float pvk_depth_max(PvkFormat format);
 
@@ -78,6 +84,7 @@ struct PvkPipeline_T {
     const PvkShaderCode *vs;
     const PvkShaderCode *fs;
     uint32_t inputQwords;     /* qwords per vertex in VU1 memory */
+    uint32_t outputQwords;    /* qwords per vertex VU1 emits: RGBAQ, XYZ2, plus ST when textured */
     uint32_t vertexStride;    /* bytes per vertex in the vertex buffer */
     uint32_t maxBatch;        /* vertices per VU1 run */
     u64      prim;            /* GS PRIM value for the GIF tag */
@@ -93,7 +100,8 @@ struct PvkCommandBuffer_T {
     PvkPipeline pipeline;
     PvkImage    colorImage;   /* attachments of the current pvkCmdBeginRendering */
     PvkImage    depthImage;   /* or NULL */
-    int         gsStateDirty; /* FRAME/ZBUF/TEST must be re-sent before the next draw */
+    int         gsStateDirty; /* FRAME/ZBUF/TEST/TEX0 must be re-sent before the next draw */
+    PvkImage    texture;      /* bound with pvkCmdBindTexture, or NULL */
     PvkBuffer   vertexBuffer;
     size_t      vertexOffset;
     PvkBuffer   indexBuffer;  /* or NULL */

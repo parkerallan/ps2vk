@@ -12,6 +12,8 @@ const PvkShaderCode builtin_lighting_vert = {
     .inputCount = 3,
     .inputLocations = { 0, 1, 2 },
     .colorOutputLocation = 0,
+    .texcoordOutputLocation = -1,
     .pushConstantBytes = 80,
     .colorInputLocation = -1,
+    .texcoordInputLocation = -1,
 };

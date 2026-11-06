@@ -1,0 +1,1 @@
+texcoord_vec3.vert: error: vertex output 'vUV' must be a vec4 (the color) or a vec2 (the texture coordinate); the GS interpolates nothing else

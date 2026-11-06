@@ -65,6 +65,12 @@ static PvkResult validate_shaders(const PvkShaderCode *vs, const PvkShaderCode *
                   fs->name, (int)fs->colorInputLocation, vs->name);
         return PVK_ERROR_VALIDATION_FAILED;
     }
+    if (fs->texcoordInputLocation >= 0 && fs->texcoordInputLocation != vs->texcoordOutputLocation) {
+        pvk_error("pipeline: fragment shader '%s' samples with a texture coordinate at "
+                  "location %d, but vertex shader '%s' does not write one there\n",
+                  fs->name, (int)fs->texcoordInputLocation, vs->name);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     return PVK_SUCCESS;
 }
 
@@ -108,10 +114,10 @@ static PvkResult validate_vertex_input(const PvkShaderCode *vs, const PvkGraphic
     return PVK_SUCCESS;
 }
 
-static uint32_t max_batch_vertices(uint32_t inputQwords)
+static uint32_t max_batch_vertices(uint32_t inputQwords, uint32_t outputQwords)
 {
     uint32_t byInput  = (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER) / inputQwords;
-    uint32_t byOutput = (PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / PVK_VU1_OUTPUT_PER_VERTEX;
+    uint32_t byOutput = (PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / outputQwords;
     uint32_t n        = byInput < byOutput ? byInput : byOutput;
 
     return n - n % 3; /* whole triangles per batch */
@@ -145,8 +151,11 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     p->vs           = vs;
     p->fs           = fs;
     p->inputQwords  = vs->inputCount;
+    /* A vertex shader with a texture coordinate output stores ST before RGBAQ, XYZ2. */
+    p->outputQwords = vs->texcoordOutputLocation >= 0 ? PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED : PVK_VU1_OUTPUT_PER_VERTEX;
     p->vertexStride = info->vertexStride;
-    p->maxBatch     = max_batch_vertices(p->inputQwords);
+    p->maxBatch     = max_batch_vertices(p->inputQwords, p->outputQwords);
+    /* ST holds S/w, T/w and Q = 1/w (FST = 0), so the GS divides per pixel. */
     p->prim         = GS_SET_PRIM(PRIM_TRIANGLE, fs->gouraud, fs->textured, 0, 0, 0, 0, 0, 0);
 
     if ((res = setup_depth(p, info)) != PVK_SUCCESS) {
