@@ -94,6 +94,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
     cmd->indexBuffer  = NULL;
     cmd->indexOffset  = 0;
     cmd->pushSet      = 0;
+    memset(&cmd->pushLayout, 0, sizeof(cmd->pushLayout));
     cmd->rendering    = 0;
     cmd->failed       = 0;
     cmd->recording    = 1;
@@ -408,9 +409,10 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
     cmd->gsStateDirty = 1; /* its depth test and write mask */
 }
 
-void pvkCmdPushConstants(PvkCommandBuffer cmd, uint32_t offset, uint32_t size, const void *data)
+void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_t stageFlags,
+                         uint32_t offset, uint32_t size, const void *data)
 {
-    uint32_t first, last, q, i;
+    uint32_t first, last, q, i, mask;
     const uint32_t *words;
 
     if ((offset | size) & 3 || size == 0 || offset + size > PVK_MAX_PUSH_CONSTANT_BYTES) {
@@ -418,6 +420,22 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, uint32_t offset, uint32_t size, c
                   "within %d bytes\n", (unsigned)offset, (unsigned)size, PVK_MAX_PUSH_CONSTANT_BYTES);
         cmd->failed = 1;
         return;
+    }
+    mask = pvk_push_word_mask(offset, size);
+    if (!stageFlags || stageFlags & ~(PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT)
+        || ((stageFlags & PVK_SHADER_STAGE_VERTEX) && (layout->pushWords[0] & mask) != mask)
+        || ((stageFlags & PVK_SHADER_STAGE_FRAGMENT) && (layout->pushWords[1] & mask) != mask)) {
+        pvk_error("pvkCmdPushConstants: bytes %u to %u are not in the layout's push constant "
+                  "ranges for stage flags 0x%x\n", (unsigned)offset, (unsigned)(offset + size),
+                  (unsigned)stageFlags);
+        cmd->failed = 1;
+        return;
+    }
+
+    /* Values set through a layout with other ranges are lost, as in Vulkan. */
+    if (!pvk_layout_push_compatible(&cmd->pushLayout, layout)) {
+        cmd->pushSet    = 0;
+        cmd->pushLayout = *layout;
     }
 
     /* VIF UNPACK writes whole qwords, so merge into a copy of the range and
@@ -481,9 +499,10 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         cmd->failed = 1;
         return 0;
     }
-    if (p->vs->pushConstantBytes > cmd->pushSet) {
+    if (p->vs->pushConstantBytes > cmd->pushSet
+        || (p->vs->pushConstantBytes && !pvk_layout_push_compatible(&cmd->pushLayout, p->layout))) {
         pvk_error("%s: vertex shader '%s' reads %u bytes of push constants but only %u "
-                  "were set with pvkCmdPushConstants\n", name, p->vs->name,
+                  "were set with pvkCmdPushConstants through the pipeline's layout\n", name, p->vs->name,
                   (unsigned)p->vs->pushConstantBytes, (unsigned)cmd->pushSet);
         cmd->failed = 1;
         return 0;

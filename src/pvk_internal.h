@@ -80,9 +80,22 @@ struct PvkShaderModule_T {
     const PvkShaderCode *code;
 };
 
+/* Which 4-byte words of the 128-byte push constant range each stage may
+ * read, one bit per word. Two layouts with equal masks are push-constant
+ * compatible in Vulkan's sense. */
+struct PvkPipelineLayout_T {
+    uint32_t pushWords[2];    /* [0] vertex stage, [1] fragment stage */
+};
+
+/* Bits of a layout's word mask for the bytes [offset, offset + size). */
+uint32_t pvk_push_word_mask(uint32_t offset, uint32_t size);
+/* Nonzero if the two layouts have the same push constant ranges. */
+int pvk_layout_push_compatible(const struct PvkPipelineLayout_T *a, const struct PvkPipelineLayout_T *b);
+
 struct PvkPipeline_T {
     const PvkShaderCode *vs;
     const PvkShaderCode *fs;
+    PvkPipelineLayout    layout;
     uint32_t inputQwords;     /* qwords per vertex in VU1 memory */
     uint32_t outputQwords;    /* qwords per vertex VU1 emits: RGBAQ, XYZ2, plus ST when textured */
     uint32_t vertexStride;    /* bytes per vertex in the vertex buffer */
@@ -108,6 +121,7 @@ struct PvkCommandBuffer_T {
     size_t      indexOffset;
     uint8_t     push[PVK_MAX_PUSH_CONSTANT_BYTES]; /* what VU1's push constant range holds */
     uint32_t    pushSet;      /* bytes set so far (high-water mark) */
+    struct PvkPipelineLayout_T pushLayout; /* ranges of the layout they were set with */
     int         recording;
     int         rendering;
     int         failed;       /* a recording error makes the buffer unusable */

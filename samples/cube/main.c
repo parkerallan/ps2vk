@@ -188,6 +188,7 @@ int main(void)
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer, textureBuffer;
     PvkShaderModule vs, fs;
+    PvkPipelineLayout layout;
     PvkPipeline pipeline;
     PvkCommandBuffer cmd;
     PvkFence fence;
@@ -251,9 +252,15 @@ int main(void)
         { .location = 0, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
         { .location = 1, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
     };
+    /* The vertex shader's push constant block: one mat4. */
+    PvkPushConstantRange pushRange = { .stageFlags = PVK_SHADER_STAGE_VERTEX, .offset = 0, .size = 64 };
+    PvkPipelineLayoutCreateInfo layoutInfo = { .pushConstantRangeCount = 1, .pushConstantRanges = &pushRange };
+    CHECK(pvkCreatePipelineLayout(device, &layoutInfo, &layout));
+
     PvkGraphicsPipelineCreateInfo pipelineInfo = {
         .vertexShader   = vs,
         .fragmentShader = fs,
+        .layout         = layout,
         .vertexStride   = sizeof(Vertex),
         .attributeCount = 2,
         .attributes     = attributes,
@@ -310,7 +317,7 @@ int main(void)
         pvkCmdBeginRendering(cmd, &rendering);
         pvkCmdBindPipeline(cmd, pipeline);
         pvkCmdBindTexture(cmd, texture);
-        pvkCmdPushConstants(cmd, 0, sizeof(mvp), mvp);
+        pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(mvp), mvp);
         pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
         pvkCmdDrawIndexed(cmd, 36, 0, 0);

@@ -74,6 +74,89 @@ static PvkResult validate_shaders(const PvkShaderCode *vs, const PvkShaderCode *
     return PVK_SUCCESS;
 }
 
+uint32_t pvk_push_word_mask(uint32_t offset, uint32_t size)
+{
+    uint32_t first = offset / 4, count = size / 4;
+
+    return (count >= 32 ? 0xffffffffu : (1u << count) - 1) << first;
+}
+
+int pvk_layout_push_compatible(const struct PvkPipelineLayout_T *a, const struct PvkPipelineLayout_T *b)
+{
+    return a->pushWords[0] == b->pushWords[0] && a->pushWords[1] == b->pushWords[1];
+}
+
+PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreateInfo *info, PvkPipelineLayout *layout)
+{
+    PvkPipelineLayout l;
+    uint32_t i, used = 0;
+
+    (void)device;
+
+    l = malloc(sizeof(struct PvkPipelineLayout_T));
+    if (!l)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    memset(l, 0, sizeof(*l));
+
+    for (i = 0; i < info->pushConstantRangeCount; i++) {
+        const PvkPushConstantRange *r = &info->pushConstantRanges[i];
+        uint32_t mask;
+
+        if ((r->offset | r->size) & 3 || r->size == 0 || r->offset + r->size > PVK_MAX_PUSH_CONSTANT_BYTES) {
+            pvk_error("pipeline layout: push constant range %u (offset %u, size %u) must be multiples "
+                      "of 4 within %d bytes\n", (unsigned)i, (unsigned)r->offset, (unsigned)r->size,
+                      PVK_MAX_PUSH_CONSTANT_BYTES);
+            free(l);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (!r->stageFlags || r->stageFlags & ~(PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT)) {
+            pvk_error("pipeline layout: push constant range %u has stage flags 0x%x; use "
+                      "PvkShaderStage values\n", (unsigned)i, (unsigned)r->stageFlags);
+            free(l);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        mask = pvk_push_word_mask(r->offset, r->size);
+        if (used & mask) {
+            pvk_error("pipeline layout: push constant range %u overlaps an earlier one\n", (unsigned)i);
+            free(l);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        used |= mask;
+        if (r->stageFlags & PVK_SHADER_STAGE_VERTEX)
+            l->pushWords[0] |= mask;
+        if (r->stageFlags & PVK_SHADER_STAGE_FRAGMENT)
+            l->pushWords[1] |= mask;
+    }
+
+    *layout = l;
+    return PVK_SUCCESS;
+}
+
+void pvkDestroyPipelineLayout(PvkDevice device, PvkPipelineLayout layout)
+{
+    (void)device;
+    free(layout);
+}
+
+/* The vertex shader's push constant block, bytes 0 to pushConstantBytes, must
+ * lie in the layout's vertex-stage ranges. */
+static PvkResult validate_layout(const PvkShaderCode *vs, const PvkGraphicsPipelineCreateInfo *info)
+{
+    uint32_t needed;
+
+    if (!info->layout) {
+        pvk_error("pipeline: layout is NULL; create one with pvkCreatePipelineLayout\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    needed = pvk_push_word_mask(0, vs->pushConstantBytes);
+    if ((info->layout->pushWords[0] & needed) != needed) {
+        pvk_error("pipeline: vertex shader '%s' reads %u bytes of push constants, but the layout's "
+                  "vertex stage ranges do not cover them\n", vs->name, (unsigned)vs->pushConstantBytes);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    return PVK_SUCCESS;
+}
+
 static PvkResult validate_vertex_input(const PvkShaderCode *vs, const PvkGraphicsPipelineCreateInfo *info)
 {
     uint32_t i, j;
@@ -138,6 +221,8 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
         return res;
     if ((res = validate_vertex_input(vs, info)) != PVK_SUCCESS)
         return res;
+    if ((res = validate_layout(vs, info)) != PVK_SUCCESS)
+        return res;
     if (info->topology != PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
         pvk_error("pipeline: only PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST is supported\n");
         return PVK_ERROR_FEATURE_NOT_PRESENT;
@@ -150,6 +235,7 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
 
     p->vs           = vs;
     p->fs           = fs;
+    p->layout       = info->layout;
     p->inputQwords  = vs->inputCount;
     /* A vertex shader with a texture coordinate output stores ST before RGBAQ, XYZ2. */
     p->outputQwords = vs->texcoordOutputLocation >= 0 ? PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED : PVK_VU1_OUTPUT_PER_VERTEX;
