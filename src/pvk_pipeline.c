@@ -93,10 +93,21 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
 
     (void)device;
 
+    if (info->setLayoutCount > PVK_MAX_DESCRIPTOR_SETS) {
+        pvk_error("pipeline layout: %u descriptor set layouts; at most %d\n", (unsigned)info->setLayoutCount,
+                  PVK_MAX_DESCRIPTOR_SETS);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+
     l = malloc(sizeof(struct PvkPipelineLayout_T));
     if (!l)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
     memset(l, 0, sizeof(*l));
+
+    /* Copies, so the set layouts may be destroyed after this. */
+    l->setLayoutCount = info->setLayoutCount;
+    for (i = 0; i < info->setLayoutCount; i++)
+        l->setLayouts[i] = *info->setLayouts[i];
 
     for (i = 0; i < info->pushConstantRangeCount; i++) {
         const PvkPushConstantRange *r = &info->pushConstantRanges[i];
@@ -139,10 +150,15 @@ void pvkDestroyPipelineLayout(PvkDevice device, PvkPipelineLayout layout)
 }
 
 /* The vertex shader's push constant block, bytes 0 to pushConstantBytes, must
- * lie in the layout's vertex-stage ranges. */
-static PvkResult validate_layout(const PvkShaderCode *vs, const PvkGraphicsPipelineCreateInfo *info)
+ * lie in the layout's vertex-stage ranges, and the fragment shader's sampler2D
+ * must be a combined image sampler binding, visible to the fragment stage, in
+ * the set layout at its set index. Fills in the pipeline's sampler slot. */
+static PvkResult validate_layout(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info)
 {
+    const PvkShaderCode *vs = p->vs, *fs = p->fs;
+    const struct PvkDescriptorSetLayout_T *set;
     uint32_t needed;
+    int slot;
 
     if (!info->layout) {
         pvk_error("pipeline: layout is NULL; create one with pvkCreatePipelineLayout\n");
@@ -154,6 +170,27 @@ static PvkResult validate_layout(const PvkShaderCode *vs, const PvkGraphicsPipel
                   "vertex stage ranges do not cover them\n", vs->name, (unsigned)vs->pushConstantBytes);
         return PVK_ERROR_VALIDATION_FAILED;
     }
+
+    if (!fs->textured)
+        return PVK_SUCCESS;
+    if (fs->samplerSet < 0 || (uint32_t)fs->samplerSet >= info->layout->setLayoutCount) {
+        pvk_error("pipeline: fragment shader '%s' samples set %d, binding %d, but the layout has %u "
+                  "descriptor set layouts\n", fs->name, (int)fs->samplerSet, (int)fs->samplerBinding,
+                  (unsigned)info->layout->setLayoutCount);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    set  = &info->layout->setLayouts[fs->samplerSet];
+    slot = pvk_set_layout_find(set, (uint32_t)fs->samplerBinding);
+    if (slot < 0 || set->bindings[slot].descriptorType != PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+        || !(set->bindings[slot].stageFlags & PVK_SHADER_STAGE_FRAGMENT)) {
+        pvk_error("pipeline: fragment shader '%s' samples set %d, binding %d, but set layout %d has no "
+                  "PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER binding %d for the fragment stage\n",
+                  fs->name, (int)fs->samplerSet, (int)fs->samplerBinding, (int)fs->samplerSet,
+                  (int)fs->samplerBinding);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    p->samplerSet  = (uint32_t)fs->samplerSet;
+    p->samplerSlot = (uint32_t)slot;
     return PVK_SUCCESS;
 }
 
@@ -221,8 +258,6 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
         return res;
     if ((res = validate_vertex_input(vs, info)) != PVK_SUCCESS)
         return res;
-    if ((res = validate_layout(vs, info)) != PVK_SUCCESS)
-        return res;
     if (info->topology != PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
         pvk_error("pipeline: only PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST is supported\n");
         return PVK_ERROR_FEATURE_NOT_PRESENT;
@@ -236,6 +271,10 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     p->vs           = vs;
     p->fs           = fs;
     p->layout       = info->layout;
+    if ((res = validate_layout(p, info)) != PVK_SUCCESS) {
+        free(p);
+        return res;
+    }
     p->inputQwords  = vs->inputCount;
     /* A vertex shader with a texture coordinate output stores ST before RGBAQ, XYZ2. */
     p->outputQwords = vs->texcoordOutputLocation >= 0 ? PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED : PVK_VU1_OUTPUT_PER_VERTEX;

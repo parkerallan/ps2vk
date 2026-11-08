@@ -29,7 +29,7 @@ build/cube_frag.c: build/cube.frag.spv $(SHADERC)
 build/%_vu1.o: build/%.vsm
 	$(EE_DVP) $< -o $@
 
-main.o: build/cube_vert.c build/cube_frag.c
+main.o: build/cube_vert.c build/cube_frag.c $(PS2VK)/include/ps2vk.h
 
 clean:
 	rm -rf build $(EE_BIN) main.o

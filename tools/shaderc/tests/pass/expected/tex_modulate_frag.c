@@ -13,4 +13,5 @@ const PvkShaderCode tex_modulate_frag = {
     .textured = 1,
     .textureFunction = 0,
     .samplerBinding = 0,
+    .samplerSet = 0,
 };

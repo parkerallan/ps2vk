@@ -58,7 +58,7 @@ enum {
 };
 
 enum { DecBlock = 2, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
-       DecBuiltIn = 11, DecLocation = 30, DecBinding = 33, DecOffset = 35 };
+       DecBuiltIn = 11, DecLocation = 30, DecBinding = 33, DecDescriptorSet = 34, DecOffset = 35 };
 enum { BuiltInPosition = 0 };
 enum { ScUniformConstant = 0, ScInput = 1, ScUniform = 2, ScOutput = 3, ScFunction = 7,
        ScPushConstant = 9, ScStorageBuffer = 12 };
@@ -129,6 +129,7 @@ typedef struct {
     uint32_t varType;        /* pointer type id */
     int      location;       /* -1 if none */
     int      binding;        /* -1 if none */
+    int      set;            /* descriptor set, -1 if none */
     int      builtin;        /* -1 if none */
     int      structPosMember;/* gl_PerVertex: member index decorated Position */
     int      isPosition;     /* pointer that targets gl_Position */
@@ -335,6 +336,7 @@ typedef struct {
     int      texcoordInput;         /* fragment: index into inputs[] of the vec2 input, -1 if none */
     uint32_t samplerVar;            /* fragment: the sampler2D variable, 0 if none */
     int      samplerBinding;        /* its binding, -1 if none */
+    int      samplerSet;            /* its descriptor set, -1 if none */
     int      textureFunction;       /* fragment: GS TEX0.TFX, 0 modulate, 1 decal */
     uint32_t colorVar;              /* vertex: the vec4 output variable, 0 if none */
     uint32_t texcoordVar;           /* vertex: the vec2 output variable, 0 if none */
@@ -547,10 +549,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     memset(sh, 0, sizeof(*sh));
     sh->execModel = ~0u;
     sh->colorLocation = sh->texcoordLocation = -1;
-    sh->colorInput = sh->texcoordInput = sh->samplerBinding = -1;
+    sh->colorInput = sh->texcoordInput = sh->samplerBinding = sh->samplerSet = -1;
     sh->pushBase = bound;
     for (uint32_t i = 0; i < bound + PVK_VU1_PUSH_QWORDS; i++) {
-        ids[i].location = ids[i].binding = ids[i].builtin = ids[i].structPosMember = -1;
+        ids[i].location = ids[i].binding = ids[i].set = ids[i].builtin = ids[i].structPosMember = -1;
         ids[i].fromInput = ids[i].fromPush = -1;
     }
     for (int q = 0; q < PVK_VU1_PUSH_QWORDS; q++) {
@@ -593,6 +595,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[w[1]].location = (int)w[3];
             else if (w[2] == DecBinding)
                 ids[w[1]].binding = (int)w[3];
+            else if (w[2] == DecDescriptorSet)
+                ids[w[1]].set = (int)w[3];
             else if (w[2] == DecBuiltIn)
                 ids[w[1]].builtin = (int)w[3];
             else if (w[2] == DecArrayStride)
@@ -761,6 +765,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     fail("sampler '%s' has no binding", name);
                 sh->samplerVar = id;
                 sh->samplerBinding = ids[id].binding;
+                sh->samplerSet = ids[id].set < 0 ? 0 : ids[id].set; /* no layout(set) means set 0 */
             } else if (storage == ScPushConstant) {
                 if (sh->pushVar)
                     fail("shader has two push constant blocks; only one is allowed");
@@ -2034,6 +2039,7 @@ static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base,
     fprintf(f, "    .textured = %d,\n", usesTexture ? 1 : 0);
     fprintf(f, "    .textureFunction = %d,\n", usesTexture ? sh->textureFunction : 0);
     fprintf(f, "    .samplerBinding = %d,\n", usesTexture ? sh->samplerBinding : -1);
+    fprintf(f, "    .samplerSet = %d,\n", usesTexture ? sh->samplerSet : -1);
     fprintf(f, "};\n");
     fclose(f);
 }

@@ -27,7 +27,7 @@ build/tri_frag.c: build/tri.frag.spv $(SHADERC)
 build/%_vu1.o: build/%.vsm
 	$(EE_DVP) $< -o $@
 
-main.o: build/tri_vert.c build/tri_frag.c
+main.o: build/tri_vert.c build/tri_frag.c $(PS2VK)/include/ps2vk.h
 
 clean:
 	rm -rf build $(EE_BIN) main.o

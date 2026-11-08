@@ -2,8 +2,8 @@
  * ps2vk cube sample: a spinning cube textured with texture.png, drawn with
  * a depth buffer so the near faces hide the far ones. The PNG is read with libpng from the folder the ELF
  * was booted from (PCSX2's host: device), uploaded once with
- * pvkCmdCopyBufferToImage, and sampled by the fragment shader. The cube's
- * transform is a mat4 push constant set every frame.
+ * pvkCmdCopyBufferToImage, put in a descriptor set and sampled by the
+ * fragment shader. The cube's transform is a mat4 push constant set every frame.
  */
 #include <math.h>
 #include <stdio.h>
@@ -188,6 +188,9 @@ int main(void)
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer, textureBuffer;
     PvkShaderModule vs, fs;
+    PvkDescriptorSetLayout setLayout;
+    PvkDescriptorPool descriptorPool;
+    PvkDescriptorSet descriptorSet;
     PvkPipelineLayout layout;
     PvkPipeline pipeline;
     PvkCommandBuffer cmd;
@@ -252,10 +255,36 @@ int main(void)
         { .location = 0, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
         { .location = 1, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
     };
+    /* Set 0 holds the fragment shader's sampler2D at binding 0. */
+    PvkDescriptorSetLayoutBinding samplerBinding = {
+        .binding = 0, .descriptorType = PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1, .stageFlags = PVK_SHADER_STAGE_FRAGMENT,
+    };
+    PvkDescriptorSetLayoutCreateInfo setLayoutInfo = { .bindingCount = 1, .bindings = &samplerBinding };
+    CHECK(pvkCreateDescriptorSetLayout(device, &setLayoutInfo, &setLayout));
+
     /* The vertex shader's push constant block: one mat4. */
     PvkPushConstantRange pushRange = { .stageFlags = PVK_SHADER_STAGE_VERTEX, .offset = 0, .size = 64 };
-    PvkPipelineLayoutCreateInfo layoutInfo = { .pushConstantRangeCount = 1, .pushConstantRanges = &pushRange };
+    PvkPipelineLayoutCreateInfo layoutInfo = {
+        .setLayoutCount = 1, .setLayouts = &setLayout,
+        .pushConstantRangeCount = 1, .pushConstantRanges = &pushRange,
+    };
     CHECK(pvkCreatePipelineLayout(device, &layoutInfo, &layout));
+
+    /* One set, pointing its binding at the texture. */
+    PvkDescriptorPoolSize poolSize = { .type = PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 };
+    PvkDescriptorPoolCreateInfo poolInfo = { .maxSets = 1, .poolSizeCount = 1, .poolSizes = &poolSize };
+    CHECK(pvkCreateDescriptorPool(device, &poolInfo, &descriptorPool));
+    PvkDescriptorSetAllocateInfo setInfo = {
+        .descriptorPool = descriptorPool, .descriptorSetCount = 1, .setLayouts = &setLayout,
+    };
+    CHECK(pvkAllocateDescriptorSets(device, &setInfo, &descriptorSet));
+    PvkDescriptorImageInfo textureDescriptor = { .image = texture };
+    PvkWriteDescriptorSet write = {
+        .dstSet = descriptorSet, .dstBinding = 0,
+        .descriptorType = PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .imageInfo = &textureDescriptor,
+    };
+    pvkUpdateDescriptorSets(device, 1, &write);
 
     PvkGraphicsPipelineCreateInfo pipelineInfo = {
         .vertexShader   = vs,
@@ -316,7 +345,7 @@ int main(void)
         };
         pvkCmdBeginRendering(cmd, &rendering);
         pvkCmdBindPipeline(cmd, pipeline);
-        pvkCmdBindTexture(cmd, texture);
+        pvkCmdBindDescriptorSets(cmd, layout, 0, 1, &descriptorSet);
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(mvp), mvp);
         pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);

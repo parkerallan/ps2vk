@@ -10,6 +10,8 @@ EE_WARNFLAGS = -Wall -Wextra
 
 all: $(EE_BIN)
 
+main.o: $(PS2VK)/include/ps2vk.h
+
 clean:
 	rm -f $(EE_BIN) $(EE_OBJS)
 

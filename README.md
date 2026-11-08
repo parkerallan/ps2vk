@@ -12,7 +12,8 @@ Those coming from Vulkan will find the same design pattern, where we write a com
 | `VkBuffer` | `PvkBuffer` | EE main RAM, sent to VU1 with `UNPACK` |
 | `VkImage` | `PvkImage` | GS VRAM with a GS pixel format |
 | `VkShaderModule` | `PvkShaderModule` | GLSL compiled offline to VU1 microcode (vertex) or GS settings (fragment) |
-| `VkPipelineLayout` | `PvkPipelineLayout` | Which bytes of VU1's push constant range each shader stage reads |
+| `VkPipelineLayout` | `PvkPipelineLayout` | Which bytes of VU1's push constant range each shader stage reads, and which descriptor sets it expects |
+| `VkDescriptorSet` | `PvkDescriptorSet` | The texture a draw samples, written into GS `TEX0` with the draw state |
 | `VkPipeline` | `PvkPipeline` | Compiled shaders + GS state |
 | `VkCommandBuffer` | `PvkCommandBuffer` | A VIF1 DMA chain in main RAM |
 | `vkCmdBeginRendering` | `pvkCmdBeginRendering` | GS `FRAME`, `ZBUF`, `SCISSOR`, `XYOFFSET`; a clear is a rectangle draw |

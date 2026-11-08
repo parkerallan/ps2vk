@@ -88,7 +88,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
     cmd->colorImage   = NULL;
     cmd->depthImage   = NULL;
     cmd->gsStateDirty = 0;
-    cmd->texture      = NULL;
+    memset(cmd->sets, 0, sizeof(cmd->sets));
     cmd->vertexBuffer = NULL;
     cmd->vertexOffset = 0;
     cmd->indexBuffer  = NULL;
@@ -259,9 +259,9 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 #define PVK_GS_STATE_QWORDS 11
 
 /* FRAME, ZBUF and TEST for drawing with the bound pipeline into the current
- * attachments, plus TEX0, TEX1 and CLAMP for the bound texture when the
- * pipeline samples one. Sent before the first draw after pvkCmdBeginRendering,
- * pvkCmdBindPipeline or pvkCmdBindTexture. */
+ * attachments, plus TEX0, TEX1 and CLAMP for the image in the bound descriptor
+ * set when the pipeline samples one. Sent before the first draw after
+ * pvkCmdBeginRendering, pvkCmdBindPipeline or pvkCmdBindDescriptorSets. */
 static void cmd_gs_state(PvkCommandBuffer cmd)
 {
     const framebuffer_t *fb = &cmd->colorImage->fb;
@@ -278,7 +278,7 @@ static void cmd_gs_state(PvkCommandBuffer cmd)
     /* No alpha test (Vulkan has none); depth test from the pipeline. */
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
     if (textured) {
-        const PvkImage t = cmd->texture;
+        const PvkImage t = cmd->sets[p->samplerSet]->images[p->samplerSlot];
         /* The texture's alpha is used (TCC), the function comes from the fragment
          * shader. Until samplers exist: bilinear filtering, no mipmaps, repeat. */
         q = gs_ad(q, GS_SET_TEX0(t->fb.address >> 6, t->tbw, t->fb.psm, t->tw, t->th, TEXTURE_COMPONENTS_RGBA,
@@ -293,15 +293,28 @@ static void cmd_gs_state(PvkCommandBuffer cmd)
     cmd->gsStateDirty = 0;
 }
 
-void pvkCmdBindTexture(PvkCommandBuffer cmd, PvkImage image)
+void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_t firstSet,
+                              uint32_t setCount, const PvkDescriptorSet *sets)
 {
-    if (image && image->format != PVK_FORMAT_CT32) {
-        pvk_error("pvkCmdBindTexture: only PVK_FORMAT_CT32 images can be sampled\n");
+    uint32_t i;
+
+    if (firstSet + setCount > layout->setLayoutCount || firstSet + setCount > PVK_MAX_DESCRIPTOR_SETS) {
+        pvk_error("pvkCmdBindDescriptorSets: sets %u to %u, but the pipeline layout has %u set layouts\n",
+                  (unsigned)firstSet, (unsigned)(firstSet + setCount), (unsigned)layout->setLayoutCount);
         cmd->failed = 1;
         return;
     }
-    cmd->texture      = image;
-    cmd->gsStateDirty = 1;
+    for (i = 0; i < setCount; i++) {
+        if (!sets[i] || !pvk_set_layout_compatible(&sets[i]->layout, &layout->setLayouts[firstSet + i])) {
+            pvk_error("pvkCmdBindDescriptorSets: set %u was not allocated with a layout matching the "
+                      "pipeline layout's set layout %u\n", (unsigned)i, (unsigned)(firstSet + i));
+            cmd->failed = 1;
+            return;
+        }
+    }
+    for (i = 0; i < setCount; i++)
+        cmd->sets[firstSet + i] = sets[i];
+    cmd->gsStateDirty = 1; /* the image the draws sample */
 }
 
 /* Most qwords of image data in one GIF IMAGE packet: NLOOP is 15 bits, and the
@@ -515,11 +528,25 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         return 0;
     }
 
-    if (p->fs->textured && !cmd->texture) {
-        pvk_error("%s: fragment shader '%s' samples a texture but none is bound with pvkCmdBindTexture\n",
-                  name, p->fs->name);
-        cmd->failed = 1;
-        return 0;
+    if (p->fs->textured) {
+        /* The pipeline knows where its sampler2D lives; the set bound there
+         * must have that layout and have been written. */
+        PvkDescriptorSet s = cmd->sets[p->samplerSet];
+
+        if (!s || !pvk_set_layout_compatible(&s->layout, &p->layout->setLayouts[p->samplerSet])) {
+            pvk_error("%s: fragment shader '%s' samples binding %d of set %u, but %s at set index %u\n",
+                      name, p->fs->name, (int)p->fs->samplerBinding, (unsigned)p->samplerSet,
+                      s ? "a set with another layout is bound" : "no descriptor set is bound",
+                      (unsigned)p->samplerSet);
+            cmd->failed = 1;
+            return 0;
+        }
+        if (!s->images[p->samplerSlot]) {
+            pvk_error("%s: binding %d of the descriptor set at index %u was never written with "
+                      "pvkUpdateDescriptorSets\n", name, (int)p->fs->samplerBinding, (unsigned)p->samplerSet);
+            cmd->failed = 1;
+            return 0;
+        }
     }
 
     if (cmd->gsStateDirty) {
