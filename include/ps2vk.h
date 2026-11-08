@@ -487,6 +487,65 @@ typedef struct PvkPipelineDepthStencilStateCreateInfo {
     PvkCompareOp depthCompareOp;   /**< Comparison when the test is on. */
 } PvkPipelineDepthStencilStateCreateInfo;
 
+/**
+ * @brief Blend factors. Values match Vulkan's VkBlendFactor.
+ *
+ * The GS blends as (A - B) * C + D, where A, B and D are the source color,
+ * the destination color or zero and C is the source alpha, the destination
+ * alpha or a fixed value. So a factor must be an alpha, one minus an alpha,
+ * zero or one, both factors must use the same alpha, and color factors
+ * (SRC_COLOR, DST_COLOR, ...) are rejected at pipeline creation.
+ */
+typedef enum PvkBlendFactor {
+    PVK_BLEND_FACTOR_ZERO                     = 0,  /**< 0. */
+    PVK_BLEND_FACTOR_ONE                      = 1,  /**< 1. */
+    PVK_BLEND_FACTOR_SRC_COLOR                = 2,  /**< Not supported. */
+    PVK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR      = 3,  /**< Not supported. */
+    PVK_BLEND_FACTOR_DST_COLOR                = 4,  /**< Not supported. */
+    PVK_BLEND_FACTOR_ONE_MINUS_DST_COLOR      = 5,  /**< Not supported. */
+    PVK_BLEND_FACTOR_SRC_ALPHA                = 6,  /**< The fragment's alpha. GS ALPHA.C = As. */
+    PVK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA      = 7,  /**< 1 - the fragment's alpha. */
+    PVK_BLEND_FACTOR_DST_ALPHA                = 8,  /**< The framebuffer's alpha. GS ALPHA.C = Ad. */
+    PVK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA      = 9,  /**< 1 - the framebuffer's alpha. */
+    PVK_BLEND_FACTOR_CONSTANT_COLOR           = 10, /**< Not supported. */
+    PVK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR = 11, /**< Not supported. */
+    PVK_BLEND_FACTOR_CONSTANT_ALPHA           = 12, /**< blendConstants[3]. GS ALPHA.C = FIX. */
+    PVK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA = 13  /**< 1 - blendConstants[3]. */
+} PvkBlendFactor;
+
+/** @brief Blend operations. Values match Vulkan's VkBlendOp. */
+typedef enum PvkBlendOp {
+    PVK_BLEND_OP_ADD              = 0, /**< src * srcFactor + dst * dstFactor. */
+    PVK_BLEND_OP_SUBTRACT         = 1, /**< src * srcFactor - dst * dstFactor. */
+    PVK_BLEND_OP_REVERSE_SUBTRACT = 2, /**< dst * dstFactor - src * srcFactor. */
+    PVK_BLEND_OP_MIN              = 3, /**< Not supported. */
+    PVK_BLEND_OP_MAX              = 4  /**< Not supported. */
+} PvkBlendOp;
+
+/**
+ * @brief Blending of the color attachment, like VkPipelineColorBlendAttachmentState.
+ *
+ * The equation src * srcColorBlendFactor (op) dst * dstColorBlendFactor is
+ * rewritten into the GS's (A - B) * C + D at pipeline creation; combinations
+ * that do not fit are rejected with PVK_ERROR_FEATURE_NOT_PRESENT. The usual
+ * ones do: alpha blending (SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ADD), additive
+ * (SRC_ALPHA or ONE, ONE, ADD) and subtractive (SRC_ALPHA, ONE,
+ * REVERSE_SUBTRACT). The GS has no alpha blending: the attachment's alpha is
+ * always the fragment's alpha. All zeros means no blending.
+ */
+typedef struct PvkPipelineColorBlendAttachmentState {
+    uint32_t       blendEnable;         /**< Nonzero to blend. GS PRIM.ABE. */
+    PvkBlendFactor srcColorBlendFactor; /**< Factor on the fragment's color. */
+    PvkBlendFactor dstColorBlendFactor; /**< Factor on the framebuffer's color. */
+    PvkBlendOp     colorBlendOp;        /**< How the two products combine. */
+} PvkPipelineColorBlendAttachmentState;
+
+/** @brief Blend state of a pipeline, like VkPipelineColorBlendStateCreateInfo. */
+typedef struct PvkPipelineColorBlendStateCreateInfo {
+    PvkPipelineColorBlendAttachmentState attachment;        /**< Blending of the single color attachment. */
+    float                                blendConstants[4]; /**< Only [3] is used, by the CONSTANT_ALPHA factors, as GS ALPHA.FIX (0..1, 1 = 128). */
+} PvkPipelineColorBlendStateCreateInfo;
+
 /** @brief Parameters for pvkCreateGraphicsPipeline(). */
 typedef struct PvkGraphicsPipelineCreateInfo {
     PvkShaderModule                vertexShader;   /**< Vertex shader module. */
@@ -499,6 +558,7 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     PvkViewport                    viewport;       /**< Viewport, fixed for this pipeline. */
     PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none (like VkPipelineRenderingCreateInfo). Sets the depth range the viewport maps to. */
     PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth test and write control. */
+    PvkPipelineColorBlendStateCreateInfo   colorBlend;   /**< Blending with the color attachment. */
 } PvkGraphicsPipelineCreateInfo;
 
 /**
@@ -522,8 +582,10 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  *
  * Checks that the shaders match each other, the vertex layout and the
  * pipeline layout, and precomputes the viewport transform, GS primitive
- * settings and depth test. A depth test needs a depthAttachmentFormat, and
- * the comparison must be one the GS can do (see PvkCompareOp).
+ * settings, depth test and blend equation. A depth test needs a
+ * depthAttachmentFormat, the comparison must be one the GS can do (see
+ * PvkCompareOp) and the blend factors must fit the GS equation (see
+ * PvkPipelineColorBlendAttachmentState).
  *
  * @param device The device.
  * @param info Pipeline parameters.

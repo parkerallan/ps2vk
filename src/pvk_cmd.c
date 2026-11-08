@@ -257,9 +257,9 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 }
 
 /* Chain qwords cmd_gs_state() uses. */
-#define PVK_GS_STATE_QWORDS 11
+#define PVK_GS_STATE_QWORDS 12
 
-/* FRAME, ZBUF and TEST for drawing with the bound pipeline into the current
+/* FRAME, ZBUF, TEST and ALPHA for drawing with the bound pipeline into the current
  * attachments, plus TEX0, TEX1 and CLAMP for the image in the bound descriptor
  * set when the pipeline samples one. Sent before the first draw after
  * pvkCmdBeginRendering, pvkCmdBindPipeline or pvkCmdBindDescriptorSets. */
@@ -272,12 +272,13 @@ static void cmd_gs_state(PvkCommandBuffer cmd)
     qword_t *q;
 
     q = cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG(textured ? 7 : 3, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GIF_SET_TAG(textured ? 8 : 4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, 0), GS_REG_FRAME);
     q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
                              depth ? p->zmsk : 1), GS_REG_ZBUF);
     /* No alpha test (Vulkan has none); depth test from the pipeline. */
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
+    q = gs_ad(q, p->alpha, GS_REG_ALPHA);
     if (textured) {
         const PvkImage t = cmd->sets[p->samplerSet]->slots[p->samplerSlot].image;
         /* The texture's alpha is used (TCC), the function comes from the fragment

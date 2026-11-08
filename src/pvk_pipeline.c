@@ -49,6 +49,85 @@ static PvkResult setup_depth(PvkPipeline p, const PvkGraphicsPipelineCreateInfo 
     return PVK_SUCCESS;
 }
 
+/* A factor as k0 + k1 * alpha; src is the GS ALPHA.C source (As, Ad, FIX) or -1. */
+static int blend_factor(PvkBlendFactor f, int *k0, int *k1, int *src)
+{
+    *k0 = 0; *k1 = 0; *src = -1;
+    switch (f) {
+    case PVK_BLEND_FACTOR_ZERO:                     return 1;
+    case PVK_BLEND_FACTOR_ONE:                      *k0 = 1; return 1;
+    case PVK_BLEND_FACTOR_SRC_ALPHA:                *k1 = 1; *src = 0; return 1;
+    case PVK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA:      *k0 = 1; *k1 = -1; *src = 0; return 1;
+    case PVK_BLEND_FACTOR_DST_ALPHA:                *k1 = 1; *src = 1; return 1;
+    case PVK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:      *k0 = 1; *k1 = -1; *src = 1; return 1;
+    case PVK_BLEND_FACTOR_CONSTANT_ALPHA:           *k1 = 1; *src = 2; return 1;
+    case PVK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA: *k0 = 1; *k1 = -1; *src = 2; return 1;
+    default:                                        return 0;
+    }
+}
+
+/* Rewrites src * sf (op) dst * df as the GS's (A - B) * C + D. */
+static PvkResult setup_blend(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info)
+{
+    const PvkPipelineColorBlendAttachmentState *bs = &info->colorBlend.attachment;
+    int s0, s1, ssrc, d0, d1, dsrc, src, fix = 0x80;
+    int a, b, c, d;
+    float k;
+
+    p->alpha = GS_SET_ALPHA(0, 2, 2, 1, 0x80);
+    if (!bs->blendEnable)
+        return PVK_SUCCESS;
+
+    if (!blend_factor(bs->srcColorBlendFactor, &s0, &s1, &ssrc)
+        || !blend_factor(bs->dstColorBlendFactor, &d0, &d1, &dsrc)) {
+        pvk_error("pipeline: blend factors %d, %d; the GS only scales by an alpha, so use ZERO, ONE "
+                  "or a *_ALPHA factor\n", (int)bs->srcColorBlendFactor, (int)bs->dstColorBlendFactor);
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    switch (bs->colorBlendOp) {
+    case PVK_BLEND_OP_ADD:                                      break;
+    case PVK_BLEND_OP_SUBTRACT:         d0 = -d0; d1 = -d1;     break;
+    case PVK_BLEND_OP_REVERSE_SUBTRACT: s0 = -s0; s1 = -s1;     break;
+    default:
+        pvk_error("pipeline: colorBlendOp %d; the GS only adds and subtracts\n", (int)bs->colorBlendOp);
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (ssrc >= 0 && dsrc >= 0 && ssrc != dsrc) {
+        pvk_error("pipeline: blend factors %d, %d use two different alphas; the GS has one per draw\n",
+                  (int)bs->srcColorBlendFactor, (int)bs->dstColorBlendFactor);
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    src = ssrc >= 0 ? ssrc : dsrc;
+    if (src == 2) {
+        k = info->colorBlend.blendConstants[3];
+        k = k < 0.0f ? 0.0f : k > 1.0f ? 1.0f : k;
+        fix = (int)(k * 128.0f + 0.5f);
+    }
+
+    for (c = 0; c < 3; c++) {
+        if (src >= 0 && c != src)
+            continue;
+        for (a = 0; a < 3; a++)
+            for (b = 0; b < 3; b++)
+                for (d = 0; d < 3; d++) {
+                    int gs1 = (a == 0) - (b == 0), gd1 = (a == 1) - (b == 1);
+                    int gs0 = d == 0, gd0 = d == 1;
+
+                    if (src < 0) {
+                        if (c != 2 || gs0 + gs1 != s0 || gd0 + gd1 != d0)
+                            continue;
+                    } else if (gs0 != s0 || gs1 != s1 || gd0 != d0 || gd1 != d1) {
+                        continue;
+                    }
+                    p->alpha = GS_SET_ALPHA(a, b, c, d, fix);
+                    return PVK_SUCCESS;
+                }
+    }
+    pvk_error("pipeline: blend factors %d, %d with op %d do not fit the GS's (A - B) * C + D\n",
+              (int)bs->srcColorBlendFactor, (int)bs->dstColorBlendFactor, (int)bs->colorBlendOp);
+    return PVK_ERROR_FEATURE_NOT_PRESENT;
+}
+
 static PvkResult validate_shaders(const PvkShaderCode *vs, const PvkShaderCode *fs)
 {
     if (!vs || vs->stage != PVK_SHADER_STAGE_VERTEX) {
@@ -304,9 +383,10 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     p->vertexStride = info->vertexStride;
     p->maxBatch     = max_batch_vertices(p->inputQwords, p->outputQwords);
     /* ST holds S/w, T/w and Q = 1/w (FST = 0), so the GS divides per pixel. */
-    p->prim         = GS_SET_PRIM(PRIM_TRIANGLE, fs->gouraud, fs->textured, 0, 0, 0, 0, 0, 0);
+    p->prim         = GS_SET_PRIM(PRIM_TRIANGLE, fs->gouraud, fs->textured, 0,
+                                  info->colorBlend.attachment.blendEnable ? 1 : 0, 0, 0, 0, 0);
 
-    if ((res = setup_depth(p, info)) != PVK_SUCCESS) {
+    if ((res = setup_depth(p, info)) != PVK_SUCCESS || (res = setup_blend(p, info)) != PVK_SUCCESS) {
         free(p);
         return res;
     }

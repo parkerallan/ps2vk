@@ -143,6 +143,7 @@ struct PvkPipeline_T {
     PvkFormat depthFormat;    /* depth attachment it draws with, or UNDEFINED */
     uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */
     uint32_t zmsk;            /* GS ZBUF.ZMSK: 1 = no depth writes */
+    u64      alpha;           /* GS ALPHA */
     float    context[PVK_VU1_CONTEXT_QWORDS * 4] __attribute__((aligned(16)));
 };
 

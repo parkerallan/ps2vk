@@ -72,7 +72,7 @@ Status: ✓ = implemented. *Italic notes* mark features the PS2 can't do nativel
 
 | Status | Feature | Vulkan | ps2vk | PS2 implementation |
 | --- | --- | --- | --- | --- |
-| | Alpha blending: transparency, additive, multiplicative | `VkPipelineColorBlendAttachmentState` (`blendEnable`, `VkBlendFactor`, `VkBlendOp`) | `PvkPipelineColorBlendState` | GS `ALPHA`: (A − B) × C + D, `PRIM.ABE`. Vulkan factor combinations the GS can't express are rejected at pipeline creation |
+| ✓ | Alpha blending: transparency, additive, subtractive | `VkPipelineColorBlendAttachmentState` (`blendEnable`, `VkBlendFactor`, `VkBlendOp`), `blendConstants` | `PvkPipelineColorBlendStateCreateInfo` in the pipeline create info; `PvkBlendFactor` ZERO, ONE and the `*_ALPHA` factors, `PvkBlendOp` ADD, SUBTRACT, REVERSE_SUBTRACT | GS `ALPHA`: (A − B) × C + D, `PRIM.ABE`. Factor combinations the GS can't express are rejected at pipeline creation. *No multiplicative blending: the GS has no color factor* |
 | | Stencil test | `VkStencilOpState` in `VkPipelineDepthStencilStateCreateInfo` | Stencil fields, limited | GS destination alpha test `TEST.DATE`/`DATM` + `FBA`. *1-bit stand-in for a stencil buffer* |
 | | Antialiased lines and edges | `VkPipelineRasterizationLineStateCreateInfoEXT` (smooth lines) | Pipeline flag | GS `PRIM.AA1` |
 
