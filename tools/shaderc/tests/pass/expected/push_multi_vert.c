@@ -14,6 +14,7 @@ const PvkShaderCode push_multi_vert = {
     .colorOutputLocation = 0,
     .texcoordOutputLocation = -1,
     .pushConstantBytes = 44,
+    .uniformBlockCount = 0,
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
 };

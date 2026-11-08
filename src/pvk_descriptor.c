@@ -1,6 +1,7 @@
 /* Descriptor set layouts, pools and sets. A set holds the image each of its
- * combined image sampler bindings reads; the command buffer turns the bound
- * set into GS TEX0 with the draw state. */
+ * combined image sampler bindings reads and the buffer range behind each
+ * uniform buffer binding; the command buffer turns the bound set into GS
+ * TEX0 with the draw state and VIF UNPACKs of the buffers into VU1 memory. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -38,10 +39,11 @@ PvkResult pvkCreateDescriptorSetLayout(PvkDevice device, const PvkDescriptorSetL
     for (i = 0; i < info->bindingCount; i++) {
         const PvkDescriptorSetLayoutBinding *b = &info->bindings[i];
 
-        if (b->descriptorType != PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+        if (b->descriptorType != PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+            b->descriptorType != PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
             pvk_error("descriptor set layout: binding %u has type %d; only "
-                      "PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER exists yet\n",
-                      (unsigned)b->binding, (int)b->descriptorType);
+                      "PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER and PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER "
+                      "exist yet\n", (unsigned)b->binding, (int)b->descriptorType);
             return PVK_ERROR_FEATURE_NOT_PRESENT;
         }
         if (b->descriptorCount != 1) {
@@ -89,7 +91,7 @@ void pvkDestroyDescriptorSetLayout(PvkDevice device, PvkDescriptorSetLayout layo
 PvkResult pvkCreateDescriptorPool(PvkDevice device, const PvkDescriptorPoolCreateInfo *info, PvkDescriptorPool *pool)
 {
     PvkDescriptorPool p;
-    uint32_t i, images = 0;
+    uint32_t i, images = 0, buffers = 0;
 
     (void)device;
 
@@ -98,13 +100,19 @@ PvkResult pvkCreateDescriptorPool(PvkDevice device, const PvkDescriptorPoolCreat
         return PVK_ERROR_VALIDATION_FAILED;
     }
     for (i = 0; i < info->poolSizeCount; i++) {
-        if (info->poolSizes[i].type != PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+        switch (info->poolSizes[i].type) {
+        case PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            images += info->poolSizes[i].descriptorCount;
+            break;
+        case PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            buffers += info->poolSizes[i].descriptorCount;
+            break;
+        default:
             pvk_error("descriptor pool: pool size %u has type %d; only "
-                      "PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER exists yet\n",
-                      (unsigned)i, (int)info->poolSizes[i].type);
+                      "PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER and PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER "
+                      "exist yet\n", (unsigned)i, (int)info->poolSizes[i].type);
             return PVK_ERROR_FEATURE_NOT_PRESENT;
         }
-        images += info->poolSizes[i].descriptorCount;
     }
 
     p = calloc(1, sizeof(struct PvkDescriptorPool_T));
@@ -115,8 +123,9 @@ PvkResult pvkCreateDescriptorPool(PvkDevice device, const PvkDescriptorPoolCreat
         free(p);
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    p->maxSets   = info->maxSets;
-    p->maxImages = images;
+    p->maxSets    = info->maxSets;
+    p->maxImages  = images;
+    p->maxBuffers = buffers;
 
     *pool = p;
     return PVK_SUCCESS;
@@ -134,37 +143,48 @@ void pvkDestroyDescriptorPool(PvkDevice device, PvkDescriptorPool pool)
 PvkResult pvkResetDescriptorPool(PvkDevice device, PvkDescriptorPool pool)
 {
     (void)device;
-    pool->usedSets   = 0;
-    pool->usedImages = 0;
+    pool->usedSets    = 0;
+    pool->usedImages  = 0;
+    pool->usedBuffers = 0;
     return PVK_SUCCESS;
 }
 
 PvkResult pvkAllocateDescriptorSets(PvkDevice device, const PvkDescriptorSetAllocateInfo *info, PvkDescriptorSet *sets)
 {
     PvkDescriptorPool pool = info->descriptorPool;
-    uint32_t i, images = 0;
+    uint32_t i, j, images = 0, buffers = 0;
 
     (void)device;
 
-    for (i = 0; i < info->descriptorSetCount; i++)
-        images += info->setLayouts[i]->bindingCount;
+    for (i = 0; i < info->descriptorSetCount; i++) {
+        const struct PvkDescriptorSetLayout_T *l = info->setLayouts[i];
+        for (j = 0; j < l->bindingCount; j++) {
+            if (l->bindings[j].descriptorType == PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                images++;
+            else
+                buffers++;
+        }
+    }
 
-    if (pool->usedSets + info->descriptorSetCount > pool->maxSets || pool->usedImages + images > pool->maxImages) {
-        pvk_error("pvkAllocateDescriptorSets: the pool has %u of %u sets and %u of %u combined image "
-                  "samplers left; %u sets with %u are asked for\n",
+    if (pool->usedSets + info->descriptorSetCount > pool->maxSets || pool->usedImages + images > pool->maxImages
+        || pool->usedBuffers + buffers > pool->maxBuffers) {
+        pvk_error("pvkAllocateDescriptorSets: the pool has %u of %u sets, %u of %u combined image "
+                  "samplers and %u of %u uniform buffers left; %u sets with %u and %u are asked for\n",
                   (unsigned)(pool->maxSets - pool->usedSets), (unsigned)pool->maxSets,
                   (unsigned)(pool->maxImages - pool->usedImages), (unsigned)pool->maxImages,
-                  (unsigned)info->descriptorSetCount, (unsigned)images);
+                  (unsigned)(pool->maxBuffers - pool->usedBuffers), (unsigned)pool->maxBuffers,
+                  (unsigned)info->descriptorSetCount, (unsigned)images, (unsigned)buffers);
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
     for (i = 0; i < info->descriptorSetCount; i++) {
         PvkDescriptorSet s = &pool->sets[pool->usedSets++];
         s->layout = *info->setLayouts[i];
-        memset(s->images, 0, sizeof(s->images));
+        memset(s->slots, 0, sizeof(s->slots));
         sets[i] = s;
     }
-    pool->usedImages += images;
+    pool->usedImages  += images;
+    pool->usedBuffers += buffers;
     return PVK_SUCCESS;
 }
 
@@ -189,11 +209,33 @@ void pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const PvkWri
                       (int)w->dstSet->layout.bindings[slot].descriptorType);
             continue;
         }
+        if (w->descriptorType == PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+            const PvkDescriptorBufferInfo *b = w->bufferInfo;
+            size_t range;
+
+            if (!b || !b->buffer) {
+                pvk_error("pvkUpdateDescriptorSets: write %u needs bufferInfo with a buffer; skipped\n",
+                          (unsigned)i);
+                continue;
+            }
+            range = b->range == PVK_WHOLE_SIZE && b->offset <= b->buffer->size ? b->buffer->size - b->offset
+                                                                                : b->range;
+            if (b->offset % 16 || range == 0 || b->offset > b->buffer->size || range > b->buffer->size - b->offset) {
+                pvk_error("pvkUpdateDescriptorSets: write %u: offset %u and range %u must be a multiple of "
+                          "16 and a nonempty part of the %u-byte buffer; skipped\n", (unsigned)i,
+                          (unsigned)b->offset, (unsigned)b->range, (unsigned)b->buffer->size);
+                continue;
+            }
+            w->dstSet->slots[slot].buffer = b->buffer;
+            w->dstSet->slots[slot].offset = b->offset;
+            w->dstSet->slots[slot].range  = range;
+            continue;
+        }
         if (!w->imageInfo || !w->imageInfo->image || w->imageInfo->image->format != PVK_FORMAT_CT32) {
             pvk_error("pvkUpdateDescriptorSets: write %u needs imageInfo with a PVK_FORMAT_CT32 image; "
                       "skipped\n", (unsigned)i);
             continue;
         }
-        w->dstSet->images[slot] = w->imageInfo->image;
+        w->dstSet->slots[slot].image = w->imageInfo->image;
     }
 }

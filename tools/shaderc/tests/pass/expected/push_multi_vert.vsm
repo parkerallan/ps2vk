@@ -3,7 +3,7 @@
 ; VU1 registers:
 ;   VF01 viewport scale, VF02 viewport offset, VF03 color scale
 ;   VF10.. shader inputs, VF20 gl_Position, VF21 color output
-;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, constants and temporaries
+;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, uniforms, constants and temporaries
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
 ;   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),
 ;   VI10 first vertex
@@ -17,10 +17,7 @@ push_multi_vert_CodeStart:
          NOP                                      lq            VF01,0(VI00)
          NOP                                      lq            VF02,1(VI00)
          NOP                                      lq            VF03,2(VI00)
-         NOP                                      lq            VF05,4(VI00)               ; push constants, bytes 0..15
-         NOP                                      lq            VF06,5(VI00)               ; push constants, bytes 16..31
-         NOP                                      lq            VF07,6(VI00)               ; push constants, bytes 32..47
-         NOP                                      iaddiu        VI01,VI00,16               ; input base
+         NOP                                      iaddiu        VI01,VI00,80               ; input base
          NOP                                      lq            VF04,0(VI01)               ; GIF tag for this batch
          NOP                                      ilw.x         VI02,1(VI01)               ; vertex count
          NOP                                      iaddiu        VI03,VI01,2                ; first vertex
@@ -44,17 +41,20 @@ push_multi_vert_fetch:
          NOP                                      lq            VF10,0(VI03)               ; location 0
          NOP                                      lq            VF11,1(VI03)               ; location 1
 ; shader body
-         mulx.xyzw     VF08,VF10,VF06x            NOP                                      ; line 21: OpVectorTimesScalar (vector * scalar)
-         add.xyzw      VF08,VF08,VF05             NOP                                      ; line 21: OpFAdd (addition)
-         addz.x        VF09,VF00,VF06z            NOP                                      ; line 21: OpCompositeConstruct (a vector constructor)
-         addw.y        VF09,VF00,VF06w            NOP
-         sub.zw        VF09,VF00,VF00             NOP
-         add.xyzw      VF08,VF08,VF09             NOP                                      ; line 21: OpFAdd (addition)
-         mul.xyz       VF09,VF11,VF07             NOP                                      ; line 22: OpFMul (multiplication)
-         NOP                                      move.xyz      VF18,VF09                  ; line 22: OpCompositeConstruct (a vector constructor)
-         NOP                                      move.w        VF18,VF11
-         NOP                                      move.xyzw     VF20,VF08                  ; gl_Position
-         NOP                                      move.xyzw     VF21,VF18                  ; color output, location 0
+         NOP                                      lq            VF05,5(VI00)               ; push constants, bytes 16..31
+         mulx.xyzw     VF06,VF10,VF05x            NOP                                      ; line 21: OpVectorTimesScalar (vector * scalar)
+         NOP                                      lq            VF07,4(VI00)               ; push constants, bytes 0..15
+         add.xyzw      VF06,VF06,VF07             NOP                                      ; line 21: OpFAdd (addition)
+         addz.x        VF07,VF00,VF05z            NOP                                      ; line 21: OpCompositeConstruct (a vector constructor)
+         addw.y        VF07,VF00,VF05w            NOP
+         sub.zw        VF07,VF00,VF00             NOP
+         add.xyzw      VF05,VF06,VF07             NOP                                      ; line 21: OpFAdd (addition)
+         NOP                                      lq            VF06,6(VI00)               ; push constants, bytes 32..47
+         mul.xyz       VF06,VF11,VF06             NOP                                      ; line 22: OpFMul (multiplication)
+         NOP                                      move.xyz      VF07,VF06                  ; line 22: OpCompositeConstruct (a vector constructor)
+         NOP                                      move.w        VF07,VF11
+         NOP                                      move.xyzw     VF20,VF05                  ; gl_Position
+         NOP                                      move.xyzw     VF21,VF07                  ; color output, location 0
 ; epilogue: perspective divide, viewport, GS formats, store
          NOP                                      div           Q,VF00w,VF20w              ; Q = 1 / w
          NOP                                      waitq

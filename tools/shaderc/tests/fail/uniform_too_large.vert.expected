@@ -1,0 +1,1 @@
+uniform_too_large.vert: error: uniform block 'big' is 1040 bytes; ps2vk reserves 1024 bytes of VU1 memory for uniform buffers

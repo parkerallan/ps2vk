@@ -14,6 +14,7 @@ const PvkShaderCode builtin_reduce_vert = {
     .colorOutputLocation = 0,
     .texcoordOutputLocation = -1,
     .pushConstantBytes = 16,
+    .uniformBlockCount = 0,
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
 };

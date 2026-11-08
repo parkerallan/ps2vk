@@ -3,7 +3,7 @@
 ; VU1 registers:
 ;   VF01 viewport scale, VF02 viewport offset, VF03 color scale
 ;   VF10.. shader inputs, VF20 gl_Position, VF21 color output
-;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, constants and temporaries
+;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, uniforms, constants and temporaries
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
 ;   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),
 ;   VI10 first vertex
@@ -17,11 +17,7 @@ mat4_push_vert_CodeStart:
          NOP                                      lq            VF01,0(VI00)
          NOP                                      lq            VF02,1(VI00)
          NOP                                      lq            VF03,2(VI00)
-         NOP                                      lq            VF05,4(VI00)               ; push constants, bytes 0..15
-         NOP                                      lq            VF06,5(VI00)               ; push constants, bytes 16..31
-         NOP                                      lq            VF07,6(VI00)               ; push constants, bytes 32..47
-         NOP                                      lq            VF08,7(VI00)               ; push constants, bytes 48..63
-         NOP                                      iaddiu        VI01,VI00,16               ; input base
+         NOP                                      iaddiu        VI01,VI00,80               ; input base
          NOP                                      lq            VF04,0(VI01)               ; GIF tag for this batch
          NOP                                      ilw.x         VI02,1(VI01)               ; vertex count
          NOP                                      iaddiu        VI03,VI01,2                ; first vertex
@@ -45,11 +41,15 @@ mat4_push_vert_fetch:
          NOP                                      lq            VF10,0(VI03)               ; location 0
          NOP                                      lq            VF11,1(VI03)               ; location 1
 ; shader body
+         NOP                                      lq            VF05,4(VI00)               ; push constants, bytes 0..15
+         NOP                                      lq            VF06,5(VI00)               ; push constants, bytes 16..31
+         NOP                                      lq            VF07,6(VI00)               ; push constants, bytes 32..47
+         NOP                                      lq            VF08,7(VI00)               ; push constants, bytes 48..63
          mulax.xyzw    ACC,VF05,VF10x             NOP                                      ; line 17: OpMatrixTimesVector (matrix * vector)
          madday.xyzw   ACC,VF06,VF10y             NOP
          maddaz.xyzw   ACC,VF07,VF10z             NOP
-         maddw.xyzw    VF09,VF08,VF10w            NOP
-         NOP                                      move.xyzw     VF20,VF09                  ; gl_Position
+         maddw.xyzw    VF05,VF08,VF10w            NOP
+         NOP                                      move.xyzw     VF20,VF05                  ; gl_Position
          NOP                                      move.xyzw     VF21,VF11                  ; color output, location 0
 ; epilogue: perspective divide, viewport, GS formats, store
          NOP                                      div           Q,VF00w,VF20w              ; Q = 1 / w

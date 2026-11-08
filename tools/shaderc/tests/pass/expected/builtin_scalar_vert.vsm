@@ -3,7 +3,7 @@
 ; VU1 registers:
 ;   VF01 viewport scale, VF02 viewport offset, VF03 color scale
 ;   VF10.. shader inputs, VF20 gl_Position, VF21 color output
-;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, constants and temporaries
+;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, uniforms, constants and temporaries
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
 ;   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),
 ;   VI10 first vertex
@@ -17,9 +17,7 @@ builtin_scalar_vert_CodeStart:
          NOP                                      lq            VF01,0(VI00)
          NOP                                      lq            VF02,1(VI00)
          NOP                                      lq            VF03,2(VI00)
-         NOP                                      lq            VF05,4(VI00)               ; push constants, bytes 0..15
-         NOP                                      lq            VF06,5(VI00)               ; push constants, bytes 16..31
-         NOP                                      iaddiu        VI01,VI00,16               ; input base
+         NOP                                      iaddiu        VI01,VI00,80               ; input base
          NOP                                      lq            VF04,0(VI01)               ; GIF tag for this batch
          NOP                                      ilw.x         VI02,1(VI01)               ; vertex count
          NOP                                      iaddiu        VI03,VI01,2                ; first vertex
@@ -43,21 +41,23 @@ builtin_scalar_vert_fetch:
          NOP                                      lq            VF10,0(VI03)               ; location 0
          NOP                                      lq            VF11,1(VI03)               ; location 1
 ; shader body
-         maxx.w        VF07,VF10,VF05x            NOP                                      ; line 21: clamp()
-         miniy.w       VF07,VF07,VF05y            NOP
-         mulw.xyzw     VF07,VF10,VF07w            NOP                                      ; line 21: OpVectorTimesScalar (vector * scalar)
+         NOP                                      lq            VF05,4(VI00)               ; push constants, bytes 0..15
+         maxx.w        VF06,VF10,VF05x            NOP                                      ; line 21: clamp()
+         miniy.w       VF06,VF06,VF05y            NOP
+         mulw.xyzw     VF06,VF10,VF06w            NOP                                      ; line 21: OpVectorTimesScalar (vector * scalar)
          mulaw.x       ACC,VF05,VF00w             NOP                                      ; line 22: mix()
-         addy.x        VF08,VF00,VF05y            NOP
-         sub.x         VF08,VF08,VF05             NOP
-         maddz.x       VF08,VF08,VF05z            NOP
-         miniy.x       VF09,VF11,VF06y            NOP                                      ; line 22: min()
-         abs.z         VF18,VF05                  NOP                                      ; line 22: abs()
-         NOP                                      move.x        VF19,VF08                  ; line 22: OpCompositeConstruct (a vector constructor)
-         addx.y        VF19,VF00,VF09x            NOP
-         NOP                                      move.z        VF19,VF18
-         addw.w        VF19,VF00,VF00w            NOP
-         NOP                                      move.xyzw     VF20,VF07                  ; gl_Position
-         NOP                                      move.xyzw     VF21,VF19                  ; color output, location 0
+         addy.x        VF07,VF00,VF05y            NOP
+         sub.x         VF07,VF07,VF05             NOP
+         maddz.x       VF07,VF07,VF05z            NOP
+         NOP                                      lq            VF08,5(VI00)               ; push constants, bytes 16..31
+         miniy.x       VF09,VF11,VF08y            NOP                                      ; line 22: min()
+         abs.z         VF08,VF05                  NOP                                      ; line 22: abs()
+         NOP                                      move.x        VF05,VF07                  ; line 22: OpCompositeConstruct (a vector constructor)
+         addx.y        VF05,VF00,VF09x            NOP
+         NOP                                      move.z        VF05,VF08
+         addw.w        VF05,VF00,VF00w            NOP
+         NOP                                      move.xyzw     VF20,VF06                  ; gl_Position
+         NOP                                      move.xyzw     VF21,VF05                  ; color output, location 0
 ; epilogue: perspective divide, viewport, GS formats, store
          NOP                                      div           Q,VF00w,VF20w              ; Q = 1 / w
          NOP                                      waitq

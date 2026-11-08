@@ -14,6 +14,7 @@ const PvkShaderCode push_swizzle_vert = {
     .colorOutputLocation = 0,
     .texcoordOutputLocation = -1,
     .pushConstantBytes = 48,
+    .uniformBlockCount = 0,
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
 };

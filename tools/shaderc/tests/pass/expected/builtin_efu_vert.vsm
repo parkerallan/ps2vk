@@ -3,7 +3,7 @@
 ; VU1 registers:
 ;   VF01 viewport scale, VF02 viewport offset, VF03 color scale
 ;   VF10.. shader inputs, VF20 gl_Position, VF21 color output
-;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, constants and temporaries
+;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, uniforms, constants and temporaries
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
 ;   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),
 ;   VI10 first vertex
@@ -17,8 +17,7 @@ builtin_efu_vert_CodeStart:
          NOP                                      lq            VF01,0(VI00)
          NOP                                      lq            VF02,1(VI00)
          NOP                                      lq            VF03,2(VI00)
-         NOP                                      lq            VF05,4(VI00)               ; push constants, bytes 0..15
-         NOP                                      iaddiu        VI01,VI00,16               ; input base
+         NOP                                      iaddiu        VI01,VI00,80               ; input base
          NOP                                      lq            VF04,0(VI01)               ; GIF tag for this batch
          NOP                                      ilw.x         VI02,1(VI01)               ; vertex count
          NOP                                      iaddiu        VI03,VI01,2                ; first vertex
@@ -42,6 +41,7 @@ builtin_efu_vert_fetch:
          NOP                                      lq            VF10,0(VI03)               ; location 0
          NOP                                      lq            VF11,1(VI03)               ; location 1
 ; shader body
+         NOP                                      lq            VF05,4(VI00)               ; push constants, bytes 0..15
          NOP                                      loi           0x3fc90fdb                 ; line 17: cos()
          addi.x        VF06,VF05,I                NOP
          mulaw.x       ACC,VF06,VF00w             NOP
@@ -143,9 +143,25 @@ builtin_efu_vert_fetch:
          NOP                                      esin          P,VF07x
          NOP                                      waitp
          NOP                                      mfp.x         VF07,P
-         mulx.xyzw     VF07,VF11,VF07x            NOP                                      ; line 20: OpVectorTimesScalar (vector * scalar)
+         mulx.xyzw     VF05,VF11,VF07x            NOP                                      ; line 20: OpVectorTimesScalar (vector * scalar)
          NOP                                      loi           0xbf800000                 ; line 20: exp()
-         muli.xyzw     VF08,VF07,I                NOP
+         muli.xyzw     VF07,VF05,I                NOP
+         NOP                                      eexp          P,VF07x
+         NOP                                      waitp
+         NOP                                      mfp.x         VF07,P
+         NOP                                      eexp          P,VF07y
+         NOP                                      waitp
+         NOP                                      mfp.y         VF07,P
+         NOP                                      eexp          P,VF07z
+         NOP                                      waitp
+         NOP                                      mfp.z         VF07,P
+         NOP                                      eexp          P,VF07w
+         NOP                                      waitp
+         NOP                                      mfp.w         VF07,P
+         NOP                                      loi           0xbf800000                 ; line 20: OpFNegate (negation)
+         muli.xyzw     VF05,VF11,I                NOP
+         NOP                                      loi           0xbf317218                 ; line 20: exp2()
+         muli.xyzw     VF08,VF05,I                NOP
          NOP                                      eexp          P,VF08x
          NOP                                      waitp
          NOP                                      mfp.x         VF08,P
@@ -158,25 +174,9 @@ builtin_efu_vert_fetch:
          NOP                                      eexp          P,VF08w
          NOP                                      waitp
          NOP                                      mfp.w         VF08,P
-         NOP                                      loi           0xbf800000                 ; line 20: OpFNegate (negation)
-         muli.xyzw     VF07,VF11,I                NOP
-         NOP                                      loi           0xbf317218                 ; line 20: exp2()
-         muli.xyzw     VF09,VF07,I                NOP
-         NOP                                      eexp          P,VF09x
-         NOP                                      waitp
-         NOP                                      mfp.x         VF09,P
-         NOP                                      eexp          P,VF09y
-         NOP                                      waitp
-         NOP                                      mfp.y         VF09,P
-         NOP                                      eexp          P,VF09z
-         NOP                                      waitp
-         NOP                                      mfp.z         VF09,P
-         NOP                                      eexp          P,VF09w
-         NOP                                      waitp
-         NOP                                      mfp.w         VF09,P
-         add.xyzw      VF07,VF08,VF09             NOP                                      ; line 20: OpFAdd (addition)
+         add.xyzw      VF05,VF07,VF08             NOP                                      ; line 20: OpFAdd (addition)
          NOP                                      move.xyzw     VF20,VF06                  ; gl_Position
-         NOP                                      move.xyzw     VF21,VF07                  ; color output, location 0
+         NOP                                      move.xyzw     VF21,VF05                  ; color output, location 0
 ; epilogue: perspective divide, viewport, GS formats, store
          NOP                                      div           Q,VF00w,VF20w              ; Q = 1 / w
          NOP                                      waitq

@@ -1,1 +1,1 @@
-mat_from_vectors.vert:11: error: vertex shader builds a matrix from values computed at run time; only push constant and constant matrices are supported so far
+mat_from_vectors.vert:11: error: vertex shader builds a matrix from values computed at run time; only push constant, uniform and constant matrices are supported so far

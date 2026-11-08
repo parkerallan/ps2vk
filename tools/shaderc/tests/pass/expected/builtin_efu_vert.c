@@ -14,6 +14,7 @@ const PvkShaderCode builtin_efu_vert = {
     .colorOutputLocation = 0,
     .texcoordOutputLocation = -1,
     .pushConstantBytes = 4,
+    .uniformBlockCount = 0,
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
 };

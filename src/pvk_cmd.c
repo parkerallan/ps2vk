@@ -88,6 +88,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
     cmd->colorImage   = NULL;
     cmd->depthImage   = NULL;
     cmd->gsStateDirty = 0;
+    cmd->uniformsDirty = 0;
     memset(cmd->sets, 0, sizeof(cmd->sets));
     cmd->vertexBuffer = NULL;
     cmd->vertexOffset = 0;
@@ -278,7 +279,7 @@ static void cmd_gs_state(PvkCommandBuffer cmd)
     /* No alpha test (Vulkan has none); depth test from the pipeline. */
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
     if (textured) {
-        const PvkImage t = cmd->sets[p->samplerSet]->images[p->samplerSlot];
+        const PvkImage t = cmd->sets[p->samplerSet]->slots[p->samplerSlot].image;
         /* The texture's alpha is used (TCC), the function comes from the fragment
          * shader. Until samplers exist: bilinear filtering, no mipmaps, repeat. */
         q = gs_ad(q, GS_SET_TEX0(t->fb.address >> 6, t->tbw, t->fb.psm, t->tw, t->th, TEXTURE_COMPONENTS_RGBA,
@@ -314,7 +315,8 @@ void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, ui
     }
     for (i = 0; i < setCount; i++)
         cmd->sets[firstSet + i] = sets[i];
-    cmd->gsStateDirty = 1; /* the image the draws sample */
+    cmd->gsStateDirty  = 1; /* the image the draws sample */
+    cmd->uniformsDirty = 1; /* and the buffers behind the uniform blocks */
 }
 
 /* Most qwords of image data in one GIF IMAGE packet: NLOOP is 15 bits, and the
@@ -418,8 +420,9 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
         packet2_add_float(cmd->packet, pipeline->context[i]);
     packet2_utils_vu_close_unpack(cmd->packet);
 
-    cmd->pipeline     = pipeline;
-    cmd->gsStateDirty = 1; /* its depth test and write mask */
+    cmd->pipeline      = pipeline;
+    cmd->gsStateDirty  = 1; /* its depth test and write mask */
+    cmd->uniformsDirty = 1; /* its shader places the uniform blocks in VU1 memory */
 }
 
 void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_t stageFlags,
@@ -500,9 +503,81 @@ void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset
     cmd->indexOffset = offset;
 }
 
+/* The set bound at `index`, which must have the layout the pipeline expects
+ * there and have had bindings[] `slot` written. `what` names the shader
+ * resource for the error; NULL fails the buffer. */
+static PvkDescriptorSet bound_set(PvkCommandBuffer cmd, const char *name, uint32_t index, uint32_t slot,
+                                  const char *what, const char *shader, uint32_t binding)
+{
+    PvkDescriptorSet s = cmd->sets[index];
+    const struct PvkDescriptorSlot *d;
+
+    if (!s || !pvk_set_layout_compatible(&s->layout, &cmd->pipeline->layout->setLayouts[index])) {
+        pvk_error("%s: %s '%s' reads binding %u of set %u, but %s at set index %u\n", name, what, shader,
+                  (unsigned)binding, (unsigned)index,
+                  s ? "a set with another layout is bound" : "no descriptor set is bound", (unsigned)index);
+        cmd->failed = 1;
+        return NULL;
+    }
+    d = &s->slots[slot];
+    if (!d->image && !d->buffer) {
+        pvk_error("%s: binding %u of the descriptor set at index %u was never written with "
+                  "pvkUpdateDescriptorSets\n", name, (unsigned)binding, (unsigned)index);
+        cmd->failed = 1;
+        return NULL;
+    }
+    return s;
+}
+
+/* The vertex shader's uniform blocks: each bound buffer range must hold the
+ * block. When a pipeline or set was bound since the last draw, the blocks are
+ * sent to VU1 memory again, streamed from the buffers by DMA REF tags after a
+ * FLUSH, since a running batch loads them in its first instructions. */
+static int send_uniforms(PvkCommandBuffer cmd, const char *name)
+{
+    const PvkPipeline p = cmd->pipeline;
+    const PvkShaderCode *vs = p->vs;
+    const struct PvkDescriptorSlot *slots[PVK_MAX_UNIFORM_BLOCKS];
+    uint32_t i;
+
+    for (i = 0; i < vs->uniformBlockCount; i++) {
+        const PvkShaderUniformBlock *u = &vs->uniformBlocks[i];
+        uint32_t qwords = (u->bytes + 15) / 16;
+        PvkDescriptorSet s = bound_set(cmd, name, u->set, p->uniformSlots[i], "vertex shader", vs->name, u->binding);
+
+        if (!s)
+            return 0;
+        slots[i] = &s->slots[p->uniformSlots[i]];
+        if (slots[i]->range < u->bytes || slots[i]->offset + (size_t)qwords * 16 > slots[i]->buffer->size) {
+            pvk_error("%s: the uniform block at set %u, binding %u of vertex shader '%s' is %u bytes "
+                      "(%u whole qwords), but the bound buffer range holds %u\n", name, (unsigned)u->set,
+                      (unsigned)u->binding, vs->name, (unsigned)u->bytes, (unsigned)qwords,
+                      (unsigned)slots[i]->range);
+            cmd->failed = 1;
+            return 0;
+        }
+    }
+
+    if (!cmd->uniformsDirty || !vs->uniformBlockCount)
+        return 1;
+    if (!cmd_reserve(cmd, 1 + 2 * vs->uniformBlockCount))
+        return 0;
+    cmd_flush(cmd);
+    for (i = 0; i < vs->uniformBlockCount; i++) {
+        const PvkShaderUniformBlock *u = &vs->uniformBlocks[i];
+        packet2_utils_vu_add_unpack_data(cmd->packet, PVK_VU1_UNIFORM_ADDR + u->qword,
+                                         (uint8_t *)slots[i]->buffer->data + slots[i]->offset,
+                                         (u->bytes + 15) / 16, 0);
+    }
+    cmd->uniformsDirty = 0;
+    return 1;
+}
+
 /* What every draw needs: rendering, a pipeline whose depth format matches the
- * attachment, a vertex buffer and the push constants the shader reads. Sends
- * the GS state if it changed. Fails the buffer and returns 0 otherwise. */
+ * attachment, a vertex buffer, the push constants the shader reads and the
+ * descriptor sets its uniform blocks and sampler read. Sends the uniform
+ * blocks and the GS state if they changed. Fails the buffer and returns 0
+ * otherwise. */
 static int draw_ready(PvkCommandBuffer cmd, const char *name)
 {
     PvkPipeline p = cmd->pipeline;
@@ -528,26 +603,11 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         return 0;
     }
 
-    if (p->fs->textured) {
-        /* The pipeline knows where its sampler2D lives; the set bound there
-         * must have that layout and have been written. */
-        PvkDescriptorSet s = cmd->sets[p->samplerSet];
-
-        if (!s || !pvk_set_layout_compatible(&s->layout, &p->layout->setLayouts[p->samplerSet])) {
-            pvk_error("%s: fragment shader '%s' samples binding %d of set %u, but %s at set index %u\n",
-                      name, p->fs->name, (int)p->fs->samplerBinding, (unsigned)p->samplerSet,
-                      s ? "a set with another layout is bound" : "no descriptor set is bound",
-                      (unsigned)p->samplerSet);
-            cmd->failed = 1;
-            return 0;
-        }
-        if (!s->images[p->samplerSlot]) {
-            pvk_error("%s: binding %d of the descriptor set at index %u was never written with "
-                      "pvkUpdateDescriptorSets\n", name, (int)p->fs->samplerBinding, (unsigned)p->samplerSet);
-            cmd->failed = 1;
-            return 0;
-        }
-    }
+    if (!send_uniforms(cmd, name))
+        return 0;
+    if (p->fs->textured && !bound_set(cmd, name, p->samplerSet, p->samplerSlot, "fragment shader", p->fs->name,
+                                      (uint32_t)p->fs->samplerBinding))
+        return 0;
 
     if (cmd->gsStateDirty) {
         if (!cmd_reserve(cmd, PVK_GS_STATE_QWORDS))

@@ -150,14 +150,16 @@ void pvkDestroyPipelineLayout(PvkDevice device, PvkPipelineLayout layout)
 }
 
 /* The vertex shader's push constant block, bytes 0 to pushConstantBytes, must
- * lie in the layout's vertex-stage ranges, and the fragment shader's sampler2D
- * must be a combined image sampler binding, visible to the fragment stage, in
- * the set layout at its set index. Fills in the pipeline's sampler slot. */
+ * lie in the layout's vertex-stage ranges, each of its uniform blocks must be
+ * a uniform buffer binding, visible to the vertex stage, in the set layout at
+ * its set index, and the fragment shader's sampler2D must be a combined image
+ * sampler binding, visible to the fragment stage, in the set layout at its
+ * set index. Fills in the pipeline's uniform and sampler slots. */
 static PvkResult validate_layout(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info)
 {
     const PvkShaderCode *vs = p->vs, *fs = p->fs;
     const struct PvkDescriptorSetLayout_T *set;
-    uint32_t needed;
+    uint32_t needed, i;
     int slot;
 
     if (!info->layout) {
@@ -169,6 +171,27 @@ static PvkResult validate_layout(PvkPipeline p, const PvkGraphicsPipelineCreateI
         pvk_error("pipeline: vertex shader '%s' reads %u bytes of push constants, but the layout's "
                   "vertex stage ranges do not cover them\n", vs->name, (unsigned)vs->pushConstantBytes);
         return PVK_ERROR_VALIDATION_FAILED;
+    }
+
+    for (i = 0; i < vs->uniformBlockCount; i++) {
+        const PvkShaderUniformBlock *u = &vs->uniformBlocks[i];
+
+        if (u->set >= info->layout->setLayoutCount) {
+            pvk_error("pipeline: vertex shader '%s' has a uniform block at set %u, binding %u, but the "
+                      "layout has %u descriptor set layouts\n", vs->name, (unsigned)u->set,
+                      (unsigned)u->binding, (unsigned)info->layout->setLayoutCount);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        set  = &info->layout->setLayouts[u->set];
+        slot = pvk_set_layout_find(set, u->binding);
+        if (slot < 0 || set->bindings[slot].descriptorType != PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+            || !(set->bindings[slot].stageFlags & PVK_SHADER_STAGE_VERTEX)) {
+            pvk_error("pipeline: vertex shader '%s' has a uniform block at set %u, binding %u, but set "
+                      "layout %u has no PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER binding %u for the vertex stage\n",
+                      vs->name, (unsigned)u->set, (unsigned)u->binding, (unsigned)u->set, (unsigned)u->binding);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        p->uniformSlots[i] = (uint32_t)slot;
     }
 
     if (!fs->textured)

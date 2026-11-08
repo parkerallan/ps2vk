@@ -1,0 +1,1 @@
+uniform_dynamic_index.vert:17: error: vertex shader indexes uniforms with a value computed at run time; only constant indices are supported so far

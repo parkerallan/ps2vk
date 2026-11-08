@@ -14,6 +14,7 @@ const PvkShaderCode component_vert = {
     .colorOutputLocation = -1,
     .texcoordOutputLocation = -1,
     .pushConstantBytes = 0,
+    .uniformBlockCount = 0,
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
 };

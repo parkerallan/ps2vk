@@ -14,6 +14,7 @@ const PvkShaderCode mat4_then_arith_vert = {
     .colorOutputLocation = -1,
     .texcoordOutputLocation = -1,
     .pushConstantBytes = 80,
+    .uniformBlockCount = 0,
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
 };

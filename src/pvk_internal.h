@@ -92,17 +92,26 @@ int pvk_set_layout_compatible(const struct PvkDescriptorSetLayout_T *a, const st
 /* Index into bindings[] of the binding with that number, or -1. */
 int pvk_set_layout_find(const struct PvkDescriptorSetLayout_T *layout, uint32_t binding);
 
-/* Every binding is a combined image sampler so far: one image per bindings[] slot. */
+/* What one bindings[] slot of a set holds: an image for a combined image
+ * sampler, a buffer range for a uniform buffer. Both NULL until written. */
+struct PvkDescriptorSlot {
+    PvkImage  image;
+    PvkBuffer buffer;
+    size_t    offset;
+    size_t    range;
+};
+
 struct PvkDescriptorSet_T {
     struct PvkDescriptorSetLayout_T layout;
-    PvkImage images[PVK_MAX_DESCRIPTOR_BINDINGS]; /* NULL until written */
+    struct PvkDescriptorSlot slots[PVK_MAX_DESCRIPTOR_BINDINGS];
 };
 
 /* Sets are handed out in order and only come back together, on reset. */
 struct PvkDescriptorPool_T {
     uint32_t maxSets, usedSets;
-    uint32_t maxImages, usedImages; /* combined image samplers */
-    struct PvkDescriptorSet_T *sets; /* maxSets of them */
+    uint32_t maxImages, usedImages;   /* combined image samplers */
+    uint32_t maxBuffers, usedBuffers; /* uniform buffers */
+    struct PvkDescriptorSet_T *sets;  /* maxSets of them */
 };
 
 /* Which 4-byte words of the 128-byte push constant range each stage may
@@ -125,7 +134,8 @@ struct PvkPipeline_T {
     PvkPipelineLayout    layout;
     uint32_t samplerSet;      /* when fs->textured: set index and bindings[] slot of its sampler2D */
     uint32_t samplerSlot;
-    uint32_t inputQwords;     /* qwords per vertex in VU1 memory */
+    uint32_t uniformSlots[PVK_MAX_UNIFORM_BLOCKS]; /* bindings[] slot of each vs->uniformBlocks[] entry in its set layout */
+    uint32_t inputQwords;    /* qwords per vertex in VU1 memory */
     uint32_t outputQwords;    /* qwords per vertex VU1 emits: RGBAQ, XYZ2, plus ST when textured */
     uint32_t vertexStride;    /* bytes per vertex in the vertex buffer */
     uint32_t maxBatch;        /* vertices per VU1 run */
@@ -143,6 +153,7 @@ struct PvkCommandBuffer_T {
     PvkImage    colorImage;   /* attachments of the current pvkCmdBeginRendering */
     PvkImage    depthImage;   /* or NULL */
     int         gsStateDirty; /* FRAME/ZBUF/TEST/TEX0 must be re-sent before the next draw */
+    int         uniformsDirty; /* the uniform blocks' buffers must be sent to VU1 before the next draw */
     PvkDescriptorSet sets[PVK_MAX_DESCRIPTOR_SETS]; /* bound with pvkCmdBindDescriptorSets, or NULL */
     PvkBuffer   vertexBuffer;
     size_t      vertexOffset;

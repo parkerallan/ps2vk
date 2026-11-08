@@ -1,0 +1,1 @@
+uniform_in_fragment.frag: error: fragment shader reads uniform block 'mat': the GS cannot read per-draw values. Uniform buffers are only available in vertex shaders

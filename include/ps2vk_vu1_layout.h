@@ -4,7 +4,10 @@
  *
  *   0   context: viewport scale, viewport offset, color scale (per pipeline)
  *   4   push constants: 8 qwords = 128 bytes, written by pvkCmdPushConstants
- *   16  input:   GIF tag for this batch, a count qword, then vertices, then
+ *   16  uniform buffers: 64 qwords = 1 KB; the vertex shader's uniform blocks,
+ *       placed by shaderc in (set, binding) order, each filled from the buffer
+ *       in the bound descriptor set before the first draw after a bind
+ *   80  input:   GIF tag for this batch, a count qword, then vertices, then
  *       for an indexed batch the 16-bit indices, one per qword (VIF UNPACK S_16)
  *   512 output:  GIF tag, then per vertex RGBAQ, XYZ2 (sent with XGKICK), or
  *       ST, RGBAQ, XYZ2 when the vertex shader writes a texture coordinate
@@ -21,7 +24,10 @@
 #define PVK_VU1_PUSH_ADDR         4
 #define PVK_VU1_PUSH_QWORDS       8   /* PVK_MAX_PUSH_CONSTANT_BYTES / 16 */
 
-#define PVK_VU1_INPUT_ADDR        16
+#define PVK_VU1_UNIFORM_ADDR      16
+#define PVK_VU1_UNIFORM_QWORDS    64  /* PVK_MAX_UNIFORM_BYTES / 16 */
+
+#define PVK_VU1_INPUT_ADDR        80
 #define PVK_VU1_INPUT_GIFTAG      0
 #define PVK_VU1_INPUT_COUNT       1   /* x: vertices to process; y: qword offset from the
                                          input base of the index list, 0 = vertices in order */

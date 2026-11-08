@@ -3,7 +3,7 @@
 ; VU1 registers:
 ;   VF01 viewport scale, VF02 viewport offset, VF03 color scale
 ;   VF10.. shader inputs, VF20 gl_Position, VF21 color output
-;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, constants and temporaries
+;   VF05-VF09, VF18-VF19, VF25-VF31 push constants, uniforms, constants and temporaries
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
 ;   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),
 ;   VI10 first vertex
@@ -17,7 +17,7 @@ construct_vert_CodeStart:
          NOP                                      lq            VF01,0(VI00)
          NOP                                      lq            VF02,1(VI00)
          NOP                                      lq            VF03,2(VI00)
-         NOP                                      iaddiu        VI01,VI00,16               ; input base
+         NOP                                      iaddiu        VI01,VI00,80               ; input base
          NOP                                      lq            VF04,0(VI01)               ; GIF tag for this batch
          NOP                                      ilw.x         VI02,1(VI01)               ; vertex count
          NOP                                      iaddiu        VI03,VI01,2                ; first vertex
