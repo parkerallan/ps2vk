@@ -323,9 +323,24 @@ typedef enum PvkShaderStage {
     PVK_SHADER_STAGE_FRAGMENT = 2  /**< Becomes GS settings. */
 } PvkShaderStage;
 
-/** @brief How vertices are grouped into primitives. */
+/**
+ * @brief How vertices are grouped into primitives, like VkPrimitiveTopology.
+ *
+ * Each value is a GS primitive type, so the GS assembles the shapes itself.
+ * A draw is split into VU1 batches; a strip or fan batch repeats the vertices
+ * the next primitive shares with the previous batch (2 for a triangle strip,
+ * the hub and the last vertex for a fan, 1 for a line strip), so the join is
+ * seamless. Lists are cut to whole primitives, strips and fans draw nothing
+ * with fewer vertices than one primitive. No primitive restart index.
+ */
 typedef enum PvkPrimitiveTopology {
-    PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST = 0 /**< Every 3 vertices form a triangle. */
+    PVK_PRIMITIVE_TOPOLOGY_POINT_LIST     = 0, /**< Every vertex is a point (GS PRIM point). */
+    PVK_PRIMITIVE_TOPOLOGY_LINE_LIST      = 1, /**< Every 2 vertices form a line. */
+    PVK_PRIMITIVE_TOPOLOGY_LINE_STRIP     = 2, /**< Each vertex after the first makes a line with the previous one. */
+    PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST  = 3, /**< Every 3 vertices form a triangle. */
+    PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP = 4, /**< Each vertex after the second makes a triangle with the previous two. */
+    PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN   = 5, /**< Each vertex after the second makes a triangle with the previous one and the first. */
+    PVK_PRIMITIVE_TOPOLOGY_SPRITE_LIST    = 6  /**< PS2 only: every 2 vertices are opposite corners of an axis-aligned rectangle (GS PRIM sprite). The rectangle takes the second vertex's color and depth; texture coordinates interpolate between the corners. */
 } PvkPrimitiveTopology;
 
 /** @brief Most vertex inputs a vertex shader can have. */
@@ -554,7 +569,7 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     uint32_t                       vertexStride;   /**< Bytes per vertex; must be 16 per shader input. */
     uint32_t                       attributeCount; /**< Number of entries in attributes. */
     const PvkVertexInputAttribute *attributes;     /**< One per vertex shader input. */
-    PvkPrimitiveTopology           topology;       /**< Must be PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST. */
+    PvkPrimitiveTopology           topology;       /**< How the vertices of a draw are grouped into primitives. */
     PvkViewport                    viewport;       /**< Viewport, fixed for this pipeline. */
     PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none (like VkPipelineRenderingCreateInfo). Sets the depth range the viewport maps to. */
     PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth test and write control. */
@@ -987,7 +1002,8 @@ void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, ui
  *
  * Must be called between pvkCmdBeginRendering() and pvkCmdEndRendering(),
  * with a pipeline and vertex buffer bound. The pipeline's depthAttachmentFormat
- * must match the depth attachment (or its absence). Only whole triangles are drawn.
+ * must match the depth attachment (or its absence). The pipeline's topology
+ * groups the vertices into primitives; only whole ones are drawn.
  *
  * @param cmd The command buffer.
  * @param vertexCount Number of vertices to draw.
@@ -1002,7 +1018,8 @@ void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t firstVertex
  * Needs what pvkCmdDraw() needs plus an index buffer. The vertices a batch
  * refers to are sent to VU1 as one block, so index lists that stay local in
  * the vertex buffer (a mesh in draw order) use the least DMA; VU1 then fetches
- * each vertex by its index. Only whole triangles are drawn.
+ * each vertex by its index. The pipeline's topology groups the indices into
+ * primitives; only whole ones are drawn.
  *
  * @param cmd The command buffer.
  * @param indexCount Number of indices to draw.

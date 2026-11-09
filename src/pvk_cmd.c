@@ -621,10 +621,24 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
 /* VU1 input memory a batch can fill, after the header. */
 #define PVK_BATCH_INPUT_QWORDS (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER)
 
-/* Most indices in one batch: whole triangles that fit the output area. */
+/* Most indices in one batch: whole primitives that fit the output area. */
 static uint32_t batch_max_indices(const PvkPipeline p)
 {
-    return ((PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / p->outputQwords) / 3 * 3;
+    return ((PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / p->outputQwords) / p->primStep * p->primStep;
+}
+
+/* Vertices a batch starting at draw position `done` repeats from the previous
+ * batch, as positions in the draw: the last primOverlap ones, or for a fan the
+ * hub (position 0) and the last one. Returns how many. */
+static uint32_t batch_carry(const PvkPipeline p, uint32_t done, uint32_t carry[2])
+{
+    uint32_t n = done ? p->primOverlap : 0, i;
+
+    for (i = 0; i < n; i++)
+        carry[i] = done - n + i;
+    if (n && p->fan)
+        carry[0] = 0;
+    return n;
 }
 
 /* Chain qwords a batch of `vertexQwords` of vertices and `indices` indices
@@ -672,24 +686,31 @@ static void batch_vertices(PvkCommandBuffer cmd, uint32_t dest, const uint8_t *s
     }
 }
 
+/* Index `i` of a batch's list: the carried ones come before the draw's. */
+static uint32_t batch_index(const uint16_t *pre, uint32_t preCount, const uint16_t *idx, uint32_t i)
+{
+    return i < preCount ? pre[i] : idx[i - preCount];
+}
+
 /* Indices, less `base`, copied into the chain: VIF UNPACK S_16 expands each
  * 16-bit value to one VU1 qword, so VU1 reads them with ILW. */
-static void batch_indices(PvkCommandBuffer cmd, uint32_t dest, const uint16_t *idx, uint32_t count, uint32_t base)
+static void batch_indices(PvkCommandBuffer cmd, uint32_t dest, const uint16_t *pre, uint32_t preCount,
+                          const uint16_t *idx, uint32_t count, uint32_t base)
 {
-    uint32_t i;
+    uint32_t i, total = preCount + count;
 
     packet2_chain_open_cnt(cmd->packet, 0, 0, 0);
     packet2_vif_stcycl(cmd->packet, 0, 0x0101, 0);
     packet2_vif_open_unpack(cmd->packet, P2_UNPACK_S_16, dest, 0, 0, 1, 0);
-    for (i = 0; i < count; i += 2) {
-        uint32_t word = idx[i] - base;
-        if (i + 1 < count)
-            word |= (uint32_t)(idx[i + 1] - base) << 16;
+    for (i = 0; i < total; i += 2) {
+        uint32_t word = batch_index(pre, preCount, idx, i) - base;
+        if (i + 1 < total)
+            word |= (uint32_t)(batch_index(pre, preCount, idx, i + 1) - base) << 16;
         packet2_add_u32(cmd->packet, word);
     }
     while ((u32)cmd->packet->next & 15)
         packet2_add_u32(cmd->packet, 0); /* VIF NOPs up to the qword boundary */
-    packet2_vif_close_unpack_manual(cmd->packet, count);
+    packet2_vif_close_unpack_manual(cmd->packet, total);
     packet2_chain_close_tag(cmd->packet);
 }
 
@@ -707,17 +728,28 @@ void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t firstVertex
         return;
     }
 
-    vertexCount -= vertexCount % 3; /* whole triangles only */
+    vertexCount -= vertexCount % p->primStep; /* whole primitives only */
+    if (vertexCount <= p->primOverlap)
+        return;
     base = (uint8_t *)cmd->vertexBuffer->data + cmd->vertexOffset + (size_t)firstVertex * p->vertexStride;
 
     while (done < vertexCount) {
-        uint32_t n      = vertexCount - done < p->maxBatch ? vertexCount - done : p->maxBatch;
-        uint32_t qwords = n * p->inputQwords;
+        uint32_t carry[2], c = batch_carry(p, done, carry);
+        uint32_t n      = vertexCount - done < p->maxBatch - c ? vertexCount - done : p->maxBatch - c;
+        uint32_t qwords = (c + n) * p->inputQwords;
 
-        if (!cmd_reserve(cmd, batch_qwords(qwords, 0)))
+        if (!cmd_reserve(cmd, batch_qwords(qwords, 0) + 2))
             return;
-        batch_begin(cmd, n, 0);
-        batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER, base + (size_t)done * p->vertexStride, qwords);
+        batch_begin(cmd, c + n, 0);
+        if (c && p->fan) {
+            /* The hub is not next to the run, so it is its own block. */
+            batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER, base, p->inputQwords);
+            batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + p->inputQwords,
+                           base + (size_t)carry[1] * p->vertexStride, qwords - p->inputQwords);
+        } else {
+            batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER,
+                           base + (size_t)(done - c) * p->vertexStride, qwords);
+        }
         packet2_utils_vu_add_start_program(cmd->packet, 0);
         done += n;
     }
@@ -744,52 +776,66 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t first
         return;
     }
 
-    indexCount -= indexCount % 3; /* whole triangles only */
+    indexCount -= indexCount % p->primStep; /* whole primitives only */
+    if (indexCount <= p->primOverlap)
+        return;
     idx         = (const uint16_t *)((const uint8_t *)cmd->indexBuffer->data + cmd->indexOffset) + firstIndex;
     vertices    = (const uint8_t *)cmd->vertexBuffer->data + cmd->vertexOffset;
     vertexSlots = (cmd->vertexBuffer->size - cmd->vertexOffset) / p->vertexStride;
 
     while (done < indexCount) {
-        uint32_t lo = idx[done], hi = lo, n = 0, k, vq;
+        uint32_t carry[2], c = batch_carry(p, done, carry);
+        uint16_t pre[2];
+        uint32_t lo, hi, n = 0, k, vq;
         int64_t first;
 
-        /* Grow the batch a triangle at a time while its indices and the run of
-         * vertices they span (sent as one block, so they need no copy) fit. */
-        while (done + n < indexCount && n < batch_max_indices(p)) {
+        for (k = 0; k < c; k++)
+            pre[k] = idx[carry[k]];
+        lo = hi = c ? pre[0] : idx[done];
+        for (k = 1; k < c; k++) {
+            if (pre[k] < lo) lo = pre[k];
+            if (pre[k] > hi) hi = pre[k];
+        }
+
+        /* Grow the batch a primitive at a time while its indices and the run
+         * of vertices they span (sent as one block, so they need no copy) fit. */
+        while (done + n < indexCount && c + n + p->primStep <= batch_max_indices(p)) {
             uint32_t l = lo, h = hi;
-            for (k = 0; k < 3; k++) {
+            for (k = 0; k < p->primStep; k++) {
                 uint32_t v = idx[done + n + k];
                 if (v < l) l = v;
                 if (v > h) h = v;
             }
-            if ((h - l + 1) * p->inputQwords + n + 3 > PVK_BATCH_INPUT_QWORDS)
+            if ((h - l + 1) * p->inputQwords + c + n + p->primStep > PVK_BATCH_INPUT_QWORDS)
                 break;
             lo = l;
             hi = h;
-            n += 3;
+            n += p->primStep;
         }
 
         if (n == 0) {
-            /* One triangle whose vertices lie too far apart for a block: send
-             * the three vertices one by one, as an in-order batch. */
-            if (!cmd_reserve(cmd, 8 + 2 * 3))
+            /* One primitive whose vertices lie too far apart for a block: send
+             * its vertices one by one, as an in-order batch. */
+            uint32_t total = c + p->primStep;
+
+            if (!cmd_reserve(cmd, 8 + 2 * total))
                 return;
-            for (k = 0; k < 3; k++) {
-                first = (int64_t)idx[done + k] + vertexOffset;
+            for (k = 0; k < total; k++) {
+                first = (int64_t)batch_index(pre, c, idx + done, k) + vertexOffset;
                 if (first < 0 || first >= (int64_t)vertexSlots) {
                     pvk_error("pvkCmdDrawIndexed: index %u + vertexOffset %d is outside the vertex buffer\n",
-                              (unsigned)idx[done + k], (int)vertexOffset);
+                              (unsigned)batch_index(pre, c, idx + done, k), (int)vertexOffset);
                     cmd->failed = 1;
                     return;
                 }
             }
-            batch_begin(cmd, 3, 0);
-            for (k = 0; k < 3; k++)
+            batch_begin(cmd, total, 0);
+            for (k = 0; k < total; k++)
                 batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + k * p->inputQwords,
-                               vertices + (size_t)((int64_t)idx[done + k] + vertexOffset) * p->vertexStride,
+                               vertices + (size_t)((int64_t)batch_index(pre, c, idx + done, k) + vertexOffset) * p->vertexStride,
                                p->inputQwords);
             packet2_utils_vu_add_start_program(cmd->packet, 0);
-            done += 3;
+            done += p->primStep;
             continue;
         }
 
@@ -802,12 +848,12 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t first
         }
         vq = (hi - lo + 1) * p->inputQwords;
 
-        if (!cmd_reserve(cmd, batch_qwords(vq, n)))
+        if (!cmd_reserve(cmd, batch_qwords(vq, c + n)))
             return;
-        batch_begin(cmd, n, PVK_VU1_INPUT_HEADER + vq);
+        batch_begin(cmd, c + n, PVK_VU1_INPUT_HEADER + vq);
         batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER,
                        vertices + (size_t)first * p->vertexStride, vq);
-        batch_indices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + vq, idx + done, n, lo);
+        batch_indices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + vq, pre, c, idx + done, n, lo);
         packet2_utils_vu_add_start_program(cmd->packet, 0);
         done += n;
     }

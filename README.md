@@ -59,4 +59,4 @@ export GSKIT=$PS2DEV/gsKit
 export PATH=$PATH:$PS2DEV/bin:$PS2DEV/ee/bin:$PS2DEV/iop/bin:$PS2DEV/dvp/bin:$PS2SDK/bin
 ```
 
-make builds `lib/libps2vk.a`, the shader compiler, `samples/triangle/triangle.elf`, `samples/cube/cube.elf` and `samples/lighting/lighting.elf`. Boot the ELF in PCSX2 with System > Boot ELF.
+make builds `lib/libps2vk.a`, the shader compiler, `samples/triangle/triangle.elf`, `samples/cube/cube.elf`, `samples/lighting/lighting.elf` and `samples/rain/rain.elf`. Boot the ELF in PCSX2 with System > Boot ELF.

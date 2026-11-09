@@ -336,14 +336,27 @@ static PvkResult validate_vertex_input(const PvkShaderCode *vs, const PvkGraphic
     return PVK_SUCCESS;
 }
 
-static uint32_t max_batch_vertices(uint32_t inputQwords, uint32_t outputQwords)
+static uint32_t max_batch_vertices(uint32_t inputQwords, uint32_t outputQwords, uint32_t step)
 {
     uint32_t byInput  = (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER) / inputQwords;
     uint32_t byOutput = (PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / outputQwords;
     uint32_t n        = byInput < byOutput ? byInput : byOutput;
 
-    return n - n % 3; /* whole triangles per batch */
+    return n - n % step; /* whole primitives per batch */
 }
+
+/* GS PRIM type and batch splitting of each topology. */
+static const struct {
+    uint32_t prim, step, overlap, fan;
+} topologies[] = {
+    [PVK_PRIMITIVE_TOPOLOGY_POINT_LIST]     = { PRIM_POINT, 1, 0, 0 },
+    [PVK_PRIMITIVE_TOPOLOGY_LINE_LIST]      = { PRIM_LINE, 2, 0, 0 },
+    [PVK_PRIMITIVE_TOPOLOGY_LINE_STRIP]     = { PRIM_LINE_STRIP, 1, 1, 0 },
+    [PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST]  = { PRIM_TRIANGLE, 3, 0, 0 },
+    [PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP] = { PRIM_TRIANGLE_STRIP, 1, 2, 0 },
+    [PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN]   = { PRIM_TRIANGLE_FAN, 1, 2, 1 },
+    [PVK_PRIMITIVE_TOPOLOGY_SPRITE_LIST]    = { PRIM_SPRITE, 2, 0, 0 },
+};
 
 PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineCreateInfo *info, PvkPipeline *pipeline)
 {
@@ -360,9 +373,9 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
         return res;
     if ((res = validate_vertex_input(vs, info)) != PVK_SUCCESS)
         return res;
-    if (info->topology != PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) {
-        pvk_error("pipeline: only PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST is supported\n");
-        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    if ((unsigned)info->topology >= sizeof(topologies) / sizeof(topologies[0])) {
+        pvk_error("pipeline: unknown topology %d\n", (int)info->topology);
+        return PVK_ERROR_VALIDATION_FAILED;
     }
 
     p = memalign(16, sizeof(struct PvkPipeline_T));
@@ -381,9 +394,12 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     /* A vertex shader with a texture coordinate output stores ST before RGBAQ, XYZ2. */
     p->outputQwords = vs->texcoordOutputLocation >= 0 ? PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED : PVK_VU1_OUTPUT_PER_VERTEX;
     p->vertexStride = info->vertexStride;
-    p->maxBatch     = max_batch_vertices(p->inputQwords, p->outputQwords);
+    p->primStep     = topologies[info->topology].step;
+    p->primOverlap  = topologies[info->topology].overlap;
+    p->fan          = topologies[info->topology].fan;
+    p->maxBatch     = max_batch_vertices(p->inputQwords, p->outputQwords, p->primStep);
     /* ST holds S/w, T/w and Q = 1/w (FST = 0), so the GS divides per pixel. */
-    p->prim         = GS_SET_PRIM(PRIM_TRIANGLE, fs->gouraud, fs->textured, 0,
+    p->prim         = GS_SET_PRIM(topologies[info->topology].prim, fs->gouraud, fs->textured, 0,
                                   info->colorBlend.attachment.blendEnable ? 1 : 0, 0, 0, 0, 0);
 
     if ((res = setup_depth(p, info)) != PVK_SUCCESS || (res = setup_blend(p, info)) != PVK_SUCCESS) {

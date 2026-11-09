@@ -138,7 +138,10 @@ struct PvkPipeline_T {
     uint32_t inputQwords;    /* qwords per vertex in VU1 memory */
     uint32_t outputQwords;    /* qwords per vertex VU1 emits: RGBAQ, XYZ2, plus ST when textured */
     uint32_t vertexStride;    /* bytes per vertex in the vertex buffer */
-    uint32_t maxBatch;        /* vertices per VU1 run */
+    uint32_t maxBatch;        /* vertices per VU1 run, a whole number of list primitives */
+    uint32_t primStep;        /* vertices a draw grows by: the list primitive's size, 1 for strips and fans */
+    uint32_t primOverlap;     /* vertices a strip or fan batch repeats from the previous batch */
+    int      fan;             /* repeats the first vertex of the draw, not the one before the overlap */
     u64      prim;            /* GS PRIM value for the GIF tag */
     PvkFormat depthFormat;    /* depth attachment it draws with, or UNDEFINED */
     uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */
