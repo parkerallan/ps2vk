@@ -502,6 +502,35 @@ typedef struct PvkPipelineDepthStencilStateCreateInfo {
     PvkCompareOp depthCompareOp;   /**< Comparison when the test is on. */
 } PvkPipelineDepthStencilStateCreateInfo;
 
+/** @brief Which triangles a pipeline discards. Values match Vulkan's VkCullModeFlagBits. */
+typedef enum PvkCullMode {
+    PVK_CULL_MODE_NONE           = 0, /**< Draw every triangle. */
+    PVK_CULL_MODE_FRONT_BIT      = 1, /**< Discard front-facing triangles. */
+    PVK_CULL_MODE_BACK_BIT       = 2, /**< Discard back-facing triangles. */
+    PVK_CULL_MODE_FRONT_AND_BACK = 3  /**< Discard all triangles: the draw is skipped. */
+} PvkCullMode;
+
+/** @brief Which winding is front-facing, like VkFrontFace, in framebuffer space (y down). */
+typedef enum PvkFrontFace {
+    PVK_FRONT_FACE_COUNTER_CLOCKWISE = 0, /**< Positive signed area is front-facing. */
+    PVK_FRONT_FACE_CLOCKWISE         = 1  /**< Negative signed area is front-facing. */
+} PvkFrontFace;
+
+/**
+ * @brief Culling, like VkPipelineRasterizationStateCreateInfo.
+ *
+ * All zeros means no culling and counter-clockwise front faces. Only triangle
+ * topologies cull; points, lines and sprites ignore it. The GS cannot cull, so
+ * the vertex shader's epilogue computes each triangle's signed area in screen
+ * space when its last vertex is transformed and, for a culled one, sets the
+ * ADC bit of that vertex's XYZ2 so the GS does not draw it. A strip's
+ * alternating winding and a fan's shared hub are followed per batch.
+ */
+typedef struct PvkPipelineRasterizationStateCreateInfo {
+    PvkCullMode  cullMode;  /**< Triangles to discard. */
+    PvkFrontFace frontFace; /**< Winding of a front-facing triangle. */
+} PvkPipelineRasterizationStateCreateInfo;
+
 /**
  * @brief Blend factors. Values match Vulkan's VkBlendFactor.
  *
@@ -572,6 +601,7 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     PvkPrimitiveTopology           topology;       /**< How the vertices of a draw are grouped into primitives. */
     PvkViewport                    viewport;       /**< Viewport, fixed for this pipeline. */
     PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none (like VkPipelineRenderingCreateInfo). Sets the depth range the viewport maps to. */
+    PvkPipelineRasterizationStateCreateInfo rasterization; /**< Back-face culling. */
     PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth test and write control. */
     PvkPipelineColorBlendStateCreateInfo   colorBlend;   /**< Blending with the color attachment. */
 } PvkGraphicsPipelineCreateInfo;
@@ -597,7 +627,7 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  *
  * Checks that the shaders match each other, the vertex layout and the
  * pipeline layout, and precomputes the viewport transform, GS primitive
- * settings, depth test and blend equation. A depth test needs a
+ * settings, culling, depth test and blend equation. A depth test needs a
  * depthAttachmentFormat, the comparison must be one the GS can do (see
  * PvkCompareOp) and the blend factors must fit the GS equation (see
  * PvkPipelineColorBlendAttachmentState).

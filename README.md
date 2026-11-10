@@ -22,7 +22,7 @@ Those coming from Vulkan will find the same design pattern, where we write a com
 
 ## Status
 
-Draws indexed shapes and depth-tested, 3D geometry from GLSL vertex and fragment shaders, running in PCSX2. Vertex shaders support:
+Draws indexed shapes and depth-tested, back-face culled 3D geometry from GLSL vertex and fragment shaders, running in PCSX2. Vertex shaders support:
 
 - vector arithmetic
 - swizzles and constructors

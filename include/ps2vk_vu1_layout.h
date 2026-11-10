@@ -2,7 +2,7 @@
  * VU1 data memory layout shared by the ps2vk runtime and tools/shaderc.
  * Addresses are in qwords (16 bytes); VU1 data memory holds 1024.
  *
- *   0   context: viewport scale, viewport offset, color scale (per pipeline)
+ *   0   context: viewport scale, viewport offset, color scale, culling (per pipeline)
  *   4   push constants: 8 qwords = 128 bytes, written by pvkCmdPushConstants
  *   16  uniform buffers: 64 qwords = 1 KB; the vertex shader's uniform blocks,
  *       placed by shaderc in (set, binding) order, each filled from the buffer
@@ -19,7 +19,10 @@
 #define PVK_VU1_CTX_VIEWPORT_SCALE  0
 #define PVK_VU1_CTX_VIEWPORT_OFFSET 1
 #define PVK_VU1_CTX_COLOR_SCALE     2
-#define PVK_VU1_CONTEXT_QWORDS    3
+#define PVK_VU1_CTX_CULL            3 /* x: winding sign flip per triangle (-1 strip, 1 else);
+                                         y: int, 1 for a fan; z: int, vertices per triangle
+                                         (3 list, 1 strip/fan), 0 = no culling; w: int 0x8000 (ADC) */
+#define PVK_VU1_CONTEXT_QWORDS    4
 
 #define PVK_VU1_PUSH_ADDR         4
 #define PVK_VU1_PUSH_QWORDS       8   /* PVK_MAX_PUSH_CONSTANT_BYTES / 16 */
@@ -30,7 +33,9 @@
 #define PVK_VU1_INPUT_ADDR        80
 #define PVK_VU1_INPUT_GIFTAG      0
 #define PVK_VU1_INPUT_COUNT       1   /* x: vertices to process; y: qword offset from the
-                                         input base of the index list, 0 = vertices in order */
+                                         input base of the index list, 0 = vertices in order;
+                                         z: float, winding sign of the batch's first triangle
+                                         (signed area * z < 0 = cull), VU1 flips it per triangle */
 #define PVK_VU1_INPUT_HEADER      2   /* qwords before the first vertex */
 
 #define PVK_VU1_OUTPUT_ADDR       512

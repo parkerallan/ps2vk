@@ -615,7 +615,7 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
             return 0;
         cmd_gs_state(cmd);
     }
-    return 1;
+    return !p->cullAll; /* FRONT_AND_BACK: every triangle is discarded, so nothing to send */
 }
 
 /* VU1 input memory a batch can fill, after the header. */
@@ -652,10 +652,11 @@ static uint32_t batch_qwords(uint32_t vertexQwords, uint32_t indices)
 }
 
 /* Batch header: the GIF tag VU1 copies to its output, how many vertices to
- * process and, for an indexed batch, where the index list starts. The
- * previous batch must be finished (VU1 done, output kicked) before its input
- * and output memory is overwritten, so a flush comes first. */
-static void batch_begin(PvkCommandBuffer cmd, uint32_t count, uint32_t indexOffset)
+ * process, for an indexed batch where the index list starts, and the winding
+ * sign to cull with (flipped for an odd strip triangle at draw position
+ * `first`). The previous batch must be finished before its memory is
+ * overwritten, so a flush comes first. */
+static void batch_begin(PvkCommandBuffer cmd, uint32_t count, uint32_t indexOffset, uint32_t first)
 {
     const PvkPipeline p = cmd->pipeline;
     u64 regs = p->outputQwords == PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED
@@ -669,7 +670,7 @@ static void batch_begin(PvkCommandBuffer cmd, uint32_t count, uint32_t indexOffs
                        regs);
     packet2_add_u32(cmd->packet, count);
     packet2_add_u32(cmd->packet, indexOffset);
-    packet2_add_u32(cmd->packet, 0);
+    packet2_add_float(cmd->packet, p->strip && (first & 1) ? -p->cullSign : p->cullSign);
     packet2_add_u32(cmd->packet, 0);
     packet2_utils_vu_close_unpack(cmd->packet);
 }
@@ -740,7 +741,7 @@ void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t firstVertex
 
         if (!cmd_reserve(cmd, batch_qwords(qwords, 0) + 2))
             return;
-        batch_begin(cmd, c + n, 0);
+        batch_begin(cmd, c + n, 0, done - c);
         if (c && p->fan) {
             /* The hub is not next to the run, so it is its own block. */
             batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER, base, p->inputQwords);
@@ -829,7 +830,7 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t first
                     return;
                 }
             }
-            batch_begin(cmd, total, 0);
+            batch_begin(cmd, total, 0, done - c);
             for (k = 0; k < total; k++)
                 batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + k * p->inputQwords,
                                vertices + (size_t)((int64_t)batch_index(pre, c, idx + done, k) + vertexOffset) * p->vertexStride,
@@ -850,7 +851,7 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t first
 
         if (!cmd_reserve(cmd, batch_qwords(vq, c + n)))
             return;
-        batch_begin(cmd, c + n, PVK_VU1_INPUT_HEADER + vq);
+        batch_begin(cmd, c + n, PVK_VU1_INPUT_HEADER + vq, done - c);
         batch_vertices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER,
                        vertices + (size_t)first * p->vertexStride, vq);
         batch_indices(cmd, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + vq, pre, c, idx + done, n, lo);

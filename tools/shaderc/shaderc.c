@@ -1445,11 +1445,65 @@ static void emit_index_scale(FILE *f, uint32_t qwords)
     }
 }
 
+/* Culling: when a vertex completes a triangle with the two before it (VF25,
+ * VF26), a negative signed area * winding sign sets ADC in its XYZ2. */
+static void emit_cull(FILE *f, const char *sym)
+{
+    char buf[64];
+
+    fprintf(f, "; culling: test the triangle this vertex completes\n");
+    vu(f, "sub.w         VF23,VF00,VF00", "isubiu        VI11,VI11,1", "ADC off; one vertex closer to a triangle");
+    snprintf(buf, sizeof(buf), "ibeq          VI12,VI00,%s_xyz", sym);
+    vu(f, "NOP", buf, "no culling");
+    vu(f, "NOP", "NOP", "branch delay slot");
+    snprintf(buf, sizeof(buf), "ibne          VI11,VI00,%s_shift", sym);
+    vu(f, "NOP", buf, "triangle not complete yet");
+    vu(f, "NOP", "NOP", "branch delay slot");
+    vu(f, "sub.xy        VF20,VF26,VF25", "iadd          VI11,VI12,VI00", "P1 - P0; vertices to the next triangle");
+    snprintf(buf, sizeof(buf), "lq            VF24,%d(VI01)", PVK_VU1_INPUT_COUNT);
+    vu(f, "sub.xy        VF21,VF22,VF25", buf, "P2 - P0; batch header, z = winding sign");
+    vu(f, "opmula.xyz    ACC,VF20,VF21", "NOP", NULL);
+    vu(f, "opmsub.xyz    VF20,VF21,VF20", "NOP", "z = signed area");
+    snprintf(buf, sizeof(buf), "lq            VF21,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_CULL);
+    vu(f, "mul.z         VF20,VF20,VF24", buf, "area * sign, negative = cull; cull context");
+    vu(f, "NOP", "NOP", "MAC flags land 4 cycles later");
+    vu(f, "NOP", "NOP", NULL);
+    vu(f, "NOP", "NOP", NULL);
+    vu(f, "NOP", "NOP", NULL);
+    vu(f, "mulx.z        VF24,VF24,VF21", "fmand         VI13,VI14", "next triangle's sign; sign flag of z");
+    snprintf(buf, sizeof(buf), "sq            VF24,%d(VI01)", PVK_VU1_INPUT_COUNT);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "ibeq          VI13,VI00,%s_shift", sym);
+    vu(f, "NOP", buf, "front facing: draw");
+    snprintf(buf, sizeof(buf), "ilw.w         VI13,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_CULL);
+    vu(f, "NOP", buf, "delay slot: ADC bit");
+    vu(f, "NOP", "NOP", NULL);
+    vu(f, "NOP", "mfir.w        VF23,VI13", "ADC on: the GS keeps the vertex but draws nothing");
+    fprintf(f, "%s_shift:\n", sym);
+    vu(f, "NOP", "isubiu        VI13,VI11,2", "0 at the batch's first vertex");
+    snprintf(buf, sizeof(buf), "ibeq          VI15,VI00,%s_p0", sym);
+    vu(f, "NOP", buf, "not a fan: P0 <- P1");
+    vu(f, "NOP", "NOP", "branch delay slot");
+    snprintf(buf, sizeof(buf), "ibne          VI13,VI00,%s_p1", sym);
+    vu(f, "NOP", buf, "a fan's P0 stays its hub");
+    vu(f, "NOP", "NOP", "branch delay slot");
+    vu(f, "NOP", "move.xy       VF25,VF22", "the hub");
+    snprintf(buf, sizeof(buf), "b             %s_p1", sym);
+    vu(f, "NOP", buf, NULL);
+    vu(f, "NOP", "NOP", "branch delay slot");
+    fprintf(f, "%s_p0:\n", sym);
+    vu(f, "NOP", "move.xy       VF25,VF26", NULL);
+    fprintf(f, "%s_p1:\n", sym);
+    vu(f, "NOP", "move.xy       VF26,VF22", "P1 <- this vertex");
+    fprintf(f, "%s_xyz:\n", sym);
+}
+
 /*
  * VF registers free for constants and shader temporaries. The rest hold the
- * prologue constants (VF01-VF04), inputs (VF10-VF17) and epilogue values (VF20-VF24).
+ * prologue constants (VF01-VF04), inputs (VF10-VF17), epilogue values (VF20-VF24)
+ * and the previous two screen positions for culling (VF25-VF26).
  */
-static const int g_pool[] = { 5, 6, 7, 8, 9, 18, 19, 25, 26, 27, 28, 29, 30, 31 };
+static const int g_pool[] = { 5, 6, 7, 8, 9, 18, 19, 27, 28, 29, 30, 31 };
 
 typedef struct {
     int reg[MAX_IDS];       /* VF register holding each value, 0 if none */
@@ -1945,10 +1999,12 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, ";   VF10.. shader inputs, VF20 gl_Position, VF21 color output\n");
     if (sh->texcoordValue)
         fprintf(f, ";   VF%02d texture coordinate output (S, T, Q)\n", PVK_VU1_TEXCOORD_REG);
-    fprintf(f, ";   VF05-VF09, VF18-VF19, VF25-VF31 push constants, uniforms, constants and temporaries\n");
+    fprintf(f, ";   VF25-VF26 the previous two screen positions (culling)\n");
+    fprintf(f, ";   VF05-VF09, VF18-VF19, VF27-VF31 push constants, uniforms, constants and temporaries\n");
     fprintf(f, ";   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer\n");
     fprintf(f, ";   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),\n");
-    fprintf(f, ";   VI10 first vertex\n\n");
+    fprintf(f, ";   VI10 first vertex, VI11 vertices to the next triangle, VI12 vertices per triangle\n");
+    fprintf(f, ";   (0 = no culling), VI14 MAC flag mask, VI15 fan\n\n");
     fprintf(f, "\t\t.vu\n\t\t.align 4\n");
     fprintf(f, "\t\t.global\t%s_CodeStart\n\t\t.global\t%s_CodeEnd\n", sym, sym);
     fprintf(f, "%s_CodeStart:\n", sym);
@@ -1976,6 +2032,12 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     vu(f, "NOP", buf, "output base");
     vu(f, "sub.xyzw      VF23,VF00,VF00", "sq            VF04,0(VI04)", "XYZ2 w = 0 (ADC off)");
     vu(f, "NOP", "iaddiu        VI05,VI04,1", "output pointer");
+    vu(f, "NOP", "iaddiu        VI11,VI00,3", "the third vertex completes the first triangle");
+    snprintf(buf, sizeof(buf), "ilw.z         VI12,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_CULL);
+    vu(f, "NOP", buf, "vertices per triangle, 0 = no culling");
+    snprintf(buf, sizeof(buf), "ilw.y         VI15,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_CULL);
+    vu(f, "NOP", buf, "1 for a fan");
+    vu(f, "NOP", "iaddiu        VI14,VI00,0x20", "MAC flag: z negative");
 
     for (i = 0; i <= sh->bodyCount + 2; i++) {
         uint32_t use[MAX_OPERANDS] = { 0 };
@@ -2084,11 +2146,15 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         snprintf(buf, sizeof(buf), "sq            VF%02d,0(VI05)", PVK_VU1_TEXCOORD_REG);
         vu(f, "NOP", buf, "ST (and Q)");
         vu(f, "NOP", "sq            VF24,1(VI05)", "RGBAQ");
-        vu(f, "NOP", "sq            VF23,2(VI05)", "XYZ2 (draws)");
-        snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED);
     } else {
         vu(f, "NOP", "sq            VF24,0(VI05)", "RGBAQ");
-        vu(f, "NOP", "sq            VF23,1(VI05)", "XYZ2 (draws)");
+    }
+    emit_cull(f, sym);
+    if (sh->texcoordValue) {
+        vu(f, "NOP", "sq            VF23,2(VI05)", "XYZ2 (draws unless ADC is set)");
+        snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED);
+    } else {
+        vu(f, "NOP", "sq            VF23,1(VI05)", "XYZ2 (draws unless ADC is set)");
         snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX);
     }
     vu(f, "NOP", buf, NULL);

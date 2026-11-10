@@ -296,6 +296,7 @@ int main(void)
         .topology       = PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         .viewport       = { 0.0f, 0.0f, WIDTH, HEIGHT, 0.0f, 1.0f },
         .depthAttachmentFormat = PVK_FORMAT_Z24,
+        .rasterization  = { .cullMode = PVK_CULL_MODE_BACK_BIT, .frontFace = PVK_FRONT_FACE_CLOCKWISE },
         .depthStencil   = { .depthTestEnable = 1, .depthWriteEnable = 1, .depthCompareOp = PVK_COMPARE_OP_LESS },
     };
     CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &pipeline));

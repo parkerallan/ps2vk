@@ -142,6 +142,9 @@ struct PvkPipeline_T {
     uint32_t primStep;        /* vertices a draw grows by: the list primitive's size, 1 for strips and fans */
     uint32_t primOverlap;     /* vertices a strip or fan batch repeats from the previous batch */
     int      fan;             /* repeats the first vertex of the draw, not the one before the overlap */
+    int      strip;           /* a triangle strip: the winding flips every triangle */
+    float    cullSign;        /* VU1 culls a triangle when its signed area * cullSign < 0; 0 = no culling */
+    int      cullAll;         /* FRONT_AND_BACK on triangles: draws are skipped */
     u64      prim;            /* GS PRIM value for the GIF tag */
     PvkFormat depthFormat;    /* depth attachment it draws with, or UNDEFINED */
     uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */

@@ -66,6 +66,34 @@ static int blend_factor(PvkBlendFactor f, int *k0, int *k1, int *src)
     }
 }
 
+/* VU1 drops a triangle when its screen-space signed area * cullSign < 0. */
+static PvkResult setup_cull(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info)
+{
+    const PvkPipelineRasterizationStateCreateInfo *rs = &info->rasterization;
+    uint32_t *ctx = (uint32_t *)&p->context[PVK_VU1_CTX_CULL * 4];
+    int triangles = info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+                    info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                    info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    float flip = p->strip ? -1.0f : 1.0f;
+
+    if ((unsigned)rs->cullMode > PVK_CULL_MODE_FRONT_AND_BACK ||
+        (unsigned)rs->frontFace > PVK_FRONT_FACE_CLOCKWISE) {
+        pvk_error("pipeline: unknown cullMode %d or frontFace %d\n", (int)rs->cullMode, (int)rs->frontFace);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (triangles && rs->cullMode == PVK_CULL_MODE_FRONT_AND_BACK)
+        p->cullAll = 1;
+    else if (triangles && rs->cullMode != PVK_CULL_MODE_NONE)
+        p->cullSign = (rs->cullMode == PVK_CULL_MODE_BACK_BIT) == (rs->frontFace == PVK_FRONT_FACE_COUNTER_CLOCKWISE)
+                    ? 1.0f : -1.0f;
+
+    memcpy(&ctx[0], &flip, sizeof(flip));
+    ctx[1] = p->fan ? 1 : 0;
+    ctx[2] = p->cullSign != 0.0f ? p->primStep : 0;
+    ctx[3] = 0x8000;
+    return PVK_SUCCESS;
+}
+
 /* Rewrites src * sf (op) dst * df as the GS's (A - B) * C + D. */
 static PvkResult setup_blend(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info)
 {
@@ -397,12 +425,14 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     p->primStep     = topologies[info->topology].step;
     p->primOverlap  = topologies[info->topology].overlap;
     p->fan          = topologies[info->topology].fan;
+    p->strip        = info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     p->maxBatch     = max_batch_vertices(p->inputQwords, p->outputQwords, p->primStep);
     /* ST holds S/w, T/w and Q = 1/w (FST = 0), so the GS divides per pixel. */
     p->prim         = GS_SET_PRIM(topologies[info->topology].prim, fs->gouraud, fs->textured, 0,
                                   info->colorBlend.attachment.blendEnable ? 1 : 0, 0, 0, 0, 0);
 
-    if ((res = setup_depth(p, info)) != PVK_SUCCESS || (res = setup_blend(p, info)) != PVK_SUCCESS) {
+    if ((res = setup_depth(p, info)) != PVK_SUCCESS || (res = setup_blend(p, info)) != PVK_SUCCESS ||
+        (res = setup_cull(p, info)) != PVK_SUCCESS) {
         free(p);
         return res;
     }

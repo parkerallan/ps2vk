@@ -50,7 +50,7 @@ Status: ✓ = implemented. *Italic notes* mark features the PS2 can't do nativel
 | | Indirect drawing: draw parameters read from a buffer | `vkCmdDrawIndirect`, `VkDrawIndirectCommand` | `pvkCmdDrawIndirect` | EE reads the parameters when the command buffer is built |
 | | Multiple vertex buffers: attributes in separate buffers | `vkCmdBindVertexBuffers`, `VkVertexInputBindingDescription` | `pvkCmdBindVertexBuffers`, binding descriptions | One `UNPACK` per binding with VIF `STCYCL` to interleave in VU1 memory |
 | | Compact vertex formats: 16/8-bit attributes save memory and DMA | `VK_FORMAT_R16G16B16_SNORM`, `R8G8B8A8_UNORM`, etc. | Matching `PvkFormat` values | VIF `UNPACK` `V3_16`, `V4_8` etc. expand to floats for free |
-| | Back-face culling: skip triangles facing away | `VkPipelineRasterizationStateCreateInfo` `cullMode`, `frontFace` | Same fields in pipeline create info | VU1 epilogue checks winding and sets the XYZ2 "don't draw" bit |
+| ✓ | Back-face culling: skip triangles facing away | `VkPipelineRasterizationStateCreateInfo` `cullMode`, `frontFace` | `PvkPipelineRasterizationStateCreateInfo` (`cullMode`, `frontFace`, Vulkan's values) as `rasterization` in the pipeline create info; triangle topologies only, FRONT_AND_BACK skips the draw | The epilogue computes each triangle's signed area in screen space when its last vertex is transformed (the two previous positions stay in VF25/VF26, a fan keeps its hub) and sets that vertex's XYZ2 ADC bit when area × sign < 0, so the GS queues the vertex but draws nothing. A context qword says how the topology forms triangles and the batch header carries the sign, flipped per triangle for a strip's alternating winding; the test is skipped when culling is off |
 
 ## Render targets and output
 
@@ -131,7 +131,7 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | --- | --- | --- |
 | ✓ | Clear | Swapchain, rendering, fences |
 | ✓ | Triangle | Pipeline, vertex and index buffers, shaders, a mat4 push constant (the triangle circles the screen), NTSC display mode |
-| ✓ | Textured cube | Depth buffer, a PNG read with libpng (ps2sdk-ports) from `host:` and uploaded once, decal sampling, a mat4 push constant, indexed drawing |
+| ✓ | Textured cube | Depth buffer, back-face culling (clockwise front faces, since the projection flips y like Vulkan's), a PNG read with libpng (ps2sdk-ports) from `host:` and uploaded once, decal sampling, a mat4 push constant, indexed drawing |
 | ✓ | Lighting | A sphere lit by an orbiting directional light: camera and light in two uniform buffers of one set, the light's buffer rewritten every frame, the model rotation and material color as push constants. The vertex shader writes the normal·light dot product as a texture coordinate and the fragment shader modulates the material by a 256×8 ramp texture (ambient + clamped Lambert), so the GS clamps per pixel and the day/night line is a curve, not a per-triangle sawtooth |
 | ✓ | Rain | A night rain scene, one topology per effect: sky and ground as a triangle strip, twinkling stars as points, the moon, its glow and its reflection as fans, 300 raindrops as a line list, splash ripples as line strips and splash droplets as sprites. The rain and droplets blend additively, the ripples with alpha; everything that moves is simulated on the EE and rewritten into one vertex buffer each frame |
 | | Skinning | Bone matrices, animation |
