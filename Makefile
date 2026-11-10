@@ -2,7 +2,7 @@
 # Needs PS2SDK set and the ps2dev bin directories on PATH.
 
 EE_LIB  = lib/libps2vk.a
-EE_OBJS = src/pvk_device.o src/pvk_swapchain.o src/pvk_image.o src/pvk_memory.o src/pvk_shader.o \
+EE_OBJS = src/pvk_device.o src/pvk_swapchain.o src/pvk_image.o src/pvk_sampler.o src/pvk_memory.o src/pvk_shader.o \
           src/pvk_descriptor.o src/pvk_pipeline.o src/pvk_cmd.o src/pvk_queue.o
 EE_INCS = -Iinclude
 EE_WARNFLAGS = -Wall -Wextra

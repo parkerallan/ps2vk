@@ -92,11 +92,18 @@ int pvk_set_layout_compatible(const struct PvkDescriptorSetLayout_T *a, const st
 /* Index into bindings[] of the binding with that number, or -1. */
 int pvk_set_layout_find(const struct PvkDescriptorSetLayout_T *layout, uint32_t binding);
 
-/* What one bindings[] slot of a set holds: an image for a combined image
- * sampler, a buffer range for a uniform buffer. Both NULL until written. */
+/* The sampler's settings as GS register fields. */
+struct PvkSampler_T {
+    uint32_t mmag, mmin; /* TEX1.MMAG/MMIN: LOD_MAG_x, LOD_MIN_x */
+    uint32_t wms, wmt;   /* CLAMP.WMS/WMT: WRAP_* */
+};
+
+/* What one bindings[] slot of a set holds: an image and sampler for a combined
+ * image sampler, a buffer range for a uniform buffer. All NULL until written. */
 struct PvkDescriptorSlot {
-    PvkImage  image;
-    PvkBuffer buffer;
+    PvkImage   image;
+    PvkSampler sampler;
+    PvkBuffer  buffer;
     size_t    offset;
     size_t    range;
 };

@@ -2,8 +2,8 @@
  * ps2vk cube sample: a spinning cube textured with texture.png, drawn with
  * a depth buffer so the near faces hide the far ones. The PNG is read with libpng from the folder the ELF
  * was booted from (PCSX2's host: device), uploaded once with
- * pvkCmdCopyBufferToImage, put in a descriptor set and sampled by the
- * fragment shader. The cube's transform is a mat4 push constant set every frame.
+ * pvkCmdCopyBufferToImage, put in a descriptor set with a bilinear sampler
+ * and sampled by the fragment shader. The cube's transform is a mat4 push constant set every frame.
  */
 #include <math.h>
 #include <stdio.h>
@@ -185,6 +185,7 @@ int main(void)
     PvkQueue queue;
     PvkSwapchain swapchain;
     PvkImage images[2], depth, texture;
+    PvkSampler sampler;
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer, textureBuffer;
     PvkShaderModule vs, fs;
@@ -225,6 +226,12 @@ int main(void)
     CHECK(pvkCreateImage(device, &depthInfo, &depth));
     PvkImageCreateInfo textureInfo = { .width = texWidth, .height = texHeight, .format = PVK_FORMAT_CT32 };
     CHECK(pvkCreateImage(device, &textureInfo, &texture));
+    /* Bilinear both ways; the cube's UVs stay in 0..1, so wrapping never shows. */
+    PvkSamplerCreateInfo samplerInfo = {
+        .magFilter = PVK_FILTER_LINEAR, .minFilter = PVK_FILTER_LINEAR,
+        .addressModeU = PVK_SAMPLER_ADDRESS_MODE_REPEAT, .addressModeV = PVK_SAMPLER_ADDRESS_MODE_REPEAT,
+    };
+    CHECK(pvkCreateSampler(device, &samplerInfo, &sampler));
 
     PvkBufferCreateInfo bufferInfo = { .size = sizeof(vertices) };
     CHECK(pvkCreateBuffer(device, &bufferInfo, &vertexBuffer));
@@ -279,7 +286,7 @@ int main(void)
         .descriptorPool = descriptorPool, .descriptorSetCount = 1, .setLayouts = &setLayout,
     };
     CHECK(pvkAllocateDescriptorSets(device, &setInfo, &descriptorSet));
-    PvkDescriptorImageInfo textureDescriptor = { .image = texture };
+    PvkDescriptorImageInfo textureDescriptor = { .sampler = sampler, .image = texture };
     PvkWriteDescriptorSet write = {
         .dstSet = descriptorSet, .dstBinding = 0,
         .descriptorType = PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .imageInfo = &textureDescriptor,

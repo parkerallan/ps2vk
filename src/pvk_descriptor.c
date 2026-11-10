@@ -1,7 +1,8 @@
-/* Descriptor set layouts, pools and sets. A set holds the image each of its
- * combined image sampler bindings reads and the buffer range behind each
- * uniform buffer binding; the command buffer turns the bound set into GS
- * TEX0 with the draw state and VIF UNPACKs of the buffers into VU1 memory. */
+/* Descriptor set layouts, pools and sets. A set holds the image and sampler
+ * each of its combined image sampler bindings reads and the buffer range
+ * behind each uniform buffer binding; the command buffer turns the bound set
+ * into GS TEX0/TEX1/CLAMP with the draw state and VIF UNPACKs of the buffers
+ * into VU1 memory. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -231,11 +232,13 @@ void pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const PvkWri
             w->dstSet->slots[slot].range  = range;
             continue;
         }
-        if (!w->imageInfo || !w->imageInfo->image || w->imageInfo->image->format != PVK_FORMAT_CT32) {
-            pvk_error("pvkUpdateDescriptorSets: write %u needs imageInfo with a PVK_FORMAT_CT32 image; "
-                      "skipped\n", (unsigned)i);
+        if (!w->imageInfo || !w->imageInfo->image || w->imageInfo->image->format != PVK_FORMAT_CT32 ||
+            !w->imageInfo->sampler) {
+            pvk_error("pvkUpdateDescriptorSets: write %u needs imageInfo with a PVK_FORMAT_CT32 image and a "
+                      "sampler; skipped\n", (unsigned)i);
             continue;
         }
-        w->dstSet->slots[slot].image = w->imageInfo->image;
+        w->dstSet->slots[slot].image   = w->imageInfo->image;
+        w->dstSet->slots[slot].sampler = w->imageInfo->sampler;
     }
 }

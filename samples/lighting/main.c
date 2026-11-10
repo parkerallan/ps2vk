@@ -164,6 +164,7 @@ int main(void)
     PvkQueue queue;
     PvkSwapchain swapchain;
     PvkImage images[2], depth, ramp;
+    PvkSampler rampSampler;
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer, cameraBuffer, lightBuffer, rampBuffer;
     PvkShaderModule vs, fs;
@@ -200,6 +201,13 @@ int main(void)
     CHECK(pvkCreateImage(device, &depthInfo, &depth));
     PvkImageCreateInfo rampInfo = { .width = RAMP_WIDTH, .height = RAMP_HEIGHT, .format = PVK_FORMAT_CT32 };
     CHECK(pvkCreateImage(device, &rampInfo, &ramp));
+    /* Clamp to edge: a dot product past either end of the ramp reads its end
+     * texel instead of wrapping round to the other end. */
+    PvkSamplerCreateInfo rampSamplerInfo = {
+        .magFilter = PVK_FILTER_LINEAR, .minFilter = PVK_FILTER_LINEAR,
+        .addressModeU = PVK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = PVK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    };
+    CHECK(pvkCreateSampler(device, &rampSamplerInfo, &rampSampler));
 
     PvkBufferCreateInfo bufferInfo = { .size = sizeof(vertices) };
     CHECK(pvkCreateBuffer(device, &bufferInfo, &vertexBuffer));
@@ -280,7 +288,7 @@ int main(void)
     CHECK(pvkAllocateDescriptorSets(device, &setInfo, &descriptorSet));
     PvkDescriptorBufferInfo cameraDescriptor = { .buffer = cameraBuffer, .offset = 0, .range = PVK_WHOLE_SIZE };
     PvkDescriptorBufferInfo lightDescriptor  = { .buffer = lightBuffer,  .offset = 0, .range = PVK_WHOLE_SIZE };
-    PvkDescriptorImageInfo rampDescriptor = { .image = ramp };
+    PvkDescriptorImageInfo rampDescriptor = { .sampler = rampSampler, .image = ramp };
     PvkWriteDescriptorSet writes[] = {
         { .dstSet = descriptorSet, .dstBinding = 0,
           .descriptorType = PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .bufferInfo = &cameraDescriptor },

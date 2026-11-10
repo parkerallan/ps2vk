@@ -160,6 +160,73 @@ void      pvkDestroyImage(PvkDevice device, PvkImage image);
 
 /* ======================================================================== */
 /**
+ * @defgroup samplers Samplers
+ * @brief How a texture is read: filtering between texels and wrapping past its edges.
+ *
+ * A sampler goes into a combined image sampler binding next to the image
+ * (PvkDescriptorImageInfo). On the PS2 its filters become GS TEX1.MMAG/MMIN
+ * and its address modes CLAMP.WMS/WMT, written with the draw state. The GS
+ * has no mirrored repeat, border color, anisotropy or depth comparison;
+ * only repeat and clamp to edge exist. Images have one mip level, so the
+ * mipmap mode is accepted and has no effect.
+ * @{
+ */
+
+/** @brief Rules for reading a texture, created with pvkCreateSampler(). */
+typedef struct PvkSampler_T *PvkSampler;
+
+/** @brief Texel filtering. Values match Vulkan's VkFilter. */
+typedef enum PvkFilter {
+    PVK_FILTER_NEAREST = 0, /**< The nearest texel. GS MMAG/MMIN = NEAREST. */
+    PVK_FILTER_LINEAR  = 1  /**< The 4 surrounding texels blended (bilinear). GS MMAG/MMIN = LINEAR. */
+} PvkFilter;
+
+/** @brief Mipmap selection. Values match Vulkan's VkSamplerMipmapMode; images have one level, so it changes nothing yet. */
+typedef enum PvkSamplerMipmapMode {
+    PVK_SAMPLER_MIPMAP_MODE_NEAREST = 0, /**< Pick one level. */
+    PVK_SAMPLER_MIPMAP_MODE_LINEAR  = 1  /**< Blend two levels. */
+} PvkSamplerMipmapMode;
+
+/** @brief What a coordinate outside 0 to 1 reads. Values match Vulkan's VkSamplerAddressMode. */
+typedef enum PvkSamplerAddressMode {
+    PVK_SAMPLER_ADDRESS_MODE_REPEAT               = 0, /**< Tile the texture. GS WMS/WMT = REPEAT. */
+    PVK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT      = 1, /**< Not supported. */
+    PVK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE        = 2, /**< Stretch the edge texel outward. GS WMS/WMT = CLAMP. */
+    PVK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER      = 3, /**< Not supported. */
+    PVK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE = 4  /**< Not supported. */
+} PvkSamplerAddressMode;
+
+/** @brief Parameters for pvkCreateSampler(), like VkSamplerCreateInfo. All zeros is nearest filtering, repeat. */
+typedef struct PvkSamplerCreateInfo {
+    PvkFilter             magFilter;    /**< Filter when a texel covers more than a pixel (zoomed in). GS TEX1.MMAG. */
+    PvkFilter             minFilter;    /**< Filter when a pixel covers more than a texel (zoomed out). GS TEX1.MMIN. */
+    PvkSamplerMipmapMode  mipmapMode;   /**< Accepted, no effect: images have one mip level. */
+    PvkSamplerAddressMode addressModeU; /**< Wrapping of the s coordinate. GS CLAMP.WMS. */
+    PvkSamplerAddressMode addressModeV; /**< Wrapping of the t coordinate. GS CLAMP.WMT. */
+} PvkSamplerCreateInfo;
+
+/**
+ * @brief Creates a sampler.
+ * @param device The device.
+ * @param info Filters and address modes.
+ * @param[out] sampler The new sampler.
+ * @return PVK_SUCCESS, PVK_ERROR_FEATURE_NOT_PRESENT for an address mode the GS
+ *         lacks, PVK_ERROR_VALIDATION_FAILED for a value outside the enums or
+ *         PVK_ERROR_OUT_OF_HOST_MEMORY.
+ */
+PvkResult pvkCreateSampler(PvkDevice device, const PvkSamplerCreateInfo *info, PvkSampler *sampler);
+
+/**
+ * @brief Destroys a sampler. Descriptor sets that hold it must not be drawn with afterwards.
+ * @param device The device.
+ * @param sampler Sampler to destroy.
+ */
+void      pvkDestroySampler(PvkDevice device, PvkSampler sampler);
+
+/** @} */
+
+/* ======================================================================== */
+/**
  * @defgroup swapchain Swapchain
  * @brief The framebuffers shown on the TV, and presenting them.
  * @{
@@ -774,9 +841,10 @@ typedef struct PvkDescriptorSetAllocateInfo {
  */
 PvkResult pvkAllocateDescriptorSets(PvkDevice device, const PvkDescriptorSetAllocateInfo *info, PvkDescriptorSet *sets);
 
-/** @brief The image a combined image sampler binding reads, like VkDescriptorImageInfo. */
+/** @brief The image and sampler a combined image sampler binding reads, like VkDescriptorImageInfo. */
 typedef struct PvkDescriptorImageInfo {
-    PvkImage image; /**< A PVK_FORMAT_CT32 image: a texture or a swapchain image. Sampled bilinear, no mipmaps, repeating, until samplers exist. */
+    PvkSampler sampler; /**< How the image is read (see @ref samplers). */
+    PvkImage   image;   /**< A PVK_FORMAT_CT32 image: a texture or a swapchain image. */
 } PvkDescriptorImageInfo;
 
 /** @brief The rest of a buffer, as the range of a PvkDescriptorBufferInfo. */

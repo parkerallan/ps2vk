@@ -260,8 +260,8 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 #define PVK_GS_STATE_QWORDS 12
 
 /* FRAME, ZBUF, TEST and ALPHA for drawing with the bound pipeline into the current
- * attachments, plus TEX0, TEX1 and CLAMP for the image in the bound descriptor
- * set when the pipeline samples one. Sent before the first draw after
+ * attachments, plus TEX0, TEX1 and CLAMP for the image and sampler in the bound
+ * descriptor set when the pipeline samples one. Sent before the first draw after
  * pvkCmdBeginRendering, pvkCmdBindPipeline or pvkCmdBindDescriptorSets. */
 static void cmd_gs_state(PvkCommandBuffer cmd)
 {
@@ -280,13 +280,15 @@ static void cmd_gs_state(PvkCommandBuffer cmd)
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
     q = gs_ad(q, p->alpha, GS_REG_ALPHA);
     if (textured) {
-        const PvkImage t = cmd->sets[p->samplerSet]->slots[p->samplerSlot].image;
+        const struct PvkDescriptorSlot *slot = &cmd->sets[p->samplerSet]->slots[p->samplerSlot];
+        const PvkImage t = slot->image;
+        const PvkSampler s = slot->sampler;
         /* The texture's alpha is used (TCC), the function comes from the fragment
-         * shader. Until samplers exist: bilinear filtering, no mipmaps, repeat. */
+         * shader, filters and wrapping from the sampler; no mipmaps (MXL = 0). */
         q = gs_ad(q, GS_SET_TEX0(t->fb.address >> 6, t->tbw, t->fb.psm, t->tw, t->th, TEXTURE_COMPONENTS_RGBA,
                                  p->fs->textureFunction, 0, 0, 0, 0, 0), GS_REG_TEX0);
-        q = gs_ad(q, GS_SET_TEX1(LOD_USE_K, 0, LOD_MAG_LINEAR, LOD_MIN_LINEAR, 0, 0, 0), GS_REG_TEX1);
-        q = gs_ad(q, GS_SET_CLAMP(WRAP_REPEAT, WRAP_REPEAT, 0, 0, 0, 0), GS_REG_CLAMP);
+        q = gs_ad(q, GS_SET_TEX1(LOD_USE_K, 0, s->mmag, s->mmin, 0, 0, 0), GS_REG_TEX1);
+        q = gs_ad(q, GS_SET_CLAMP(s->wms, s->wmt, 0, 0, 0, 0), GS_REG_CLAMP);
         /* The texture cache may hold texels from before an upload or a render into it. */
         q = gs_ad(q, GS_SET_TEXFLUSH(0), GS_REG_TEXFLUSH);
     }
