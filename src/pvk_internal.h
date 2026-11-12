@@ -46,11 +46,12 @@ struct PvkDevice_T {
 };
 
 /* Color images keep libdraw's framebuffer_t (the swapchain presents from it);
- * depth images reuse its address/width/height with a GS_PSMZ_* psm. A CT32
+ * depth images reuse its address/width/height with a GS_PSMZ_* psm. A color
  * image can also be sampled: TEX0 takes its address, texture buffer width
  * and log2 size; MIPTBP1/2 the addresses and widths of the other levels. */
 struct PvkImage_T {
     PvkFormat     format;
+    int           colorTable; /* a palette of fb.width entries at TEX0.CBP */
     framebuffer_t fb;         /* level 0 */
     uint32_t      tbw;        /* GS TEX0.TBW / BITBLTBUF.DBW: buffer width in 64-texel units */
     uint32_t      tw, th;     /* GS TEX0.TW/TH: log2 of the width and height */
@@ -61,6 +62,9 @@ struct PvkImage_T {
 
 /* GS psm for a PvkFormat, or -1. */
 int pvk_gs_psm(PvkFormat format);
+/* Bits per texel of a color format, 0 otherwise. */
+uint32_t pvk_format_bits(PvkFormat format);
+int pvk_is_color_format(PvkFormat format);
 /* Fills tbw/tw/th from fb.width and fb.height, and level 0's entries. */
 void pvk_image_texture_params(PvkImage image);
 /* Largest depth value a depth format stores; depth is flipped so near = this. */
@@ -110,6 +114,7 @@ struct PvkSampler_T {
  * image sampler, a buffer range for a uniform buffer. All NULL until written. */
 struct PvkDescriptorSlot {
     PvkImage   image;
+    PvkImage   colorTable; /* for a T8/T4 image */
     PvkSampler sampler;
     PvkBuffer  buffer;
     size_t    offset;

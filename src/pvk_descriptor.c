@@ -232,11 +232,21 @@ void pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const PvkWri
             w->dstSet->slots[slot].range  = range;
             continue;
         }
-        if (!w->imageInfo || !w->imageInfo->image || w->imageInfo->image->format != PVK_FORMAT_CT32 ||
-            !w->imageInfo->sampler) {
-            pvk_error("pvkUpdateDescriptorSets: write %u needs imageInfo with a PVK_FORMAT_CT32 image and a "
-                      "sampler; skipped\n", (unsigned)i);
+        if (!w->imageInfo || !w->imageInfo->image || !pvk_is_color_format(w->imageInfo->image->format) ||
+            w->imageInfo->image->colorTable || !w->imageInfo->sampler) {
+            pvk_error("pvkUpdateDescriptorSets: write %u needs imageInfo with a texture (a color image that is "
+                      "not a color table) and a sampler; skipped\n", (unsigned)i);
             continue;
+        }
+        {
+            const PvkImage img = w->imageInfo->image, c = w->imageInfo->colorTable;
+            int indexed = img->format == PVK_FORMAT_T8 || img->format == PVK_FORMAT_T4;
+            if (indexed ? !c || !c->colorTable || (img->format == PVK_FORMAT_T8 && c->fb.width != 256) : c != NULL) {
+                pvk_error("pvkUpdateDescriptorSets: write %u: a PVK_FORMAT_T8 image needs a 256-entry colorTable, "
+                          "a PVK_FORMAT_T4 image a 16- or 256-entry one, other formats none; skipped\n", (unsigned)i);
+                continue;
+            }
+            w->dstSet->slots[slot].colorTable = c;
         }
         w->dstSet->slots[slot].image   = w->imageInfo->image;
         w->dstSet->slots[slot].sampler = w->imageInfo->sampler;

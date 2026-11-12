@@ -1,9 +1,8 @@
 /*
- * ps2vk cube sample: a spinning cube textured with texture.png, drawn with
- * a depth buffer so the near faces hide the far ones. The PNG is read with libpng from the folder the ELF
- * was booted from (PCSX2's host: device), uploaded once with
- * pvkCmdCopyBufferToImage, put in a descriptor set with a bilinear sampler
- * and sampled by the fragment shader. The cube's transform is a mat4 push constant set every frame.
+ * ps2vk cube sample: a spinning, depth-tested cube textured with texture.png,
+ * a 256-color PNG read with libpng from host:. It is uploaded once as a
+ * PVK_FORMAT_T8 texture (one palette index per texel) with its palette in a
+ * 256-entry PVK_FORMAT_CT16 color table.
  */
 #include <math.h>
 #include <stdio.h>
@@ -73,23 +72,26 @@ static void build_cube(Vertex *v, uint16_t *idx)
     }
 }
 
-/*
- * Reads a PNG into GS PSMCT32 pixels: 8 bits each of R, G, B, A, with alpha
- * halved since 0x80 is opaque on the GS. Any PNG color type is expanded to
- * RGBA by libpng. Returns malloc'd pixels, or NULL after printing why.
- */
-static uint32_t *load_png(const char *path, uint32_t *width, uint32_t *height)
+typedef struct {
+    uint32_t width, height;
+    uint8_t *indices;      /* PVK_FORMAT_T8 texels */
+    uint16_t palette[256]; /* PVK_FORMAT_CT16 color table entries */
+} Picture;
+
+/* Reads a 256-color PNG into pic; returns 0 after printing why. */
+static int load_png(const char *path, Picture *pic)
 {
     FILE *f = fopen(path, "rb");
     png_structp png;
     png_infop info;
     png_bytep *rows;
-    uint32_t *pixels;
+    png_colorp plte = NULL;
+    int entries = 0;
     uint32_t w, h, x, y;
 
     if (!f) {
         printf("cube: cannot open %s\n", path);
-        return NULL;
+        return 0;
     }
     png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     info = png ? png_create_info_struct(png) : NULL;
@@ -97,33 +99,44 @@ static uint32_t *load_png(const char *path, uint32_t *width, uint32_t *height)
         printf("cube: %s is not a PNG libpng can read\n", path);
         png_destroy_read_struct(&png, info ? &info : NULL, NULL);
         fclose(f);
-        return NULL;
+        return 0;
     }
     png_init_io(png, f);
-    /* Whatever the file holds, hand back 8-bit RGBA rows. */
-    png_read_png(png, info, PNG_TRANSFORM_STRIP_16 | PNG_TRANSFORM_PACKING | PNG_TRANSFORM_EXPAND |
-                 PNG_TRANSFORM_GRAY_TO_RGB, NULL);
+    png_read_info(png, info);
+    if (png_get_color_type(png, info) != PNG_COLOR_TYPE_PALETTE) {
+        printf("cube: %s must be a paletted (256-color) PNG\n", path);
+        png_destroy_read_struct(&png, &info, NULL);
+        fclose(f);
+        return 0;
+    }
+    png_set_packing(png); /* one index per byte */
+    png_read_update_info(png, info);
     w = png_get_image_width(png, info);
     h = png_get_image_height(png, info);
-    rows = png_get_rows(png, info);
-
-    pixels = malloc((size_t)w * h * 4);
-    if (pixels) {
-        int alpha = png_get_color_type(png, info) & PNG_COLOR_MASK_ALPHA;
-        for (y = 0; y < h; y++) {
-            const png_byte *src = rows[y];
-            for (x = 0; x < w; x++) {
-                uint32_t r = src[0], g = src[1], b = src[2], a = alpha ? src[3] >> 1 : 0x80;
-                pixels[y * w + x] = (a << 24) | (b << 16) | (g << 8) | r;
-                src += alpha ? 4 : 3;
-            }
-        }
+    rows = malloc(h * sizeof(png_bytep));
+    pic->indices = malloc((size_t)w * h);
+    if (!rows || !pic->indices) {
+        printf("cube: out of memory for %s\n", path);
+        png_destroy_read_struct(&png, &info, NULL);
+        fclose(f);
+        return 0;
     }
+    for (y = 0; y < h; y++)
+        rows[y] = pic->indices + (size_t)y * w;
+    png_read_image(png, rows);
+
+    /* PLTE's 8-bit colors to CT16: 5 bits each, alpha bit set (opaque). */
+    png_get_PLTE(png, info, &plte, &entries);
+    for (x = 0; x < 256; x++) {
+        png_color c = x < (uint32_t)entries ? plte[x] : plte[0];
+        pic->palette[x] = (uint16_t)(0x8000 | (c.blue >> 3) << 10 | (c.green >> 3) << 5 | (c.red >> 3));
+    }
+    free(rows);
     png_destroy_read_struct(&png, &info, NULL);
     fclose(f);
-    *width  = w;
-    *height = h;
-    return pixels;
+    pic->width  = w;
+    pic->height = h;
+    return 1;
 }
 
 /* Column-major 4x4 matrices: m[col * 4 + row]. */
@@ -184,10 +197,10 @@ int main(void)
     PvkDevice device;
     PvkQueue queue;
     PvkSwapchain swapchain;
-    PvkImage images[2], depth, texture;
+    PvkImage images[2], depth, texture, colorTable;
     PvkSampler sampler;
     uint32_t imageCount = 2;
-    PvkBuffer vertexBuffer, indexBuffer, textureBuffer;
+    PvkBuffer vertexBuffer, indexBuffer, textureBuffer, paletteBuffer;
     PvkShaderModule vs, fs;
     PvkDescriptorSetLayout setLayout;
     PvkDescriptorPool descriptorPool;
@@ -200,14 +213,13 @@ int main(void)
     static Vertex vertices[24];
     static uint16_t indices[36];
     float proj[16];
-    uint32_t *pixels, texWidth, texHeight;
+    Picture pic;
 
     build_cube(vertices, indices);
 
-    pixels = load_png(TEXTURE_FILE, &texWidth, &texHeight);
-    if (!pixels)
+    if (!load_png(TEXTURE_FILE, &pic))
         return 1;
-    printf("cube: %s is %ux%u\n", TEXTURE_FILE, (unsigned)texWidth, (unsigned)texHeight);
+    printf("cube: %s is %ux%u\n", TEXTURE_FILE, (unsigned)pic.width, (unsigned)pic.height);
 
     PvkInstanceCreateInfo instanceInfo = { .applicationName = "cube" };
     CHECK(pvkCreateInstance(&instanceInfo, &instance));
@@ -221,11 +233,13 @@ int main(void)
     CHECK(pvkCreateSwapchain(device, &swapchainInfo, &swapchain));
     CHECK(pvkGetSwapchainImages(device, swapchain, &imageCount, images));
 
-    /* VRAM is handed out in order: framebuffers, then the depth buffer, then the texture. */
+    /* VRAM is handed out in order: framebuffers, depth buffer, the T8 texture, then its CT16 color table. */
     PvkImageCreateInfo depthInfo = { .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_Z24 };
     CHECK(pvkCreateImage(device, &depthInfo, &depth));
-    PvkImageCreateInfo textureInfo = { .width = texWidth, .height = texHeight, .format = PVK_FORMAT_CT32 };
+    PvkImageCreateInfo textureInfo = { .width = pic.width, .height = pic.height, .format = PVK_FORMAT_T8 };
     CHECK(pvkCreateImage(device, &textureInfo, &texture));
+    PvkImageCreateInfo tableInfo = { .width = 256, .height = 1, .format = PVK_FORMAT_CT16 };
+    CHECK(pvkCreateImage(device, &tableInfo, &colorTable));
     /* Bilinear both ways; the cube's UVs stay in 0..1, so wrapping never shows. */
     PvkSamplerCreateInfo samplerInfo = {
         .magFilter = PVK_FILTER_LINEAR, .minFilter = PVK_FILTER_LINEAR,
@@ -245,13 +259,18 @@ int main(void)
     memcpy(mapped, indices, sizeof(indices));
     pvkUnmapMemory(device, indexBuffer);
 
-    /* The texture's pixels: a staging buffer, as in Vulkan. */
-    PvkBufferCreateInfo textureBufferInfo = { .size = (size_t)texWidth * texHeight * 4 };
+    /* Staging buffers, as in Vulkan: the T8 indices, then the CT16 color table. */
+    PvkBufferCreateInfo textureBufferInfo = { .size = (size_t)pic.width * pic.height };
     CHECK(pvkCreateBuffer(device, &textureBufferInfo, &textureBuffer));
     CHECK(pvkMapMemory(device, textureBuffer, &mapped));
-    memcpy(mapped, pixels, textureBufferInfo.size);
+    memcpy(mapped, pic.indices, textureBufferInfo.size);
     pvkUnmapMemory(device, textureBuffer);
-    free(pixels);
+    free(pic.indices);
+    PvkBufferCreateInfo paletteBufferInfo = { .size = sizeof(pic.palette) };
+    CHECK(pvkCreateBuffer(device, &paletteBufferInfo, &paletteBuffer));
+    CHECK(pvkMapMemory(device, paletteBuffer, &mapped));
+    memcpy(mapped, pic.palette, sizeof(pic.palette));
+    pvkUnmapMemory(device, paletteBuffer);
 
     PvkShaderModuleCreateInfo vsInfo = { .code = &cube_vert };
     PvkShaderModuleCreateInfo fsInfo = { .code = &cube_frag };
@@ -286,7 +305,7 @@ int main(void)
         .descriptorPool = descriptorPool, .descriptorSetCount = 1, .setLayouts = &setLayout,
     };
     CHECK(pvkAllocateDescriptorSets(device, &setInfo, &descriptorSet));
-    PvkDescriptorImageInfo textureDescriptor = { .sampler = sampler, .image = texture };
+    PvkDescriptorImageInfo textureDescriptor = { .sampler = sampler, .image = texture, .colorTable = colorTable };
     PvkWriteDescriptorSet write = {
         .dstSet = descriptorSet, .dstBinding = 0,
         .descriptorType = PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .imageInfo = &textureDescriptor,
@@ -311,10 +330,12 @@ int main(void)
     CHECK(pvkCreateCommandBuffer(device, NULL, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
 
-    /* Upload the texture once, outside rendering, and wait for it. */
+    /* Upload the texture and its color table once, outside rendering, and wait for it. */
     CHECK(pvkBeginCommandBuffer(cmd));
-    PvkBufferImageCopy copy = { .bufferOffset = 0, .rect = { 0, 0, texWidth, texHeight } };
+    PvkBufferImageCopy copy = { .bufferOffset = 0, .rect = { 0, 0, pic.width, pic.height } };
     pvkCmdCopyBufferToImage(cmd, textureBuffer, texture, &copy);
+    PvkBufferImageCopy tableCopy = { .bufferOffset = 0, .rect = { 0, 0, 256, 1 } };
+    pvkCmdCopyBufferToImage(cmd, paletteBuffer, colorTable, &tableCopy);
     CHECK(pvkEndCommandBuffer(cmd));
     CHECK(pvkQueueSubmit(queue, cmd, fence));
     CHECK(pvkWaitForFences(device, 1, &fence));

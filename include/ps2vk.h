@@ -39,7 +39,11 @@ typedef enum PvkResult {
 typedef enum PvkFormat {
     PVK_FORMAT_UNDEFINED = 0,       /**< No format. */
     PVK_FORMAT_R32G32B32A32_SFLOAT, /**< Vertex attribute: 4 floats. */
-    PVK_FORMAT_CT32,                /**< GS PSMCT32 color image (RGBA, 8 bits each). */
+    PVK_FORMAT_CT32,                /**< GS PSMCT32 color image (RGBA, 8 bits each; like VK_FORMAT_R8G8B8A8_UNORM, alpha 0x80 is opaque). */
+    PVK_FORMAT_CT24,                /**< GS PSMCT24 texture or color table (RGB, 8 bits each, 3 bytes per texel; like VK_FORMAT_R8G8B8_UNORM). Reads as opaque. */
+    PVK_FORMAT_CT16,                /**< GS PSMCT16 texture or color table (16 bits per texel: R in bits 0-4, G 5-9, B 10-14, alpha bit 15; like VK_FORMAT_A1R5G5B5_UNORM_PACK16). */
+    PVK_FORMAT_T8,                  /**< GS PSMT8 texture: one byte per texel, an index into a 256-entry color table (PS2 only). */
+    PVK_FORMAT_T4,                  /**< GS PSMT4 texture: 4 bits per texel, two per byte with the first in the low bits, an index into a 16-entry color table (PS2 only). */
     PVK_FORMAT_Z32,                 /**< GS PSMZ32 depth image (like VK_FORMAT_D32). */
     PVK_FORMAT_Z24,                 /**< GS PSMZ24 depth image (like VK_FORMAT_X8_D24). */
     PVK_FORMAT_Z16                  /**< GS PSMZ16 depth image (like VK_FORMAT_D16). */
@@ -120,6 +124,29 @@ PvkResult pvkDeviceWaitIdle(PvkDevice device);
 /**
  * @defgroup images Images
  * @brief Pixel memory in GS VRAM: framebuffers, depth buffers and textures.
+ *
+ * The choice is almost entirely about GS VRAM, which is 4 MB shared by
+ * framebuffers, depth buffer and every texture. A 640×448 CT32 framebuffer
+ * pair plus a Z24 buffer already takes about 3.4 MB, so textures fight over
+ * what is left. Smaller texel formats also move less data through the DMA on
+ * upload and through the texture cache while drawing, which is why real PS2
+ * games used 8-bit and 4-bit textures almost everywhere.
+ *
+ * | Format | Bits per texel | 256×256 texture | What you get |
+ * | --- | --- | --- | --- |
+ * | PVK_FORMAT_CT32 | 32 | 256 KB | Full RGB plus an 8-bit alpha. Use when you need smooth alpha gradients or exact color, such as a lighting ramp or a UI element with soft edges. |
+ * | PVK_FORMAT_CT24 | 24 | 192 KB | Same RGB, no alpha; the GS reads it as opaque. Use for opaque full-color images that must not be quantized: photographs, pre-rendered backdrops, video frames and skyboxes. |
+ * | PVK_FORMAT_CT16 | 16 | 128 KB | 5 bits per channel and a 1-bit alpha. Use for full-color textures with cut-out transparency: foliage, fences, grates, hair cards and particle sprites with hard edges. |
+ * | PVK_FORMAT_T8 | 8 | 64 KB + 1 KB table | Each texel indexes a 256-entry table, and alpha comes from the table: a CT32 table gives every entry an 8-bit alpha, a CT16 table a 1-bit one, so T8 with a CT32 table does soft gradients at a quarter of CT32's size. Use for character skins, environment and terrain textures, props and anything painted: the bulk of a scene's textures. Swapping tables recolors a texture for free. |
+ * | PVK_FORMAT_T4 | 4 | 32 KB + 64 B table | 16 colors, each with the alpha of its table entry (8-bit from a CT32 table, 1-bit from CT16). For sprites, fonts, decals, UI, and anything flat-shaded. Eight times smaller than CT32, so a whole sprite sheet fits where one CT32 texture would. |
+ *
+ * Color tables are separate images so several textures share one, and so the
+ * same texture can be drawn with different palettes, which is how games did
+ * team colors, damage states and day/night tints with no extra texture memory.
+ *
+ * The practical rule: start with T8, drop to T4 for flat art, go up to CT16
+ * only when a palette visibly fails, and reserve CT32 for the few textures
+ * where alpha gradients or exact values matter.
  * @{
  */
 
@@ -131,21 +158,28 @@ typedef struct PvkImage_T         *PvkImage;
 
 /** @brief Parameters for pvkCreateImage(). */
 typedef struct PvkImageCreateInfo {
-    uint32_t  width;     /**< Width in pixels; a depth buffer must be as wide as the framebuffer it is used with, a texture a power of two from 8 to 1024. */
-    uint32_t  height;    /**< Height in pixels; a texture a power of two from 8 to 1024. */
+    uint32_t  width;     /**< Width in pixels; a depth buffer must be as wide as the framebuffer it is used with, a texture a power of two from 8 to 1024, a color table 16 or 256 (its entries). */
+    uint32_t  height;    /**< Height in pixels; a texture a power of two from 8 to 1024, a color table 1. */
     uint32_t  mipLevels; /**< Texture only: number of mip levels, 0 or 1 for the base level alone, up to PVK_MAX_MIP_LEVELS. Each level halves the one before and must stay at least 8 on each side. */
-    PvkFormat format;    /**< PVK_FORMAT_CT32 for a texture, or PVK_FORMAT_Z32, PVK_FORMAT_Z24 or PVK_FORMAT_Z16 for a depth buffer. */
+    PvkFormat format;    /**< PVK_FORMAT_CT32, PVK_FORMAT_CT24, PVK_FORMAT_CT16, PVK_FORMAT_T8 or PVK_FORMAT_T4 for a texture; PVK_FORMAT_CT32 or PVK_FORMAT_CT16 for a color table; PVK_FORMAT_Z32, PVK_FORMAT_Z24 or PVK_FORMAT_Z16 for a depth buffer. */
 } PvkImageCreateInfo;
 
 /**
  * @brief Allocates an image in GS VRAM.
  *
- * A PVK_FORMAT_CT32 image is a texture: fill each of its mip levels with
- * pvkCmdCopyBufferToImage() and sample it through a descriptor set (see
- * @ref descriptors). Every level gets its own VRAM, addressed by GS TEX0 and
- * MIPTBP1/MIPTBP2 when the texture is bound. Depth formats make depth buffers.
- * Framebuffers come from the swapchain. GS VRAM is handed out in creation
- * order and never reclaimed, so create images once, after the swapchain.
+ * A color format image at least 8 texels on each side is a texture: fill
+ * each of its mip levels with pvkCmdCopyBufferToImage() and sample it
+ * through a descriptor set (see @ref descriptors). Every level gets its own
+ * VRAM, addressed by GS TEX0 and MIPTBP1/MIPTBP2 when the texture is bound.
+ * A PVK_FORMAT_CT32 or PVK_FORMAT_CT16 image 16 or 256 wide and 1 high is
+ * a color table: the palette a PVK_FORMAT_T4 or PVK_FORMAT_T8 texture's
+ * indices pick colors from (GS TEX0.CBP/CPSM, loaded in CSM1 layout). A table
+ * is paired with a texture in its PvkDescriptorImageInfo, so one table can
+ * serve several textures and a texture can switch tables; a 256-entry table
+ * also serves a PVK_FORMAT_T4 texture, which reads its first 16 entries.
+ * Depth formats make depth buffers. Framebuffers come from the swapchain.
+ * GS VRAM is handed out in creation order and never reclaimed, so create
+ * images once, after the swapchain.
  *
  * @param device The device.
  * @param info Image parameters.
@@ -761,7 +795,7 @@ typedef struct PvkDescriptorSet_T       *PvkDescriptorSet;
 
 /** @brief What a descriptor binding holds. Values match Vulkan's VkDescriptorType. */
 typedef enum PvkDescriptorType {
-    PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = 1, /**< A PVK_FORMAT_CT32 image a sampler2D reads: GS TEX0. */
+    PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = 1, /**< A texture (and its color table) a sampler2D reads: GS TEX0. */
     PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER         = 6  /**< Part of a PvkBuffer a vertex shader's uniform block reads: VIF UNPACK into VU1 memory. */
 } PvkDescriptorType;
 
@@ -864,8 +898,9 @@ PvkResult pvkAllocateDescriptorSets(PvkDevice device, const PvkDescriptorSetAllo
 
 /** @brief The image and sampler a combined image sampler binding reads, like VkDescriptorImageInfo. */
 typedef struct PvkDescriptorImageInfo {
-    PvkSampler sampler; /**< How the image is read (see @ref samplers). */
-    PvkImage   image;   /**< A PVK_FORMAT_CT32 image: a texture or a swapchain image. */
+    PvkSampler sampler;    /**< How the image is read (see @ref samplers). */
+    PvkImage   image;      /**< A texture of any color format, or a swapchain image. */
+    PvkImage   colorTable; /**< For a PVK_FORMAT_T8 or PVK_FORMAT_T4 image, the color table its indices read (256 entries, or 16 for T4); NULL for other formats. */
 } PvkDescriptorImageInfo;
 
 /** @brief The rest of a buffer, as the range of a PvkDescriptorBufferInfo. */
@@ -1077,21 +1112,25 @@ void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset
 typedef struct PvkBufferImageCopy {
     size_t    bufferOffset; /**< Byte offset of the first pixel in the buffer; a multiple of 16. */
     uint32_t  mipLevel;     /**< Destination mip level, 0 for the base level; below the image's mipLevels. */
-    PvkRect2D rect;         /**< Destination rectangle in that level (level n is the image size shifted right by n). The buffer holds its rows back to back, 4 bytes per pixel. */
+    PvkRect2D rect;         /**< Destination rectangle in that level (level n is the image size shifted right by n). The buffer holds its rows back to back with no padding, texels in the image's format (see PvkFormat). For a color table: (0, 0, entries, 1). */
 } PvkBufferImageCopy;
 
 /**
- * @brief Uploads pixels from a buffer into one mip level of a PVK_FORMAT_CT32 image.
+ * @brief Uploads texels from a buffer into one mip level of a texture, or the entries of a color table.
  *
  * A GS host-to-local transfer (BITBLTBUF at the level's VRAM, TRXPOS, TRXREG, TRXDIR, then the
- * pixels as a GIF IMAGE packet). The pixels stream straight from the buffer
- * by DMA when the command buffer is submitted, so the buffer must stay
- * unchanged until then. Must be called outside pvkCmdBeginRendering() /
- * pvkCmdEndRendering(). The region must hold a multiple of 4 pixels.
+ * texels as a GIF IMAGE packet). A texture's texels stream straight from the
+ * buffer by DMA when the command buffer is submitted, so the buffer must
+ * stay unchanged until then; the region's bytes must be a multiple of 16
+ * (4 CT32 texels, 16 CT24, 8 CT16, 16 T8, 32 T4). A color table's entries
+ * are copied into the command buffer as it is recorded, rearranged into the
+ * GS's CSM1 layout (a 256-entry table swaps index bits 3 and 4), so its
+ * buffer is free again at once. Must be called outside
+ * pvkCmdBeginRendering() / pvkCmdEndRendering().
  *
  * @param cmd The command buffer.
- * @param buffer Source pixels, RGBA with 8 bits each (GS PSMCT32: alpha 0x80 is opaque).
- * @param image Destination texture.
+ * @param buffer Source texels in the image's format.
+ * @param image Destination texture or color table.
  * @param region What to copy and where.
  */
 void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage image, const PvkBufferImageCopy *region);

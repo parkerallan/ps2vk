@@ -257,11 +257,11 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 }
 
 /* Chain qwords cmd_gs_state() uses. */
-#define PVK_GS_STATE_QWORDS 14
+#define PVK_GS_STATE_QWORDS 15
 
 /* FRAME, ZBUF, TEST and ALPHA for drawing with the bound pipeline into the current
- * attachments, plus TEX0, TEX1, CLAMP and the MIPTBPs for the image and sampler in
- * the bound descriptor set when the pipeline samples one. Sent before the first draw
+ * attachments, plus TEX0, TEXA, TEX1, CLAMP and the MIPTBPs for the image and sampler
+ * in the bound descriptor set when the pipeline samples one. Sent before the first draw
  * after pvkCmdBeginRendering, pvkCmdBindPipeline or pvkCmdBindDescriptorSets. */
 static void cmd_gs_state(PvkCommandBuffer cmd)
 {
@@ -274,7 +274,7 @@ static void cmd_gs_state(PvkCommandBuffer cmd)
     qword_t *q;
 
     q = cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 10 : 8) : 4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 11 : 9) : 4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, 0), GS_REG_FRAME);
     q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
                              depth ? p->zmsk : 1), GS_REG_ZBUF);
@@ -282,14 +282,17 @@ static void cmd_gs_state(PvkCommandBuffer cmd)
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
     q = gs_ad(q, p->alpha, GS_REG_ALPHA);
     if (textured) {
-        const PvkImage t = slot->image;
+        const PvkImage t = slot->image, c = slot->colorTable;
         const PvkSampler s = slot->sampler;
         uint32_t mxl = t->levels - 1 < s->maxLevel ? t->levels - 1 : s->maxLevel;
         const uint32_t *a = t->levelAddress, *w = t->levelTbw;
         /* The texture's alpha is used (TCC), the function comes from the fragment
          * shader, filters, levels and LOD from the sampler: LOD = log2(w) + K (L = 0). */
         q = gs_ad(q, GS_SET_TEX0(t->fb.address >> 6, t->tbw, t->fb.psm, t->tw, t->th, TEXTURE_COMPONENTS_RGBA,
-                                 p->fs->textureFunction, 0, 0, 0, 0, 0), GS_REG_TEX0);
+                                 p->fs->textureFunction, c ? c->fb.address >> 6 : 0, c ? c->fb.psm : 0, 0, 0,
+                                 c ? 1 : 0), GS_REG_TEX0);
+        /* TEXA: CT24 reads opaque, a set CT16 alpha bit is 0x80. */
+        q = gs_ad(q, GS_SET_TEXA(t->format == PVK_FORMAT_CT24 ? 0x80 : 0, 0, 0x80), GS_REG_TEXA);
         q = gs_ad(q, GS_SET_TEX1(LOD_FORMULAIC, mxl, s->mmag, mxl ? s->mmip : s->mmin, 0, 0, s->k), GS_REG_TEX1);
         q = gs_ad(q, GS_SET_CLAMP(s->wms, s->wmt, 0, 0, 0, 0), GS_REG_CLAMP);
         if (mipmapped) {
@@ -333,21 +336,63 @@ void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, ui
  * DMA REF and VIF DIRECT counts are 16. */
 #define PVK_IMAGE_CHUNK_QWORDS 16384
 
+/* Copies a color table into the chain in CSM1 layout (256 entries: 16x16 with index bits 3 and 4 swapped). */
+static void cmd_copy_color_table(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage table, const PvkBufferImageCopy *region)
+{
+    const PvkRect2D *r = &region->rect;
+    uint32_t entries = table->fb.width, bytes = pvk_format_bits(table->format) / 8, qwords = entries * bytes / 16, i;
+    const uint8_t *src = (const uint8_t *)buffer->data + region->bufferOffset;
+    uint8_t *dst;
+    qword_t *q;
+
+    if (region->mipLevel || r->x || r->y || r->width != entries || r->height != 1 || region->bufferOffset % 16) {
+        pvk_error("pvkCmdCopyBufferToImage: a color table is uploaded whole: mip level 0, region (0, 0, %u, 1), "
+                  "bufferOffset a multiple of 16\n", (unsigned)entries);
+        cmd->failed = 1;
+        return;
+    }
+    if (region->bufferOffset + (size_t)entries * bytes > buffer->size) {
+        pvk_error("pvkCmdCopyBufferToImage reads past the end of the buffer\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (!cmd_reserve(cmd, 8 + qwords))
+        return;
+
+    q = cmd_open_direct(cmd);
+    q = gs_ad(q, GIF_SET_TAG(4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_BITBLTBUF(0, 0, 0, table->fb.address >> 6, 1, table->fb.psm), GS_REG_BITBLTBUF);
+    q = gs_ad(q, GS_SET_TRXPOS(0, 0, 0, 0, 0), GS_REG_TRXPOS);
+    q = gs_ad(q, GS_SET_TRXREG(entries == 256 ? 16 : 8, entries == 256 ? 16 : 2), GS_REG_TRXREG);
+    q = gs_ad(q, GS_SET_TRXDIR(0), GS_REG_TRXDIR);
+    q = gs_ad(q, GIF_SET_TAG(qwords, 0, 0, 0, GIF_FLG_IMAGE, 0), 0);
+    dst = (uint8_t *)q;
+    for (i = 0; i < entries; i++) {
+        uint32_t slot = entries == 256 ? (i & ~0x18u) | ((i & 8) << 1) | ((i & 16) >> 1) : i;
+        memcpy(dst + slot * bytes, src + i * bytes, bytes);
+    }
+    cmd_close_direct(cmd, q + qwords);
+}
+
 void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage image, const PvkBufferImageCopy *region)
 {
     const PvkRect2D *r = &region->rect;
     const uint8_t *src;
-    uint32_t qwords, sent = 0, level = region->mipLevel, width, height;
+    uint32_t bytes, qwords, sent = 0, level = region->mipLevel, width, height;
     qword_t *q;
 
-    if (image->format != PVK_FORMAT_CT32) {
-        pvk_error("pvkCmdCopyBufferToImage: only PVK_FORMAT_CT32 images can be uploaded to\n");
+    if (!pvk_is_color_format(image->format)) {
+        pvk_error("pvkCmdCopyBufferToImage: only color images (textures and color tables) can be uploaded to\n");
         cmd->failed = 1;
         return;
     }
     if (cmd->rendering) {
         pvk_error("pvkCmdCopyBufferToImage must be called outside pvkCmdBeginRendering/pvkCmdEndRendering\n");
         cmd->failed = 1;
+        return;
+    }
+    if (image->colorTable) {
+        cmd_copy_color_table(cmd, buffer, image, region);
         return;
     }
     if (level >= image->levels) {
@@ -366,13 +411,14 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
         cmd->failed = 1;
         return;
     }
-    if ((r->width * r->height) % 4 || region->bufferOffset % 16) {
-        pvk_error("pvkCmdCopyBufferToImage: the GIF moves whole qwords: the region must hold a "
-                  "multiple of 4 pixels and bufferOffset must be a multiple of 16\n");
+    bytes = r->width * r->height * pvk_format_bits(image->format) / 8;
+    if (bytes % 16 || region->bufferOffset % 16) {
+        pvk_error("pvkCmdCopyBufferToImage: the GIF moves whole qwords: the region's texels must fill a "
+                  "multiple of 16 bytes and bufferOffset must be a multiple of 16\n");
         cmd->failed = 1;
         return;
     }
-    qwords = r->width * r->height * 4 / 16;
+    qwords = bytes / 16;
     if (region->bufferOffset + (size_t)qwords * 16 > buffer->size) {
         pvk_error("pvkCmdCopyBufferToImage reads past the end of the buffer\n");
         cmd->failed = 1;
