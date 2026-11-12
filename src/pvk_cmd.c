@@ -257,22 +257,24 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 }
 
 /* Chain qwords cmd_gs_state() uses. */
-#define PVK_GS_STATE_QWORDS 12
+#define PVK_GS_STATE_QWORDS 14
 
 /* FRAME, ZBUF, TEST and ALPHA for drawing with the bound pipeline into the current
- * attachments, plus TEX0, TEX1 and CLAMP for the image and sampler in the bound
- * descriptor set when the pipeline samples one. Sent before the first draw after
- * pvkCmdBeginRendering, pvkCmdBindPipeline or pvkCmdBindDescriptorSets. */
+ * attachments, plus TEX0, TEX1, CLAMP and the MIPTBPs for the image and sampler in
+ * the bound descriptor set when the pipeline samples one. Sent before the first draw
+ * after pvkCmdBeginRendering, pvkCmdBindPipeline or pvkCmdBindDescriptorSets. */
 static void cmd_gs_state(PvkCommandBuffer cmd)
 {
     const framebuffer_t *fb = &cmd->colorImage->fb;
     const PvkImage depth = cmd->depthImage;
     const PvkPipeline p = cmd->pipeline;
     int textured = p->fs->textured;
+    const struct PvkDescriptorSlot *slot = textured ? &cmd->sets[p->samplerSet]->slots[p->samplerSlot] : NULL;
+    int mipmapped = textured && slot->image->levels > 1;
     qword_t *q;
 
     q = cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG(textured ? 8 : 4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 10 : 8) : 4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, 0), GS_REG_FRAME);
     q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
                              depth ? p->zmsk : 1), GS_REG_ZBUF);
@@ -280,15 +282,20 @@ static void cmd_gs_state(PvkCommandBuffer cmd)
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
     q = gs_ad(q, p->alpha, GS_REG_ALPHA);
     if (textured) {
-        const struct PvkDescriptorSlot *slot = &cmd->sets[p->samplerSet]->slots[p->samplerSlot];
         const PvkImage t = slot->image;
         const PvkSampler s = slot->sampler;
+        uint32_t mxl = t->levels - 1 < s->maxLevel ? t->levels - 1 : s->maxLevel;
+        const uint32_t *a = t->levelAddress, *w = t->levelTbw;
         /* The texture's alpha is used (TCC), the function comes from the fragment
-         * shader, filters and wrapping from the sampler; no mipmaps (MXL = 0). */
+         * shader, filters, levels and LOD from the sampler: LOD = log2(w) + K (L = 0). */
         q = gs_ad(q, GS_SET_TEX0(t->fb.address >> 6, t->tbw, t->fb.psm, t->tw, t->th, TEXTURE_COMPONENTS_RGBA,
                                  p->fs->textureFunction, 0, 0, 0, 0, 0), GS_REG_TEX0);
-        q = gs_ad(q, GS_SET_TEX1(LOD_USE_K, 0, s->mmag, s->mmin, 0, 0, 0), GS_REG_TEX1);
+        q = gs_ad(q, GS_SET_TEX1(LOD_FORMULAIC, mxl, s->mmag, mxl ? s->mmip : s->mmin, 0, 0, s->k), GS_REG_TEX1);
         q = gs_ad(q, GS_SET_CLAMP(s->wms, s->wmt, 0, 0, 0, 0), GS_REG_CLAMP);
+        if (mipmapped) {
+            q = gs_ad(q, GS_SET_MIPTBP1(a[1] >> 6, w[1], a[2] >> 6, w[2], a[3] >> 6, w[3]), GS_REG_MIPTBP1);
+            q = gs_ad(q, GS_SET_MIPTBP2(a[4] >> 6, w[4], a[5] >> 6, w[5], a[6] >> 6, w[6]), GS_REG_MIPTBP2);
+        }
         /* The texture cache may hold texels from before an upload or a render into it. */
         q = gs_ad(q, GS_SET_TEXFLUSH(0), GS_REG_TEXFLUSH);
     }
@@ -330,7 +337,7 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
 {
     const PvkRect2D *r = &region->rect;
     const uint8_t *src;
-    uint32_t qwords, sent = 0;
+    uint32_t qwords, sent = 0, level = region->mipLevel, width, height;
     qword_t *q;
 
     if (image->format != PVK_FORMAT_CT32) {
@@ -343,11 +350,19 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
         cmd->failed = 1;
         return;
     }
+    if (level >= image->levels) {
+        pvk_error("pvkCmdCopyBufferToImage: mip level %u, but the image has %u\n", (unsigned)level,
+                  (unsigned)image->levels);
+        cmd->failed = 1;
+        return;
+    }
+    width  = image->fb.width >> level;
+    height = image->fb.height >> level;
     if (r->x < 0 || r->y < 0 || r->width == 0 || r->height == 0 ||
-        (uint32_t)r->x + r->width > image->fb.width || (uint32_t)r->y + r->height > image->fb.height) {
-        pvk_error("pvkCmdCopyBufferToImage: the region (%d, %d, %ux%u) is outside the %ux%u image\n",
-                  (int)r->x, (int)r->y, (unsigned)r->width, (unsigned)r->height,
-                  (unsigned)image->fb.width, (unsigned)image->fb.height);
+        (uint32_t)r->x + r->width > width || (uint32_t)r->y + r->height > height) {
+        pvk_error("pvkCmdCopyBufferToImage: the region (%d, %d, %ux%u) is outside the %ux%u level %u\n",
+                  (int)r->x, (int)r->y, (unsigned)r->width, (unsigned)r->height, (unsigned)width,
+                  (unsigned)height, (unsigned)level);
         cmd->failed = 1;
         return;
     }
@@ -373,7 +388,8 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
 
     q = cmd_open_direct(cmd);
     q = gs_ad(q, GIF_SET_TAG(4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    q = gs_ad(q, GS_SET_BITBLTBUF(0, 0, 0, image->fb.address >> 6, image->tbw, image->fb.psm), GS_REG_BITBLTBUF);
+    q = gs_ad(q, GS_SET_BITBLTBUF(0, 0, 0, image->levelAddress[level] >> 6, image->levelTbw[level], image->fb.psm),
+              GS_REG_BITBLTBUF);
     q = gs_ad(q, GS_SET_TRXPOS(0, 0, r->x, r->y, 0), GS_REG_TRXPOS);
     q = gs_ad(q, GS_SET_TRXREG(r->width, r->height), GS_REG_TRXREG);
     q = gs_ad(q, GS_SET_TRXDIR(0), GS_REG_TRXDIR); /* host to local */

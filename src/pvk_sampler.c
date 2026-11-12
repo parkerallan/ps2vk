@@ -1,5 +1,6 @@
-/* Samplers: the filter and wrap fields of GS TEX1 and CLAMP, written with the
- * draw state for the texture bound next to them. */
+/* Samplers: the filter, LOD and wrap fields of GS TEX1 and CLAMP, written with
+ * the draw state for the texture bound next to them. */
+#include <math.h>
 #include <stdlib.h>
 
 #include <draw_sampling.h>
@@ -20,6 +21,9 @@ PvkResult pvkCreateSampler(PvkDevice device, const PvkSamplerCreateInfo *info, P
 {
     PvkSampler s;
     int wms = gs_wrap(info->addressModeU), wmt = gs_wrap(info->addressModeV);
+    int linear = info->minFilter == PVK_FILTER_LINEAR, mipLinear = info->mipmapMode == PVK_SAMPLER_MIPMAP_MODE_LINEAR;
+    /* K is signed 7.4 fixed point: 1/16 steps from -128 to 127.9375. */
+    float k = roundf(info->mipLodBias * 16.0f);
 
     (void)device;
 
@@ -42,14 +46,26 @@ PvkResult pvkCreateSampler(PvkDevice device, const PvkSamplerCreateInfo *info, P
                   (int)info->addressModeU, (int)info->addressModeV);
         return PVK_ERROR_FEATURE_NOT_PRESENT;
     }
+    if (!(k >= -2048.0f && k <= 2047.0f)) {
+        pvk_error("pvkCreateSampler: mipLodBias %f is outside TEX1.K's range, -128 to 127.9375\n", info->mipLodBias);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (info->minLod != 0.0f || !(info->maxLod >= 0.0f)) {
+        pvk_error("pvkCreateSampler: minLod %f, maxLod %f; the GS only clamps the LOD from above, so minLod "
+                  "must be 0 and maxLod at least 0\n", info->minLod, info->maxLod);
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    }
 
     s = calloc(1, sizeof(struct PvkSampler_T));
     if (!s)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
 
-    /* One mip level (TEX1.MXL = 0), so MMIN is the plain nearest/linear value. */
     s->mmag = info->magFilter == PVK_FILTER_LINEAR ? LOD_MAG_LINEAR : LOD_MAG_NEAREST;
-    s->mmin = info->minFilter == PVK_FILTER_LINEAR ? LOD_MIN_LINEAR : LOD_MIN_NEAREST;
+    s->mmin = linear ? LOD_MIN_LINEAR : LOD_MIN_NEAREST;
+    s->mmip = linear ? (mipLinear ? LOD_MIN_LINE_MIPMAP_LINE : LOD_MIN_LINE_MIPMAP_NEAR)
+                     : (mipLinear ? LOD_MIN_NEAR_MIPMAP_LINE : LOD_MIN_NEAR_MIPMAP_NEAR);
+    s->maxLevel = info->maxLod >= (float)(PVK_MAX_MIP_LEVELS - 1) ? PVK_MAX_MIP_LEVELS - 1 : (uint32_t)info->maxLod;
+    s->k    = (uint32_t)(int32_t)k & 0xFFF;
     s->wms  = (uint32_t)wms;
     s->wmt  = (uint32_t)wmt;
 

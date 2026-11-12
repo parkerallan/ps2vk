@@ -126,18 +126,24 @@ PvkResult pvkDeviceWaitIdle(PvkDevice device);
 /** @brief An image in GS VRAM: a swapchain framebuffer, a depth buffer or a texture. */
 typedef struct PvkImage_T         *PvkImage;
 
+/** @brief Most mip levels a texture has: GS TEX1.MXL goes up to 6. */
+#define PVK_MAX_MIP_LEVELS 7
+
 /** @brief Parameters for pvkCreateImage(). */
 typedef struct PvkImageCreateInfo {
-    uint32_t  width;  /**< Width in pixels; a depth buffer must be as wide as the framebuffer it is used with, a texture a power of two from 8 to 1024. */
-    uint32_t  height; /**< Height in pixels; a texture a power of two from 8 to 1024. */
-    PvkFormat format; /**< PVK_FORMAT_CT32 for a texture, or PVK_FORMAT_Z32, PVK_FORMAT_Z24 or PVK_FORMAT_Z16 for a depth buffer. */
+    uint32_t  width;     /**< Width in pixels; a depth buffer must be as wide as the framebuffer it is used with, a texture a power of two from 8 to 1024. */
+    uint32_t  height;    /**< Height in pixels; a texture a power of two from 8 to 1024. */
+    uint32_t  mipLevels; /**< Texture only: number of mip levels, 0 or 1 for the base level alone, up to PVK_MAX_MIP_LEVELS. Each level halves the one before and must stay at least 8 on each side. */
+    PvkFormat format;    /**< PVK_FORMAT_CT32 for a texture, or PVK_FORMAT_Z32, PVK_FORMAT_Z24 or PVK_FORMAT_Z16 for a depth buffer. */
 } PvkImageCreateInfo;
 
 /**
  * @brief Allocates an image in GS VRAM.
  *
- * A PVK_FORMAT_CT32 image is a texture: fill it with pvkCmdCopyBufferToImage()
- * and sample it through a descriptor set (see @ref descriptors). Depth formats make depth buffers.
+ * A PVK_FORMAT_CT32 image is a texture: fill each of its mip levels with
+ * pvkCmdCopyBufferToImage() and sample it through a descriptor set (see
+ * @ref descriptors). Every level gets its own VRAM, addressed by GS TEX0 and
+ * MIPTBP1/MIPTBP2 when the texture is bound. Depth formats make depth buffers.
  * Framebuffers come from the swapchain. GS VRAM is handed out in creation
  * order and never reclaimed, so create images once, after the swapchain.
  *
@@ -167,8 +173,16 @@ void      pvkDestroyImage(PvkDevice device, PvkImage image);
  * (PvkDescriptorImageInfo). On the PS2 its filters become GS TEX1.MMAG/MMIN
  * and its address modes CLAMP.WMS/WMT, written with the draw state. The GS
  * has no mirrored repeat, border color, anisotropy or depth comparison;
- * only repeat and clamp to edge exist. Images have one mip level, so the
- * mipmap mode is accepted and has no effect.
+ * only repeat and clamp to edge exist.
+ *
+ * Mip level selection is TEX1.MXL/MMIN/K. The GS has no screen-space
+ * derivatives: it computes LOD = log2(w) + mipLodBias from the vertex's
+ * clip w (the Q it stores per vertex is 1/w), then clamps it to 0..MXL. So
+ * mipLodBias carries the scale: log2 of the texels one pixel covers at
+ * w = 1, which is log2(texture texels / (world size × focal length in
+ * pixels)) for a perspective projection. The same LOD picks magFilter when it
+ * is below 0 and minFilter otherwise. minLod must be 0 (the GS cannot clamp
+ * from below); maxLod lowers MXL below the image's last level.
  * @{
  */
 
@@ -181,11 +195,14 @@ typedef enum PvkFilter {
     PVK_FILTER_LINEAR  = 1  /**< The 4 surrounding texels blended (bilinear). GS MMAG/MMIN = LINEAR. */
 } PvkFilter;
 
-/** @brief Mipmap selection. Values match Vulkan's VkSamplerMipmapMode; images have one level, so it changes nothing yet. */
+/** @brief Mipmap selection. Values match Vulkan's VkSamplerMipmapMode. */
 typedef enum PvkSamplerMipmapMode {
-    PVK_SAMPLER_MIPMAP_MODE_NEAREST = 0, /**< Pick one level. */
-    PVK_SAMPLER_MIPMAP_MODE_LINEAR  = 1  /**< Blend two levels. */
+    PVK_SAMPLER_MIPMAP_MODE_NEAREST = 0, /**< Pick one level. GS MMIN = *_MIPMAP_NEAREST. */
+    PVK_SAMPLER_MIPMAP_MODE_LINEAR  = 1  /**< Blend two levels (trilinear with PVK_FILTER_LINEAR). GS MMIN = *_MIPMAP_LINEAR. */
 } PvkSamplerMipmapMode;
+
+/** @brief A maxLod that never clamps: every level of the image is used, like VK_LOD_CLAMP_NONE. */
+#define PVK_LOD_CLAMP_NONE 1000.0f
 
 /** @brief What a coordinate outside 0 to 1 reads. Values match Vulkan's VkSamplerAddressMode. */
 typedef enum PvkSamplerAddressMode {
@@ -196,13 +213,16 @@ typedef enum PvkSamplerAddressMode {
     PVK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE = 4  /**< Not supported. */
 } PvkSamplerAddressMode;
 
-/** @brief Parameters for pvkCreateSampler(), like VkSamplerCreateInfo. All zeros is nearest filtering, repeat. */
+/** @brief Parameters for pvkCreateSampler(), like VkSamplerCreateInfo. All zeros is nearest filtering, repeat, the base level only. */
 typedef struct PvkSamplerCreateInfo {
     PvkFilter             magFilter;    /**< Filter when a texel covers more than a pixel (zoomed in). GS TEX1.MMAG. */
     PvkFilter             minFilter;    /**< Filter when a pixel covers more than a texel (zoomed out). GS TEX1.MMIN. */
-    PvkSamplerMipmapMode  mipmapMode;   /**< Accepted, no effect: images have one mip level. */
+    PvkSamplerMipmapMode  mipmapMode;   /**< How levels are picked when the image has more than one and maxLod allows it. GS TEX1.MMIN. */
     PvkSamplerAddressMode addressModeU; /**< Wrapping of the s coordinate. GS CLAMP.WMS. */
     PvkSamplerAddressMode addressModeV; /**< Wrapping of the t coordinate. GS CLAMP.WMT. */
+    float                 mipLodBias;   /**< Added to log2(w) to get the LOD (see @ref samplers); -128 to 127.9375, rounded to 1/16. GS TEX1.K. */
+    float                 minLod;       /**< Must be 0: the GS has no lower LOD clamp. */
+    float                 maxLod;       /**< Highest level used: 0 is the base level alone, PVK_LOD_CLAMP_NONE every level. The whole part becomes GS TEX1.MXL, capped at the image's last level. */
 } PvkSamplerCreateInfo;
 
 /**
@@ -211,7 +231,8 @@ typedef struct PvkSamplerCreateInfo {
  * @param info Filters and address modes.
  * @param[out] sampler The new sampler.
  * @return PVK_SUCCESS, PVK_ERROR_FEATURE_NOT_PRESENT for an address mode the GS
- *         lacks, PVK_ERROR_VALIDATION_FAILED for a value outside the enums or
+ *         lacks or a minLod other than 0, PVK_ERROR_VALIDATION_FAILED for a
+ *         value outside the enums or a mipLodBias outside TEX1.K's range, or
  *         PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
 PvkResult pvkCreateSampler(PvkDevice device, const PvkSamplerCreateInfo *info, PvkSampler *sampler);
@@ -1055,13 +1076,14 @@ void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset
 /** @brief A region copied by pvkCmdCopyBufferToImage() (like VkBufferImageCopy). */
 typedef struct PvkBufferImageCopy {
     size_t    bufferOffset; /**< Byte offset of the first pixel in the buffer; a multiple of 16. */
-    PvkRect2D rect;         /**< Destination rectangle in the image. The buffer holds its rows back to back, 4 bytes per pixel. */
+    uint32_t  mipLevel;     /**< Destination mip level, 0 for the base level; below the image's mipLevels. */
+    PvkRect2D rect;         /**< Destination rectangle in that level (level n is the image size shifted right by n). The buffer holds its rows back to back, 4 bytes per pixel. */
 } PvkBufferImageCopy;
 
 /**
- * @brief Uploads pixels from a buffer into a PVK_FORMAT_CT32 image.
+ * @brief Uploads pixels from a buffer into one mip level of a PVK_FORMAT_CT32 image.
  *
- * A GS host-to-local transfer (BITBLTBUF, TRXPOS, TRXREG, TRXDIR, then the
+ * A GS host-to-local transfer (BITBLTBUF at the level's VRAM, TRXPOS, TRXREG, TRXDIR, then the
  * pixels as a GIF IMAGE packet). The pixels stream straight from the buffer
  * by DMA when the command buffer is submitted, so the buffer must stay
  * unchanged until then. Must be called outside pvkCmdBeginRendering() /

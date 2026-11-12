@@ -48,17 +48,20 @@ struct PvkDevice_T {
 /* Color images keep libdraw's framebuffer_t (the swapchain presents from it);
  * depth images reuse its address/width/height with a GS_PSMZ_* psm. A CT32
  * image can also be sampled: TEX0 takes its address, texture buffer width
- * and log2 size. */
+ * and log2 size; MIPTBP1/2 the addresses and widths of the other levels. */
 struct PvkImage_T {
     PvkFormat     format;
-    framebuffer_t fb;
+    framebuffer_t fb;         /* level 0 */
     uint32_t      tbw;        /* GS TEX0.TBW / BITBLTBUF.DBW: buffer width in 64-texel units */
     uint32_t      tw, th;     /* GS TEX0.TW/TH: log2 of the width and height */
+    uint32_t      levels;     /* mip levels, 1 to PVK_MAX_MIP_LEVELS */
+    uint32_t      levelAddress[PVK_MAX_MIP_LEVELS]; /* VRAM word address of each level ([0] = fb.address) */
+    uint32_t      levelTbw[PVK_MAX_MIP_LEVELS];     /* buffer width of each level ([0] = tbw) */
 };
 
 /* GS psm for a PvkFormat, or -1. */
 int pvk_gs_psm(PvkFormat format);
-/* Fills tbw/tw/th from fb.width and fb.height. */
+/* Fills tbw/tw/th from fb.width and fb.height, and level 0's entries. */
 void pvk_image_texture_params(PvkImage image);
 /* Largest depth value a depth format stores; depth is flipped so near = this. */
 float pvk_depth_max(PvkFormat format);
@@ -92,9 +95,14 @@ int pvk_set_layout_compatible(const struct PvkDescriptorSetLayout_T *a, const st
 /* Index into bindings[] of the binding with that number, or -1. */
 int pvk_set_layout_find(const struct PvkDescriptorSetLayout_T *layout, uint32_t binding);
 
-/* The sampler's settings as GS register fields. */
+/* The sampler's settings as GS register fields. MMIN depends on whether the
+ * bound image has levels to pick from, so it is chosen at draw time. */
 struct PvkSampler_T {
-    uint32_t mmag, mmin; /* TEX1.MMAG/MMIN: LOD_MAG_x, LOD_MIN_x */
+    uint32_t mmag;       /* TEX1.MMAG: LOD_MAG_x */
+    uint32_t mmin;       /* TEX1.MMIN with one level: LOD_MIN_x */
+    uint32_t mmip;       /* TEX1.MMIN with levels: LOD_MIN_x_MIPMAP_x */
+    uint32_t maxLevel;   /* TEX1.MXL cap from maxLod */
+    uint32_t k;          /* TEX1.K: mipLodBias as signed 7.4 fixed point */
     uint32_t wms, wmt;   /* CLAMP.WMS/WMT: WRAP_* */
 };
 

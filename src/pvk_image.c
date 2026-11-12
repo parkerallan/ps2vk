@@ -42,6 +42,10 @@ void pvk_image_texture_params(PvkImage image)
     image->tbw = (image->fb.width < 64 ? 64 : image->fb.width) / 64;
     image->tw  = log2_ceil(image->fb.width);
     image->th  = log2_ceil(image->fb.height);
+    if (!image->levels)
+        image->levels = 1;
+    image->levelAddress[0] = image->fb.address;
+    image->levelTbw[0]     = image->tbw;
 }
 
 PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkImage *image)
@@ -49,6 +53,7 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     PvkImage img;
     int psm, address, alignment, width;
     int depth = info->format == PVK_FORMAT_Z32 || info->format == PVK_FORMAT_Z24 || info->format == PVK_FORMAT_Z16;
+    uint32_t levels = depth || !info->mipLevels ? 1 : info->mipLevels, l;
 
     (void)device;
 
@@ -65,6 +70,13 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
             pvk_error("pvkCreateImage: a PVK_FORMAT_CT32 texture must be a power of two from 8 to 1024 "
                       "on each side (%ux%u given)\n", (unsigned)info->width, (unsigned)info->height);
             return PVK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        /* MXL is 3 bits (levels 0 to 6); the smallest level keeps the 8-texel minimum. */
+        if (levels > PVK_MAX_MIP_LEVELS || (info->width >> (levels - 1)) < 8 || (info->height >> (levels - 1)) < 8) {
+            pvk_error("pvkCreateImage: %u mip levels, but a %ux%u texture has at most %u (each at least 8 "
+                      "on each side, up to PVK_MAX_MIP_LEVELS)\n", (unsigned)levels, (unsigned)info->width,
+                      (unsigned)info->height, (unsigned)PVK_MAX_MIP_LEVELS);
+            return PVK_ERROR_VALIDATION_FAILED;
         }
     }
     psm = pvk_gs_psm(info->format);
@@ -91,7 +103,22 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     img->fb.height  = info->height;
     img->fb.psm     = psm;
     img->fb.mask    = 0;
+    img->levels     = levels;
     pvk_image_texture_params(img);
+
+    /* Each further level is its own block-aligned texture, half the size. */
+    for (l = 1; l < levels; l++) {
+        uint32_t w = info->width >> l, h = info->height >> l;
+        address = graph_vram_allocate(w < 64 ? 64 : (int)w, (int)h, psm, GRAPH_ALIGN_BLOCK);
+        if (address < 0) {
+            pvk_error("out of GS memory for level %u of a %ux%u texture\n", (unsigned)l, (unsigned)info->width,
+                      (unsigned)info->height);
+            free(img);
+            return PVK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        img->levelAddress[l] = (uint32_t)address;
+        img->levelTbw[l]     = (w < 64 ? 64 : w) / 64;
+    }
 
     *image = img;
     return PVK_SUCCESS;
