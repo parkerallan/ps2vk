@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t scale_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t scale_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t scale_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode scale_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode scale_vert = {
     .name = "scale.vert",
     .vu1CodeStart = &scale_vert_CodeStart,
     .vu1CodeEnd = &scale_vert_CodeEnd,
+    .vu1Convert = &scale_vert_Convert,
     .inputCount = 1,
     .inputLocations = { 0 },
     .colorOutputLocation = -1,

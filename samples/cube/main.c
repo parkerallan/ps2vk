@@ -2,7 +2,8 @@
  * ps2vk cube sample: a spinning, depth-tested cube textured with texture.png,
  * a 256-color PNG read with libpng from host:. It is uploaded once as a
  * PVK_FORMAT_T8 texture (one palette index per texel) with its palette in a
- * 256-entry PVK_FORMAT_CT16 color table.
+ * 256-entry PVK_FORMAT_CT16 color table. The vertices are compact: 16-bit
+ * positions and texture coordinates in two vertex bindings of one buffer.
  */
 #include <math.h>
 #include <stdio.h>
@@ -31,38 +32,40 @@ extern const PvkShaderCode cube_frag;
         }                                                                 \
     } while (0)
 
-/* One vertex: position and texture coordinate (xy used), each a vec4. */
-typedef struct {
-    float pos[4];
-    float uv[4];
-} Vertex;
+/* Vertex binding 0: positions as R16G16B16_SNORM (32767 = 1.0, 6 bytes each);
+ * binding 1: texture coordinates as R16G16_UNORM (65535 = 1.0, 4 bytes). The
+ * shader sees both as vec4s, w = 1. */
+typedef int16_t  Position[3];
+typedef uint16_t TexCoord[2];
 
 /* Four corners per face, counter-clockwise seen from outside. */
-static void face(Vertex *v, const float *a, const float *b, const float *c, const float *d)
+static void face(Position *pos, TexCoord *uv, const int16_t *a, const int16_t *b, const int16_t *c, const int16_t *d)
 {
-    const float *corners[4] = { a, b, c, d };
-    static const float uvs[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+    const int16_t *corners[4] = { a, b, c, d };
+    static const uint16_t uvs[4][2] = { { 0, 0 }, { 65535, 0 }, { 65535, 65535 }, { 0, 65535 } };
 
     for (int i = 0; i < 4; i++) {
-        v[i].pos[0] = corners[i][0]; v[i].pos[1] = corners[i][1]; v[i].pos[2] = corners[i][2]; v[i].pos[3] = 1.0f;
-        v[i].uv[0] = uvs[i][0]; v[i].uv[1] = uvs[i][1]; v[i].uv[2] = 0.0f; v[i].uv[3] = 0.0f;
+        pos[i][0] = corners[i][0]; pos[i][1] = corners[i][1]; pos[i][2] = corners[i][2];
+        uv[i][0] = uvs[i][0]; uv[i][1] = uvs[i][1];
     }
 }
 
 /* 24 vertices (6 faces of 4) and 36 indices (2 triangles per face). */
-static void build_cube(Vertex *v, uint16_t *idx)
+static void build_cube(Position *pos, TexCoord *uv, uint16_t *idx)
 {
-    static const float p[8][3] = {
-        { -1, -1, -1 }, { 1, -1, -1 }, { 1, 1, -1 }, { -1, 1, -1 }, /* back  (z = -1) */
-        { -1, -1,  1 }, { 1, -1,  1 }, { 1, 1,  1 }, { -1, 1,  1 }, /* front (z = +1) */
+#define U 32767
+    static const int16_t p[8][3] = {
+        { -U, -U, -U }, { U, -U, -U }, { U, U, -U }, { -U, U, -U }, /* back  (z = -1) */
+        { -U, -U,  U }, { U, -U,  U }, { U, U,  U }, { -U, U,  U }, /* front (z = +1) */
     };
+#undef U
 
-    face(v +  0, p[4], p[5], p[6], p[7]); /* front */
-    face(v +  4, p[1], p[0], p[3], p[2]); /* back */
-    face(v +  8, p[0], p[4], p[7], p[3]); /* left */
-    face(v + 12, p[5], p[1], p[2], p[6]); /* right */
-    face(v + 16, p[7], p[6], p[2], p[3]); /* top (y = +1) */
-    face(v + 20, p[0], p[1], p[5], p[4]); /* bottom */
+    face(pos +  0, uv +  0, p[4], p[5], p[6], p[7]); /* front */
+    face(pos +  4, uv +  4, p[1], p[0], p[3], p[2]); /* back */
+    face(pos +  8, uv +  8, p[0], p[4], p[7], p[3]); /* left */
+    face(pos + 12, uv + 12, p[5], p[1], p[2], p[6]); /* right */
+    face(pos + 16, uv + 16, p[7], p[6], p[2], p[3]); /* top (y = +1) */
+    face(pos + 20, uv + 20, p[0], p[1], p[5], p[4]); /* bottom */
 
     for (int f = 0; f < 6; f++) {
         uint16_t b = (uint16_t)(f * 4);
@@ -211,12 +214,13 @@ int main(void)
     PvkCommandBuffer cmd;
     PvkFence fence;
     void *mapped;
-    static Vertex vertices[24];
+    static Position positions[24];
+    static TexCoord uvs[24];
     static uint16_t indices[36];
     float proj[16];
     Picture pic;
 
-    build_cube(vertices, indices);
+    build_cube(positions, uvs, indices);
 
     if (!load_png(TEXTURE_FILE, &pic))
         return 1;
@@ -256,10 +260,13 @@ int main(void)
     };
     CHECK(pvkCreateSampler(device, &samplerInfo, &sampler));
 
-    PvkBufferCreateInfo bufferInfo = { .size = sizeof(vertices) };
+    /* One buffer, the positions first and the texture coordinates after them
+     * (sizeof(positions) is a multiple of 16, as a binding offset must be). */
+    PvkBufferCreateInfo bufferInfo = { .size = sizeof(positions) + sizeof(uvs) };
     CHECK(pvkCreateBuffer(device, &bufferInfo, &vertexBuffer));
     CHECK(pvkMapMemory(device, vertexBuffer, &mapped));
-    memcpy(mapped, vertices, sizeof(vertices));
+    memcpy(mapped, positions, sizeof(positions));
+    memcpy((uint8_t *)mapped + sizeof(positions), uvs, sizeof(uvs));
     pvkUnmapMemory(device, vertexBuffer);
 
     PvkBufferCreateInfo indexInfo = { .size = sizeof(indices) };
@@ -286,9 +293,13 @@ int main(void)
     CHECK(pvkCreateShaderModule(device, &vsInfo, &vs));
     CHECK(pvkCreateShaderModule(device, &fsInfo, &fs));
 
+    PvkVertexInputBinding bindings[] = {
+        { .binding = 0, .stride = sizeof(Position) },
+        { .binding = 1, .stride = sizeof(TexCoord) },
+    };
     PvkVertexInputAttribute attributes[] = {
-        { .location = 0, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
-        { .location = 1, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
+        { .location = 0, .binding = 0, .format = PVK_FORMAT_R16G16B16_SNORM, .offset = 0 },
+        { .location = 1, .binding = 1, .format = PVK_FORMAT_R16G16_UNORM,    .offset = 0 },
     };
     /* Set 0 holds the fragment shader's sampler2D at binding 0. */
     PvkDescriptorSetLayoutBinding samplerBinding = {
@@ -325,7 +336,8 @@ int main(void)
         .vertexShader   = vs,
         .fragmentShader = fs,
         .layout         = layout,
-        .vertexStride   = sizeof(Vertex),
+        .bindingCount   = 2,
+        .bindings       = bindings,
         .attributeCount = 2,
         .attributes     = attributes,
         .topology       = PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
@@ -385,7 +397,9 @@ int main(void)
         pvkCmdBindPipeline(cmd, pipeline);
         pvkCmdBindDescriptorSets(cmd, layout, 0, 1, &descriptorSet);
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(mvp), mvp);
-        pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
+        PvkBuffer vertexBuffers[2] = { vertexBuffer, vertexBuffer };
+        size_t vertexOffsets[2] = { 0, sizeof(positions) };
+        pvkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, vertexOffsets);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
         pvkCmdDrawIndexed(cmd, 36, 0, 0);
         pvkCmdEndRendering(cmd);

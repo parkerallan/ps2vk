@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t uniform_registers_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t uniform_registers_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t uniform_registers_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode uniform_registers_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode uniform_registers_vert = {
     .name = "uniform_registers.vert",
     .vu1CodeStart = &uniform_registers_vert_CodeStart,
     .vu1CodeEnd = &uniform_registers_vert_CodeEnd,
+    .vu1Convert = &uniform_registers_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,

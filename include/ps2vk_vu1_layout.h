@@ -7,8 +7,11 @@
  *   16  uniform buffers: 64 qwords = 1 KB; the vertex shader's uniform blocks,
  *       placed by shaderc in (set, binding) order, each filled from the buffer
  *       in the bound descriptor set before the first draw after a bind
- *   80  input:   GIF tag for this batch, a count qword, then vertices, then
- *       for an indexed batch the 16-bit indices, one per qword (VIF UNPACK S_16)
+ *   80  input:   GIF tag for this batch, a count qword, a first-vertex qword,
+ *       then vertices (one qword per shader input; a few unused ones may come
+ *       first and last, as the VIF unpacks whole 16-byte units of each
+ *       binding), then for an indexed batch the 16-bit indices, one per
+ *       qword (VIF UNPACK S_16)
  *   512 output:  GIF tag, then per vertex RGBAQ, XYZ2 (sent with XGKICK), or
  *       ST (UV for a sampler with unnormalized coordinates), RGBAQ, XYZ2 when
  *       the vertex shader writes a texture coordinate
@@ -38,7 +41,9 @@
                                          z: float, winding sign of the batch's first triangle
                                          (signed area * z < 0 = cull), VU1 flips it per triangle;
                                          w: int, 1 = store UV (texels, 12.4) instead of ST and Q */
-#define PVK_VU1_INPUT_HEADER      2   /* qwords before the first vertex */
+#define PVK_VU1_INPUT_FIRST       2   /* x: int, qwords from the first unpacked vertex to the
+                                         batch's first (the alignment lead) */
+#define PVK_VU1_INPUT_HEADER      3   /* qwords before the first unpacked vertex */
 
 #define PVK_VU1_OUTPUT_ADDR       512
 #define PVK_VU1_OUTPUT_PER_VERTEX 2   /* RGBAQ, XYZ2 */

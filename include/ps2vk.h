@@ -35,7 +35,38 @@ typedef enum PvkResult {
     PVK_ERROR_VALIDATION_FAILED        = -1000011001  /**< Invalid use of the API; details are printed. */
 } PvkResult;
 
-/** @brief Data formats for vertex attributes and images. */
+/**
+ * @brief Data formats for vertex attributes and images.
+ *
+ * Vertex attribute formats are Vulkan's: a vec4 of floats, or 1 to 4
+ * components of 32-bit floats, 16-bit or 8-bit integers (see
+ * PvkVertexInputBinding for how they are laid out). The shader always sees a
+ * vec4: missing components read 0, a missing w reads 1; UNORM/SNORM integers
+ * are scaled to 0..1 / -1..1 and USCALED/SSCALED are the integer's value.
+ * Image formats are the GS's.
+ *
+ * A vertex is read by DMA for every draw, and VU1 holds about 430 qwords of
+ * input per batch however the attributes are stored, so a smaller attribute
+ * format means less main RAM, less DMA time per frame and nothing else: the
+ * VIF widens the values on the way in and VU1 scales them with two or three
+ * instructions per attribute. Each 8- or 16-bit attribute is a binding of its
+ * own (see PvkVertexInputBinding).
+ *
+ * | Format | Bytes per vertex | VIF unpack | Shader sees | What you get |
+ * | --- | --- | --- | --- | --- |
+ * | PVK_FORMAT_R32G32B32A32_SFLOAT | 16 | V4-32 | the floats | Exact values; several may share one binding. Use when a vertex is rewritten by the CPU every frame, or when precision matters: positions of a large mesh, skinning weights that must sum to 1. |
+ * | PVK_FORMAT_R32G32B32_SFLOAT, R32G32_SFLOAT, R32_SFLOAT | 12, 8, 4 | V3-32, V2-32, S-32 | the floats, w = 1 | Same precision without the padding of a vec4. Positions, 2D texture coordinates and scalars that need the full float range. |
+ * | PVK_FORMAT_R16G16B16A16_SNORM, R16G16B16_SNORM, R16G16_SNORM, R16_SNORM | 8, 6, 4, 2 | V4-16, V3-16, V2-16, S-16 | -1..1 | 1/32767 steps, invisible for anything within a unit range. Normals, tangents, and the positions of a model that fits in a ±1 box (put the model's size in its matrix). |
+ * | PVK_FORMAT_R16G16B16A16_UNORM, R16G16B16_UNORM, R16G16_UNORM, R16_UNORM | 8, 6, 4, 2 | V4-16, V3-16, V2-16, S-16 | 0..1 | 1/65535 steps. Texture coordinates for any texture the PS2 can hold (1024 texels at most, so 64 steps per texel), heights and other 0..1 fields. |
+ * | PVK_FORMAT_R16G16B16A16_SSCALED/USCALED and the 3, 2, 1 component forms | 8, 6, 4, 2 | V4-16, V3-16, V2-16, S-16 | the integer | -32768..32767 or 0..65535 as a float. Positions on a world grid with the unit in a push constant or uniform, which is how PS2 games stored level geometry; indices such as bone numbers. |
+ * | PVK_FORMAT_R8G8B8A8_SNORM, R8G8B8_SNORM, R8G8_SNORM, R8_SNORM | 4, 3, 2, 1 | V4-8, V3-8, V2-8, S-8 | -1..1 | 1/127 steps, enough for a normal when lighting is per vertex (the GS interpolates colors, not normals, so the shader's lighting result is what is smoothed). |
+ * | PVK_FORMAT_R8G8B8A8_UNORM, R8G8B8_UNORM, R8G8_UNORM, R8_UNORM | 4, 3, 2, 1 | V4-8, V3-8, V2-8, S-8 | 0..1 | 1/255 steps: the GS itself only keeps 8 bits per color channel, so vertex colors lose nothing. Colors, blend weights, ambient occlusion. |
+ * | PVK_FORMAT_R8G8B8A8_SSCALED/USCALED and the 3, 2, 1 component forms | 4, 3, 2, 1 | V4-8, V3-8, V2-8, S-8 | the integer | -128..127 or 0..255 as a float. Bone indices, material or palette numbers, anything the shader uses as a count. |
+ *
+ * The practical rule: colors as R8G8B8A8_UNORM, normals and texture
+ * coordinates as 16-bit, positions as 16-bit when the model fits a known box
+ * and float otherwise.
+ */
 typedef enum PvkFormat {
     PVK_FORMAT_UNDEFINED = 0,       /**< No format. */
     PVK_FORMAT_R32G32B32A32_SFLOAT, /**< Vertex attribute: 4 floats. */
@@ -46,7 +77,42 @@ typedef enum PvkFormat {
     PVK_FORMAT_T4,                  /**< GS PSMT4 texture: 4 bits per texel, two per byte with the first in the low bits, an index into a 16-entry color table (PS2 only). */
     PVK_FORMAT_Z32,                 /**< GS PSMZ32 depth image (like VK_FORMAT_D32). */
     PVK_FORMAT_Z24,                 /**< GS PSMZ24 depth image (like VK_FORMAT_X8_D24). */
-    PVK_FORMAT_Z16                  /**< GS PSMZ16 depth image (like VK_FORMAT_D16). */
+    PVK_FORMAT_Z16,                 /**< GS PSMZ16 depth image (like VK_FORMAT_D16). */
+    PVK_FORMAT_R32G32B32_SFLOAT,    /**< Vertex attribute: 3 floats (VIF UNPACK V3-32). */
+    PVK_FORMAT_R32G32_SFLOAT,       /**< Vertex attribute: 2 floats (V2-32). */
+    PVK_FORMAT_R32_SFLOAT,          /**< Vertex attribute: 1 float (S-32). */
+    PVK_FORMAT_R16G16B16A16_UNORM,  /**< Vertex attribute: 4 unsigned 16-bit integers, 0..65535 read as 0..1 (V4-16). */
+    PVK_FORMAT_R16G16B16A16_SNORM,  /**< Vertex attribute: 4 signed 16-bit integers, -32767..32767 read as -1..1, -32768 as -1. */
+    PVK_FORMAT_R16G16B16A16_USCALED,/**< Vertex attribute: 4 unsigned 16-bit integers read as their value. */
+    PVK_FORMAT_R16G16B16A16_SSCALED,/**< Vertex attribute: 4 signed 16-bit integers read as their value. */
+    PVK_FORMAT_R16G16B16_UNORM,     /**< Vertex attribute: 3 unsigned 16-bit integers (V3-16). */
+    PVK_FORMAT_R16G16B16_SNORM,     /**< Vertex attribute: 3 signed 16-bit integers. */
+    PVK_FORMAT_R16G16B16_USCALED,   /**< Vertex attribute: 3 unsigned 16-bit integers read as their value. */
+    PVK_FORMAT_R16G16B16_SSCALED,   /**< Vertex attribute: 3 signed 16-bit integers read as their value. */
+    PVK_FORMAT_R16G16_UNORM,        /**< Vertex attribute: 2 unsigned 16-bit integers (V2-16). */
+    PVK_FORMAT_R16G16_SNORM,        /**< Vertex attribute: 2 signed 16-bit integers. */
+    PVK_FORMAT_R16G16_USCALED,      /**< Vertex attribute: 2 unsigned 16-bit integers read as their value. */
+    PVK_FORMAT_R16G16_SSCALED,      /**< Vertex attribute: 2 signed 16-bit integers read as their value. */
+    PVK_FORMAT_R16_UNORM,           /**< Vertex attribute: 1 unsigned 16-bit integer (S-16). */
+    PVK_FORMAT_R16_SNORM,           /**< Vertex attribute: 1 signed 16-bit integer. */
+    PVK_FORMAT_R16_USCALED,         /**< Vertex attribute: 1 unsigned 16-bit integer read as its value. */
+    PVK_FORMAT_R16_SSCALED,         /**< Vertex attribute: 1 signed 16-bit integer read as its value. */
+    PVK_FORMAT_R8G8B8A8_UNORM,      /**< Vertex attribute: 4 unsigned bytes, 0..255 read as 0..1 (V4-8). */
+    PVK_FORMAT_R8G8B8A8_SNORM,      /**< Vertex attribute: 4 signed bytes, -127..127 read as -1..1, -128 as -1. */
+    PVK_FORMAT_R8G8B8A8_USCALED,    /**< Vertex attribute: 4 unsigned bytes read as their value. */
+    PVK_FORMAT_R8G8B8A8_SSCALED,    /**< Vertex attribute: 4 signed bytes read as their value. */
+    PVK_FORMAT_R8G8B8_UNORM,        /**< Vertex attribute: 3 unsigned bytes (V3-8). */
+    PVK_FORMAT_R8G8B8_SNORM,        /**< Vertex attribute: 3 signed bytes. */
+    PVK_FORMAT_R8G8B8_USCALED,      /**< Vertex attribute: 3 unsigned bytes read as their value. */
+    PVK_FORMAT_R8G8B8_SSCALED,      /**< Vertex attribute: 3 signed bytes read as their value. */
+    PVK_FORMAT_R8G8_UNORM,          /**< Vertex attribute: 2 unsigned bytes (V2-8). */
+    PVK_FORMAT_R8G8_SNORM,          /**< Vertex attribute: 2 signed bytes. */
+    PVK_FORMAT_R8G8_USCALED,        /**< Vertex attribute: 2 unsigned bytes read as their value. */
+    PVK_FORMAT_R8G8_SSCALED,        /**< Vertex attribute: 2 signed bytes read as their value. */
+    PVK_FORMAT_R8_UNORM,            /**< Vertex attribute: 1 unsigned byte (S-8). */
+    PVK_FORMAT_R8_SNORM,            /**< Vertex attribute: 1 signed byte. */
+    PVK_FORMAT_R8_USCALED,          /**< Vertex attribute: 1 unsigned byte read as its value. */
+    PVK_FORMAT_R8_SSCALED           /**< Vertex attribute: 1 signed byte read as its value. */
 } PvkFormat;
 
 /** @} */
@@ -539,6 +605,9 @@ typedef enum PvkPrimitiveTopology {
 /** @brief Most vertex inputs a vertex shader can have. */
 #define PVK_MAX_VERTEX_INPUTS 8
 
+/** @brief Most vertex buffer bindings a pipeline can declare and a command buffer can bind. */
+#define PVK_MAX_VERTEX_BINDINGS 8
+
 /** @brief Size of the push constant range, in bytes (Vulkan's minimum). */
 #define PVK_MAX_PUSH_CONSTANT_BYTES 128
 
@@ -578,6 +647,7 @@ typedef struct PvkShaderCode {
 
     const uint32_t *vu1CodeStart;          /**< Vertex: start of the VU1 microcode, linked into the ELF. */
     const uint32_t *vu1CodeEnd;            /**< Vertex: end of the VU1 microcode. */
+    const uint32_t *vu1Convert;            /**< Vertex: the input conversion block in the microcode: a branch, its delay slot, then 4 instructions per input (itof0 with loi scale, muli with loi -1, maxi, mul by VF00) that pvkCreateGraphicsPipeline() rewrites in its copy of the code for the attribute's format. */
     uint32_t        inputCount;            /**< Vertex: number of inputs, each one vec4. */
     uint32_t        inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< Vertex: input locations, in the order VU1 reads them. */
     int32_t         colorOutputLocation;   /**< Vertex: location of the color output, or -1 if none. */
@@ -648,11 +718,29 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
  */
 void      pvkDestroyPipelineLayout(PvkDevice device, PvkPipelineLayout layout);
 
-/** @brief One vertex attribute in the vertex buffer. */
+/**
+ * @brief A vertex buffer binding: one stream of vertices, like VkVertexInputBindingDescription.
+ *
+ * The VIF expands each binding into VU1 memory with one UNPACK format, so a
+ * binding is a tightly packed array in one format: its attributes share the
+ * format, feed consecutive shader inputs and lie one after another in the
+ * vertex, and the stride is their total size. Attributes of float vec4s may
+ * share a binding; an attribute of any other format is a binding of its own
+ * (its stride is the format's size: 16-bit RGB normals are 6 bytes, 8-bit RGBA
+ * colors 4). So a mesh with mixed formats keeps one array per format, bound
+ * with pvkCmdBindVertexBuffers(). No per-instance rate.
+ */
+typedef struct PvkVertexInputBinding {
+    uint32_t binding; /**< Binding number, below PVK_MAX_VERTEX_BINDINGS. */
+    uint32_t stride;  /**< Bytes per vertex in this binding: the attributes' format size times their count. */
+} PvkVertexInputBinding;
+
+/** @brief One vertex attribute, like VkVertexInputAttributeDescription. */
 typedef struct PvkVertexInputAttribute {
     uint32_t  location; /**< Shader input location it feeds. */
-    PvkFormat format;   /**< Must be PVK_FORMAT_R32G32B32A32_SFLOAT. */
-    uint32_t  offset;   /**< Bytes from the start of the vertex; input i must be at i * 16. */
+    uint32_t  binding;  /**< The PvkVertexInputBinding it is read from. */
+    PvkFormat format;   /**< A vertex attribute format (PVK_FORMAT_R32G32B32A32_SFLOAT to PVK_FORMAT_R8_SSCALED). */
+    uint32_t  offset;   /**< Bytes from the start of the vertex in its binding: the n-th attribute of a binding, in shader input order, is at n times the format's size. */
 } PvkVertexInputAttribute;
 
 /** @brief Maps clip space to framebuffer pixels, as in Vulkan (y points down). */
@@ -788,7 +876,8 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     PvkShaderModule                vertexShader;   /**< Vertex shader module. */
     PvkShaderModule                fragmentShader; /**< Fragment shader module. */
     PvkPipelineLayout              layout;         /**< Layout whose vertex push constant ranges cover the vertex shader's block. */
-    uint32_t                       vertexStride;   /**< Bytes per vertex; must be 16 per shader input. */
+    uint32_t                       bindingCount;   /**< Number of entries in bindings. */
+    const PvkVertexInputBinding   *bindings;       /**< The vertex buffer bindings the attributes come from. */
     uint32_t                       attributeCount; /**< Number of entries in attributes. */
     const PvkVertexInputAttribute *attributes;     /**< One per vertex shader input. */
     PvkPrimitiveTopology           topology;       /**< How the vertices of a draw are grouped into primitives. */
@@ -823,7 +912,10 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  * settings, culling, depth test and blend equation. A depth test needs a
  * depthAttachmentFormat, the comparison must be one the GS can do (see
  * PvkCompareOp) and the blend factors must fit the GS equation (see
- * PvkPipelineColorBlendAttachmentState).
+ * PvkPipelineColorBlendAttachmentState). Every vertex shader input needs an
+ * attribute in a declared binding (see PvkVertexInputBinding); the pipeline
+ * keeps its own copy of the VU1 code with the integer-to-float conversion
+ * each input's format needs patched in, so float inputs cost nothing.
  *
  * @param device The device.
  * @param info Pipeline parameters.
@@ -1160,12 +1252,26 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_
                          uint32_t offset, uint32_t size, const void *data);
 
 /**
- * @brief Binds the vertex buffer for the following draws.
+ * @brief Binds vertex buffers to bindings for the following draws, like vkCmdBindVertexBuffers.
+ *
+ * A draw reads binding b of its pipeline from buffers[b - firstBinding] at
+ * offsets[b - firstBinding]. The vertices stream from the buffers into VU1
+ * by DMA when the command buffer runs, so the buffers' contents at submit
+ * time are what the draw sees. The DMA moves whole 16-byte units: a batch
+ * of a binding whose stride is not a multiple of 16 starts at the vertex on
+ * the last 16-byte boundary before its first and ends at the one after its
+ * last, so up to 15 vertices around a draw are read too; pvkCreateBuffer()
+ * leaves room after the buffer for this, and the extra vertices are not
+ * drawn.
+ *
  * @param cmd The command buffer.
- * @param buffer The buffer holding the vertices.
- * @param offset Byte offset of the first vertex; must be a multiple of 16.
+ * @param firstBinding The binding the first buffer goes to.
+ * @param bindingCount Number of buffers; firstBinding + bindingCount at most PVK_MAX_VERTEX_BINDINGS.
+ * @param buffers The buffers.
+ * @param offsets Byte offset of the first vertex in each buffer; each a multiple of 16.
  */
-void pvkCmdBindVertexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset);
+void pvkCmdBindVertexBuffers(PvkCommandBuffer cmd, uint32_t firstBinding, uint32_t bindingCount,
+                             const PvkBuffer *buffers, const size_t *offsets);
 
 /** @brief Size of the indices in an index buffer. */
 typedef enum PvkIndexType {

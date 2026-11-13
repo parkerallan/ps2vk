@@ -302,6 +302,8 @@ int main(void)
     CHECK(pvkCreateShaderModule(device, &vsInfo, &vs));
     CHECK(pvkCreateShaderModule(device, &fsInfo, &fs));
 
+    PvkVertexInputBinding binding = { .binding = 0, .stride = sizeof(Vertex) };
+    size_t noOffset = 0;
     PvkVertexInputAttribute attributes[] = {
         { .location = 0, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
         { .location = 1, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
@@ -315,7 +317,8 @@ int main(void)
         .vertexShader   = vs,
         .fragmentShader = fs,
         .layout         = layout,
-        .vertexStride   = sizeof(Vertex),
+        .bindingCount   = 1,
+        .bindings       = &binding,
         .attributeCount = 2,
         .attributes     = attributes,
         .viewport       = { 0.0f, 0.0f, WIDTH, HEIGHT, 0.0f, 1.0f },
@@ -354,7 +357,7 @@ int main(void)
             },
         };
         pvkCmdBeginRendering(cmd, &rendering);
-        pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
+        pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
 
         pvkCmdBindPipeline(cmd, skyPipe);
         pvkCmdDraw(cmd, SKY_VERTS, SKY_FIRST);

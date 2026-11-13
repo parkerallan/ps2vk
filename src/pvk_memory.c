@@ -14,9 +14,10 @@ PvkResult pvkCreateBuffer(PvkDevice device, const PvkBufferCreateInfo *info, Pvk
     if (!buf)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
 
-    /* DMA needs 16-byte alignment; 64 keeps buffers on their own cache lines. */
+    /* DMA needs 16-byte alignment; 64 keeps buffers on their own cache lines.
+     * A vertex binding is read in whole 16-byte units, up to 48 bytes past its last vertex. */
     buf->size = (info->size + 15) & ~(size_t)15;
-    buf->data = memalign(64, buf->size);
+    buf->data = memalign(64, buf->size + 48);
     if (!buf->data) {
         free(buf);
         return PVK_ERROR_OUT_OF_HOST_MEMORY;

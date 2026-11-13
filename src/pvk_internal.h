@@ -163,16 +163,31 @@ uint32_t pvk_push_word_mask(uint32_t offset, uint32_t size);
 /* Nonzero if the two layouts have the same push constant ranges. */
 int pvk_layout_push_compatible(const struct PvkPipelineLayout_T *a, const struct PvkPipelineLayout_T *b);
 
+/* One vertex buffer binding of a pipeline: a stream the VIF unpacks with one format. */
+struct PvkVertexBinding {
+    int      used;            /* declared, and some shader input reads it */
+    uint32_t stride;          /* bytes per vertex */
+    uint32_t count;           /* attributes (consecutive shader inputs) it holds */
+    uint32_t slot;            /* VU1 qword of its first attribute within a vertex */
+    uint32_t mode;            /* VIF UNPACK format (P2_UNPACK_*) */
+    uint32_t usn;             /* unsigned 8/16-bit data */
+    uint32_t align;           /* vertices per whole 16-byte unit: 16 / gcd(16, stride) */
+    uint32_t chunk;           /* most vertices per UNPACK code, a multiple of align */
+};
+
 struct PvkPipeline_T {
     const PvkShaderCode *vs;
     const PvkShaderCode *fs;
     PvkPipelineLayout    layout;
+    uint32_t *code;           /* copy of vs's VU1 code with the input conversions patched in */
+    uint32_t *codeEnd;
     uint32_t samplerSet;      /* when fs->textured: set index and bindings[] slot of its sampler2D */
     uint32_t samplerSlot;
     uint32_t uniformSlots[PVK_MAX_UNIFORM_BLOCKS]; /* bindings[] slot of each vs->uniformBlocks[] entry in its set layout */
     uint32_t inputQwords;    /* qwords per vertex in VU1 memory */
     uint32_t outputQwords;    /* qwords per vertex VU1 emits: RGBAQ, XYZ2, plus ST when textured */
-    uint32_t vertexStride;    /* bytes per vertex in the vertex buffer */
+    struct PvkVertexBinding vertexBindings[PVK_MAX_VERTEX_BINDINGS];
+    uint32_t align;           /* batches start on a vertex that is a multiple of this: lcm of the bindings' align */
     uint32_t maxBatch;        /* vertices per VU1 run, a whole number of list primitives */
     uint32_t primStep;        /* vertices a draw grows by: the list primitive's size, 1 for strips and fans */
     uint32_t primOverlap;     /* vertices a strip or fan batch repeats from the previous batch */
@@ -197,8 +212,8 @@ struct PvkCommandBuffer_T {
     int         gsStateDirty; /* FRAME/ZBUF/TEST/TEX0 must be re-sent before the next draw */
     int         uniformsDirty; /* the uniform blocks' buffers must be sent to VU1 before the next draw */
     PvkDescriptorSet sets[PVK_MAX_DESCRIPTOR_SETS]; /* bound with pvkCmdBindDescriptorSets, or NULL */
-    PvkBuffer   vertexBuffer;
-    size_t      vertexOffset;
+    PvkBuffer   vertexBuffers[PVK_MAX_VERTEX_BINDINGS]; /* bound with pvkCmdBindVertexBuffers, or NULL */
+    size_t      vertexOffsets[PVK_MAX_VERTEX_BINDINGS];
     PvkBuffer   indexBuffer;  /* or NULL */
     size_t      indexOffset;
     uint8_t     push[PVK_MAX_PUSH_CONSTANT_BYTES]; /* what VU1's push constant range holds */

@@ -324,20 +324,85 @@ static PvkResult validate_layout(PvkPipeline p, const PvkGraphicsPipelineCreateI
     return PVK_SUCCESS;
 }
 
-static PvkResult validate_vertex_input(const PvkShaderCode *vs, const PvkGraphicsPipelineCreateInfo *info)
+/* Vertex attribute formats: the VIF UNPACK that expands one to a qword, and
+ * what VU1 then does with it. */
+enum { CONV_FLOAT, CONV_UNORM, CONV_SNORM, CONV_SCALED };
+
+typedef struct VertexFormat {
+    PvkFormat format;
+    uint8_t   mode;       /* P2_UNPACK_* */
+    uint8_t   components;
+    uint8_t   bytes;
+    uint8_t   conv;
+    uint8_t   usn;        /* unsigned integers */
+} VertexFormat;
+
+#define INT_FORMATS(prefix, mode, n, bytes)                               \
+    { PVK_FORMAT_##prefix##_UNORM,   mode, n, bytes, CONV_UNORM,  1 },    \
+    { PVK_FORMAT_##prefix##_SNORM,   mode, n, bytes, CONV_SNORM,  0 },    \
+    { PVK_FORMAT_##prefix##_USCALED, mode, n, bytes, CONV_SCALED, 1 },    \
+    { PVK_FORMAT_##prefix##_SSCALED, mode, n, bytes, CONV_SCALED, 0 },
+
+static const VertexFormat vertex_formats[] = {
+    { PVK_FORMAT_R32G32B32A32_SFLOAT, P2_UNPACK_V4_32, 4, 16, CONV_FLOAT, 0 },
+    { PVK_FORMAT_R32G32B32_SFLOAT,    P2_UNPACK_V3_32, 3, 12, CONV_FLOAT, 0 },
+    { PVK_FORMAT_R32G32_SFLOAT,       P2_UNPACK_V2_32, 2,  8, CONV_FLOAT, 0 },
+    { PVK_FORMAT_R32_SFLOAT,          P2_UNPACK_S_32,  1,  4, CONV_FLOAT, 0 },
+    INT_FORMATS(R16G16B16A16, P2_UNPACK_V4_16, 4, 8)
+    INT_FORMATS(R16G16B16,    P2_UNPACK_V3_16, 3, 6)
+    INT_FORMATS(R16G16,       P2_UNPACK_V2_16, 2, 4)
+    INT_FORMATS(R16,          P2_UNPACK_S_16,  1, 2)
+    INT_FORMATS(R8G8B8A8,     P2_UNPACK_V4_8,  4, 4)
+    INT_FORMATS(R8G8B8,       P2_UNPACK_V3_8,  3, 3)
+    INT_FORMATS(R8G8,         P2_UNPACK_V2_8,  2, 2)
+    INT_FORMATS(R8,           P2_UNPACK_S_8,   1, 1)
+};
+
+static const VertexFormat *vertex_format(PvkFormat format)
 {
+    size_t i;
+    for (i = 0; i < sizeof(vertex_formats) / sizeof(vertex_formats[0]); i++)
+        if (vertex_formats[i].format == format)
+            return &vertex_formats[i];
+    return NULL;
+}
+
+static uint32_t gcd(uint32_t a, uint32_t b)
+{
+    while (b) {
+        uint32_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+/* Fills p->vertexBindings from the bindings and attributes; fmt[i] gets the
+ * format of shader input i. VU1 reads a vertex as one qword per shader input in
+ * location order, and the VIF unpacks a binding with one UNPACK code, so a
+ * binding's attributes are consecutive inputs of one format, packed. */
+static PvkResult setup_vertex_input(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info,
+                                    const VertexFormat **fmt)
+{
+    const PvkShaderCode *vs = p->vs;
     uint32_t i, j;
 
-    /* VU1 reads each vertex as consecutive qwords, one per shader input in
-     * location order, so the buffer layout has to match exactly for now. */
-    if (info->vertexStride != vs->inputCount * 16) {
-        pvk_error("pipeline: vertexStride must be %u (one vec4 per shader input)\n",
-                  (unsigned)(vs->inputCount * 16));
-        return PVK_ERROR_VALIDATION_FAILED;
+    for (i = 0; i < info->bindingCount; i++) {
+        const PvkVertexInputBinding *b = &info->bindings[i];
+
+        if (b->binding >= PVK_MAX_VERTEX_BINDINGS || !b->stride || p->vertexBindings[b->binding].stride) {
+            pvk_error("pipeline: vertex binding %u is out of range, declared twice or has stride 0\n",
+                      (unsigned)b->binding);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        p->vertexBindings[b->binding].stride = b->stride;
     }
 
+    p->align = 1;
     for (i = 0; i < vs->inputCount; i++) {
         const PvkVertexInputAttribute *attr = NULL;
+        const VertexFormat *f;
+        struct PvkVertexBinding *vb;
 
         for (j = 0; j < info->attributeCount; j++) {
             if (info->attributes[j].location == vs->inputLocations[i]) {
@@ -350,24 +415,137 @@ static PvkResult validate_vertex_input(const PvkShaderCode *vs, const PvkGraphic
                       (unsigned)vs->inputLocations[i]);
             return PVK_ERROR_VALIDATION_FAILED;
         }
-        if (attr->format != PVK_FORMAT_R32G32B32A32_SFLOAT) {
-            pvk_error("pipeline: attribute at location %u must be PVK_FORMAT_R32G32B32A32_SFLOAT\n",
-                      (unsigned)attr->location);
+        f = vertex_format(attr->format);
+        if (!f) {
+            pvk_error("pipeline: format %d of the attribute at location %u is not a vertex attribute format\n",
+                      (int)attr->format, (unsigned)attr->location);
             return PVK_ERROR_FORMAT_NOT_SUPPORTED;
         }
-        if (attr->offset != i * 16) {
-            pvk_error("pipeline: attribute at location %u must have offset %u\n",
-                      (unsigned)attr->location, (unsigned)(i * 16));
+        if (attr->binding >= PVK_MAX_VERTEX_BINDINGS || !p->vertexBindings[attr->binding].stride) {
+            pvk_error("pipeline: the attribute at location %u reads vertex binding %u, which is not declared\n",
+                      (unsigned)attr->location, (unsigned)attr->binding);
             return PVK_ERROR_VALIDATION_FAILED;
         }
+        vb = &p->vertexBindings[attr->binding];
+        if (!vb->used) {
+            vb->used = 1;
+            vb->slot = i;
+            vb->mode = f->mode;
+            vb->usn  = f->usn;
+        } else if (vb->slot + vb->count != i) {
+            pvk_error("pipeline: the attributes of vertex binding %u must feed consecutive shader inputs\n",
+                      (unsigned)attr->binding);
+            return PVK_ERROR_VALIDATION_FAILED;
+        } else if (vb->mode != f->mode || vb->usn != f->usn || fmt[vb->slot]->conv != f->conv) {
+            pvk_error("pipeline: the attributes of vertex binding %u must share one format "
+                      "(the VIF unpacks a binding with one UNPACK code)\n", (unsigned)attr->binding);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (vb->count && f->bytes != 16) {
+            pvk_error("pipeline: an attribute of format %d needs a vertex binding of its own; binding %u "
+                      "holds more than one\n", (int)attr->format, (unsigned)attr->binding);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (attr->offset != vb->count * f->bytes) {
+            pvk_error("pipeline: the attribute at location %u must be at offset %u of vertex binding %u "
+                      "(attributes are packed in shader input order)\n",
+                      (unsigned)attr->location, (unsigned)(vb->count * f->bytes), (unsigned)attr->binding);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        vb->count++;
+        fmt[i] = f;
+    }
+
+    for (i = 0; i < PVK_MAX_VERTEX_BINDINGS; i++) {
+        struct PvkVertexBinding *vb = &p->vertexBindings[i];
+
+        if (!vb->used)
+            continue;
+        if (vb->stride != vb->count * fmt[vb->slot]->bytes) {
+            pvk_error("pipeline: vertex binding %u has stride %u but its attributes take %u bytes "
+                      "(a binding is tightly packed)\n", (unsigned)i, (unsigned)vb->stride,
+                      (unsigned)(vb->count * fmt[vb->slot]->bytes));
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        vb->align = 16 / gcd(16, vb->stride);
+        vb->chunk = 255 / vb->count;
+        vb->chunk -= vb->chunk % vb->align;
+        p->align  = p->align / gcd(p->align, vb->align) * vb->align;
     }
     return PVK_SUCCESS;
 }
 
-static uint32_t max_batch_vertices(uint32_t inputQwords, uint32_t outputQwords, uint32_t step)
+/* VU1 instruction words the conversion block is patched with. */
+#define VU_UPPER_NOP    0x000002FFu
+#define VU_LOWER_NOP    0x8000033Cu
+#define VU_LOWER_B      0x40000000u /* b imm11: target = this pair + 1 + imm11 */
+#define VU_DEST_SHIFT   21          /* xyzw write mask, x in bit 24 */
+
+static void vu_nop(uint32_t *pair)
 {
-    uint32_t byInput  = (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER) / inputQwords;
-    uint32_t byOutput = (PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / outputQwords;
+    pair[0] = VU_LOWER_NOP;
+    pair[1] = VU_UPPER_NOP;
+}
+
+/* The pipeline's copy of the vertex shader, with the conversion block (see
+ * PvkShaderCode::vu1Convert) patched: per input the pairs `itof0` + `loi`
+ * scale, `muli` + `loi` -1, `maxi` and `mul.mask VFn,VF00,VF00` (0 and 1 for
+ * the components the format lacks), each NOP'd when the format does not need
+ * it (a `loi` feeds the next pair), and the branch skips the leading inputs
+ * that need nothing. */
+static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt)
+{
+    const PvkShaderCode *vs = p->vs;
+    size_t words = (size_t)(vs->vu1CodeEnd - vs->vu1CodeStart);
+    uint32_t *blk, i, first = vs->inputCount, target;
+
+    if (!vs->vu1Convert || vs->vu1Convert < vs->vu1CodeStart ||
+        vs->vu1Convert + 2 * (2 + 4 * vs->inputCount) > vs->vu1CodeEnd) {
+        pvk_error("pipeline: vertex shader '%s' has no input conversion block; rebuild it with this shaderc\n",
+                  vs->name);
+        return PVK_ERROR_INVALID_SHADER;
+    }
+    p->code = memalign(16, words * 4);
+    if (!p->code)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    memcpy(p->code, vs->vu1CodeStart, words * 4);
+    p->codeEnd = p->code + words;
+    blk = p->code + (vs->vu1Convert - vs->vu1CodeStart);
+
+    for (i = 0; i < vs->inputCount; i++) {
+        uint32_t *s = blk + 2 * (2 + 4 * i);
+        const VertexFormat *f = fmt[i];
+        uint32_t bits = f->bytes * 8 / f->components;
+        float scale = f->conv == CONV_UNORM ? 1.0f / (float)((1u << bits) - 1)
+                    : 1.0f / (float)((1u << (bits - 1)) - 1);
+        int needed = f->conv != CONV_FLOAT || f->components < 4;
+
+        if (f->conv == CONV_FLOAT)
+            vu_nop(s);
+        else
+            memcpy(&s[0], &scale, 4);
+        if (f->conv == CONV_FLOAT || f->conv == CONV_SCALED)
+            vu_nop(s + 2);
+        if (f->conv != CONV_SNORM)
+            vu_nop(s + 4);
+        if (f->components == 4)
+            vu_nop(s + 6);
+        else
+            s[7] = (s[7] & ~(0xFu << VU_DEST_SHIFT)) | (((1u << (4 - f->components)) - 1) << VU_DEST_SHIFT);
+        if (needed && first == vs->inputCount)
+            first = i;
+    }
+    target = 2 + 4 * first;
+    blk[0] = VU_LOWER_B | ((target - 1) & 0x7FF);
+    return PVK_SUCCESS;
+}
+
+static uint32_t max_batch_vertices(const PvkPipeline p, uint32_t step)
+{
+    /* Up to align - 1 unused vertices come before and after a batch's. */
+    uint32_t byInput  = (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER) / p->inputQwords
+                      - 2 * (p->align - 1);
+    uint32_t byOutput = (PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / p->outputQwords;
     uint32_t n        = byInput < byOutput ? byInput : byOutput;
 
     return n - n % step; /* whole primitives per batch */
@@ -391,6 +569,7 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     const PvkShaderCode *vs = info->vertexShader ? info->vertexShader->code : NULL;
     const PvkShaderCode *fs = info->fragmentShader ? info->fragmentShader->code : NULL;
     const PvkViewport *vp   = &info->viewport;
+    const VertexFormat *fmt[PVK_MAX_VERTEX_INPUTS];
     PvkPipeline p;
     PvkResult res;
     float *ctx, depthMax;
@@ -398,8 +577,6 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     (void)device;
 
     if ((res = validate_shaders(vs, fs)) != PVK_SUCCESS)
-        return res;
-    if ((res = validate_vertex_input(vs, info)) != PVK_SUCCESS)
         return res;
     if ((unsigned)info->topology >= sizeof(topologies) / sizeof(topologies[0])) {
         pvk_error("pipeline: unknown topology %d\n", (int)info->topology);
@@ -414,26 +591,26 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     p->vs           = vs;
     p->fs           = fs;
     p->layout       = info->layout;
-    if ((res = validate_layout(p, info)) != PVK_SUCCESS) {
-        free(p);
+    if ((res = validate_layout(p, info)) != PVK_SUCCESS || (res = setup_vertex_input(p, info, fmt)) != PVK_SUCCESS ||
+        (res = copy_code(p, fmt)) != PVK_SUCCESS) {
+        pvkDestroyPipeline(device, p);
         return res;
     }
     p->inputQwords  = vs->inputCount;
     /* A vertex shader with a texture coordinate output stores ST before RGBAQ, XYZ2. */
     p->outputQwords = vs->texcoordOutputLocation >= 0 ? PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED : PVK_VU1_OUTPUT_PER_VERTEX;
-    p->vertexStride = info->vertexStride;
     p->primStep     = topologies[info->topology].step;
     p->primOverlap  = topologies[info->topology].overlap;
     p->fan          = topologies[info->topology].fan;
     p->strip        = info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-    p->maxBatch     = max_batch_vertices(p->inputQwords, p->outputQwords, p->primStep);
+    p->maxBatch     = max_batch_vertices(p, p->primStep);
     /* ST holds S/w, T/w and Q = 1/w (FST = 0), so the GS divides per pixel. */
     p->prim         = GS_SET_PRIM(topologies[info->topology].prim, fs->gouraud, fs->textured, 0,
                                   info->colorBlend.attachment.blendEnable ? 1 : 0, 0, 0, 0, 0);
 
     if ((res = setup_depth(p, info)) != PVK_SUCCESS || (res = setup_blend(p, info)) != PVK_SUCCESS ||
         (res = setup_cull(p, info)) != PVK_SUCCESS) {
-        free(p);
+        pvkDestroyPipeline(device, p);
         return res;
     }
     depthMax = pvk_depth_max(p->depthFormat);
@@ -461,5 +638,8 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
 void pvkDestroyPipeline(PvkDevice device, PvkPipeline pipeline)
 {
     (void)device;
+    if (!pipeline)
+        return;
+    free(pipeline->code);
     free(pipeline);
 }

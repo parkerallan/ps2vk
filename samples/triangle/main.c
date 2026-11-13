@@ -86,6 +86,8 @@ int main(void)
     CHECK(pvkCreateShaderModule(device, &vsInfo, &vs));
     CHECK(pvkCreateShaderModule(device, &fsInfo, &fs));
 
+    PvkVertexInputBinding binding = { .binding = 0, .stride = 32 };
+    size_t noOffset = 0;
     PvkVertexInputAttribute attributes[] = {
         { .location = 0, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
         { .location = 1, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
@@ -99,7 +101,8 @@ int main(void)
         .vertexShader   = vs,
         .fragmentShader = fs,
         .layout         = layout,
-        .vertexStride   = 32,
+        .bindingCount   = 1,
+        .bindings       = &binding,
         .attributeCount = 2,
         .attributes     = attributes,
         .topology       = PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
@@ -137,7 +140,7 @@ int main(void)
         pvkCmdBeginRendering(cmd, &rendering);
         pvkCmdBindPipeline(cmd, pipeline);
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(mvp), mvp);
-        pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
+        pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
         pvkCmdDrawIndexed(cmd, 3, 0, 0);
         pvkCmdEndRendering(cmd);

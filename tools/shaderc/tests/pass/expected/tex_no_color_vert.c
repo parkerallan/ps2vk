@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t tex_no_color_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t tex_no_color_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t tex_no_color_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode tex_no_color_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode tex_no_color_vert = {
     .name = "tex_no_color.vert",
     .vu1CodeStart = &tex_no_color_vert_CodeStart,
     .vu1CodeEnd = &tex_no_color_vert_CodeEnd,
+    .vu1Convert = &tex_no_color_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = -1,

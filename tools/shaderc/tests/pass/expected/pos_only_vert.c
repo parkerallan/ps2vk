@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t pos_only_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t pos_only_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t pos_only_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode pos_only_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode pos_only_vert = {
     .name = "pos_only.vert",
     .vu1CodeStart = &pos_only_vert_CodeStart,
     .vu1CodeEnd = &pos_only_vert_CodeEnd,
+    .vu1Convert = &pos_only_vert_Convert,
     .inputCount = 1,
     .inputLocations = { 0 },
     .colorOutputLocation = -1,

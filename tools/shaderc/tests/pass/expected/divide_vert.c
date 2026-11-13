@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t divide_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t divide_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t divide_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode divide_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode divide_vert = {
     .name = "divide.vert",
     .vu1CodeStart = &divide_vert_CodeStart,
     .vu1CodeEnd = &divide_vert_CodeEnd,
+    .vu1Convert = &divide_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,

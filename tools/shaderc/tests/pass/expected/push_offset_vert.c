@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t push_offset_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t push_offset_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t push_offset_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode push_offset_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode push_offset_vert = {
     .name = "push_offset.vert",
     .vu1CodeStart = &push_offset_vert_CodeStart,
     .vu1CodeEnd = &push_offset_vert_CodeEnd,
+    .vu1Convert = &push_offset_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,

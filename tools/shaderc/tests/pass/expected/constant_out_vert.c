@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t constant_out_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t constant_out_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t constant_out_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode constant_out_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode constant_out_vert = {
     .name = "constant_out.vert",
     .vu1CodeStart = &constant_out_vert_CodeStart,
     .vu1CodeEnd = &constant_out_vert_CodeEnd,
+    .vu1Convert = &constant_out_vert_Convert,
     .inputCount = 1,
     .inputLocations = { 0 },
     .colorOutputLocation = 0,

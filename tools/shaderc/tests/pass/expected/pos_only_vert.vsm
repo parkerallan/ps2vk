@@ -8,11 +8,12 @@
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
 ;   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),
 ;   VI10 first vertex, VI11 vertices to the next triangle, VI12 vertices per triangle
-;   (0 = no culling), VI14 MAC flag mask, VI15 fan
+;   (0 = no culling), VI13 unused vertices before the first, VI14 MAC flag mask, VI15 fan
 
 		.vu
 		.align 4
 		.global	pos_only_vert_CodeStart
+		.global	pos_only_vert_Convert
 		.global	pos_only_vert_CodeEnd
 pos_only_vert_CodeStart:
 ; prologue: constants, batch header, GIF tag to the output
@@ -21,8 +22,10 @@ pos_only_vert_CodeStart:
          NOP                                      lq            VF03,2(VI00)
          NOP                                      iaddiu        VI01,VI00,80               ; input base
          NOP                                      lq            VF04,0(VI01)               ; GIF tag for this batch
+         NOP                                      ilw.x         VI13,2(VI01)               ; qwords of unused vertices before the first
          NOP                                      ilw.x         VI02,1(VI01)               ; vertex count
-         NOP                                      iaddiu        VI03,VI01,2                ; first vertex
+         NOP                                      iaddiu        VI03,VI01,3                ; first unpacked vertex
+         NOP                                      iadd          VI03,VI03,VI13             ; first vertex
          NOP                                      ilw.y         VI09,1(VI01)               ; index list offset, 0 = vertices in order
          NOP                                      iadd          VI10,VI03,VI00             ; first vertex, kept for indexed fetches
          NOP                                      iadd          VI06,VI01,VI09             ; index pointer
@@ -44,6 +47,15 @@ pos_only_vert_loop:
 pos_only_vert_fetch:
 ; load inputs (location order)
          NOP                                      lq            VF10,0(VI03)               ; location 0
+; input conversion: the pipeline patches each input's 4 pairs for its attribute format
+pos_only_vert_Convert:
+         NOP                                      b             pos_only_vert_body         ; retargeted past the inputs that need nothing
+         NOP                                      NOP                                      ; branch delay slot
+         itof0.xyzw    VF10,VF10                  loi           0x3f800000                 ; integers to floats; I = UNORM/SNORM scale
+         muli.xyzw     VF10,VF10,I                loi           0xbf800000                 ; scale; I = SNORM clamp
+         maxi.xyzw     VF10,VF10,I                NOP                                      ; clamp to -1
+         mul.xyzw      VF10,VF00,VF00             NOP                                      ; components the format lacks: 0, w = 1
+pos_only_vert_body:
 ; shader body
          NOP                                      move.xyzw     VF20,VF10                  ; gl_Position
          NOP                                      move.xyzw     VF21,VF00                  ; no color output: black

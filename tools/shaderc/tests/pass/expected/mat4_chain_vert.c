@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t mat4_chain_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t mat4_chain_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t mat4_chain_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode mat4_chain_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode mat4_chain_vert = {
     .name = "mat4_chain.vert",
     .vu1CodeStart = &mat4_chain_vert_CodeStart,
     .vu1CodeEnd = &mat4_chain_vert_CodeEnd,
+    .vu1Convert = &mat4_chain_vert_Convert,
     .inputCount = 1,
     .inputLocations = { 0 },
     .colorOutputLocation = -1,

@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t swapped_locations_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t swapped_locations_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t swapped_locations_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode swapped_locations_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode swapped_locations_vert = {
     .name = "swapped_locations.vert",
     .vu1CodeStart = &swapped_locations_vert_CodeStart,
     .vu1CodeEnd = &swapped_locations_vert_CodeEnd,
+    .vu1Convert = &swapped_locations_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 2,

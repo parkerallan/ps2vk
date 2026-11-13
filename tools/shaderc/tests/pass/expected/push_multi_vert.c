@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t push_multi_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t push_multi_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t push_multi_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode push_multi_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode push_multi_vert = {
     .name = "push_multi.vert",
     .vu1CodeStart = &push_multi_vert_CodeStart,
     .vu1CodeEnd = &push_multi_vert_CodeEnd,
+    .vu1Convert = &push_multi_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,

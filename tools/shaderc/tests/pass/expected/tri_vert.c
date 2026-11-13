@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t tri_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t tri_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t tri_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode tri_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode tri_vert = {
     .name = "tri.vert",
     .vu1CodeStart = &tri_vert_CodeStart,
     .vu1CodeEnd = &tri_vert_CodeEnd,
+    .vu1Convert = &tri_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,

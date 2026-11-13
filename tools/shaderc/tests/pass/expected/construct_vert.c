@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t construct_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t construct_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t construct_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode construct_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode construct_vert = {
     .name = "construct.vert",
     .vu1CodeStart = &construct_vert_CodeStart,
     .vu1CodeEnd = &construct_vert_CodeEnd,
+    .vu1Convert = &construct_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,

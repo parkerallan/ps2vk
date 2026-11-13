@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t arith_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t arith_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t arith_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode arith_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode arith_vert = {
     .name = "arith.vert",
     .vu1CodeStart = &arith_vert_CodeStart,
     .vu1CodeEnd = &arith_vert_CodeEnd,
+    .vu1Convert = &arith_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,

@@ -2,6 +2,7 @@
 #include "ps2vk.h"
 
 extern uint32_t builtin_efu_vert_CodeStart __attribute__((section(".vudata")));
+extern uint32_t builtin_efu_vert_Convert __attribute__((section(".vudata")));
 extern uint32_t builtin_efu_vert_CodeEnd __attribute__((section(".vudata")));
 
 const PvkShaderCode builtin_efu_vert = {
@@ -9,6 +10,7 @@ const PvkShaderCode builtin_efu_vert = {
     .name = "builtin_efu.vert",
     .vu1CodeStart = &builtin_efu_vert_CodeStart,
     .vu1CodeEnd = &builtin_efu_vert_CodeEnd,
+    .vu1Convert = &builtin_efu_vert_Convert,
     .inputCount = 2,
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,

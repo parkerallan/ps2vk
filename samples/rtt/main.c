@@ -226,6 +226,8 @@ int main(void)
     CHECK(pvkCreateShaderModule(device, &colorFsInfo, &colorFs));
     CHECK(pvkCreateShaderModule(device, &textureFsInfo, &textureFs));
 
+    PvkVertexInputBinding binding = { .binding = 0, .stride = sizeof(Vertex) };
+    size_t noOffset = 0;
     PvkVertexInputAttribute attributes[] = {
         { .location = 0, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 0 },
         { .location = 1, .format = PVK_FORMAT_R32G32B32A32_SFLOAT, .offset = 16 },
@@ -268,7 +270,8 @@ int main(void)
         .vertexShader   = vs,
         .fragmentShader = colorFs,
         .layout         = layout,
-        .vertexStride   = sizeof(Vertex),
+        .bindingCount   = 1,
+        .bindings       = &binding,
         .attributeCount = 3,
         .attributes     = attributes,
         .topology       = PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
@@ -320,7 +323,7 @@ int main(void)
         pvkCmdBeginRendering(cmd, &toTexture);
         pvkCmdBindPipeline(cmd, innerPipeline);
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(innerMvp), innerMvp);
-        pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
+        pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
         pvkCmdDrawIndexed(cmd, 36, 0, 0);
         pvkCmdEndRendering(cmd);
@@ -343,7 +346,7 @@ int main(void)
         pvkCmdBindPipeline(cmd, outerPipeline);
         pvkCmdBindDescriptorSets(cmd, layout, 0, 1, &descriptorSet);
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(outerMvp), outerMvp);
-        pvkCmdBindVertexBuffer(cmd, vertexBuffer, 0);
+        pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
         pvkCmdDrawIndexed(cmd, 36, 0, 0);
         pvkCmdEndRendering(cmd);
