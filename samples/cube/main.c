@@ -198,6 +198,7 @@ int main(void)
     PvkQueue queue;
     PvkSwapchain swapchain;
     PvkImage images[2], depth, texture, colorTable;
+    PvkImageView views[2], depthView, textureView;
     PvkSampler sampler;
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer, textureBuffer, paletteBuffer;
@@ -232,6 +233,10 @@ int main(void)
     };
     CHECK(pvkCreateSwapchain(device, &swapchainInfo, &swapchain));
     CHECK(pvkGetSwapchainImages(device, swapchain, &imageCount, images));
+    for (uint32_t i = 0; i < imageCount; i++) {
+        PvkImageViewCreateInfo viewInfo = { .image = images[i], .levelCount = 1 };
+        CHECK(pvkCreateImageView(device, &viewInfo, &views[i]));
+    }
 
     /* VRAM is handed out in order: framebuffers, depth buffer, the T8 texture, then its CT16 color table. */
     PvkImageCreateInfo depthInfo = { .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_Z24 };
@@ -240,6 +245,10 @@ int main(void)
     CHECK(pvkCreateImage(device, &textureInfo, &texture));
     PvkImageCreateInfo tableInfo = { .width = 256, .height = 1, .format = PVK_FORMAT_CT16 };
     CHECK(pvkCreateImage(device, &tableInfo, &colorTable));
+    PvkImageViewCreateInfo depthViewInfo = { .image = depth, .levelCount = 1 };
+    CHECK(pvkCreateImageView(device, &depthViewInfo, &depthView));
+    PvkImageViewCreateInfo textureViewInfo = { .image = texture, .levelCount = 1 };
+    CHECK(pvkCreateImageView(device, &textureViewInfo, &textureView));
     /* Bilinear both ways; the cube's UVs stay in 0..1, so wrapping never shows. */
     PvkSamplerCreateInfo samplerInfo = {
         .magFilter = PVK_FILTER_LINEAR, .minFilter = PVK_FILTER_LINEAR,
@@ -305,7 +314,7 @@ int main(void)
         .descriptorPool = descriptorPool, .descriptorSetCount = 1, .setLayouts = &setLayout,
     };
     CHECK(pvkAllocateDescriptorSets(device, &setInfo, &descriptorSet));
-    PvkDescriptorImageInfo textureDescriptor = { .sampler = sampler, .image = texture, .colorTable = colorTable };
+    PvkDescriptorImageInfo textureDescriptor = { .sampler = sampler, .imageView = textureView, .colorTable = colorTable };
     PvkWriteDescriptorSet write = {
         .dstSet = descriptorSet, .dstBinding = 0,
         .descriptorType = PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .imageInfo = &textureDescriptor,
@@ -362,12 +371,12 @@ int main(void)
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },
             .colorAttachment = {
-                .image      = images[imageIndex],
+                .imageView  = views[imageIndex],
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
                 .clearValue = { .color = { { 0.1f, 0.1f, 0.2f, 1.0f } } },
             },
             .depthAttachment = {
-                .image      = depth,
+                .imageView  = depthView,
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
                 .clearValue = { .depthStencil = { .depth = 1.0f } },
             },

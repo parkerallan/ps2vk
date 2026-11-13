@@ -164,6 +164,7 @@ int main(void)
     PvkQueue queue;
     PvkSwapchain swapchain;
     PvkImage images[2], depth, ramp;
+    PvkImageView views[2], depthView, rampView;
     PvkSampler rampSampler;
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer, cameraBuffer, lightBuffer, rampBuffer;
@@ -195,12 +196,20 @@ int main(void)
     };
     CHECK(pvkCreateSwapchain(device, &swapchainInfo, &swapchain));
     CHECK(pvkGetSwapchainImages(device, swapchain, &imageCount, images));
+    for (uint32_t i = 0; i < imageCount; i++) {
+        PvkImageViewCreateInfo viewInfo = { .image = images[i], .levelCount = 1 };
+        CHECK(pvkCreateImageView(device, &viewInfo, &views[i]));
+    }
 
     /* VRAM is handed out in order: framebuffers, then the depth buffer, then the ramp. */
     PvkImageCreateInfo depthInfo = { .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_Z24 };
     CHECK(pvkCreateImage(device, &depthInfo, &depth));
     PvkImageCreateInfo rampInfo = { .width = RAMP_WIDTH, .height = RAMP_HEIGHT, .format = PVK_FORMAT_CT32 };
     CHECK(pvkCreateImage(device, &rampInfo, &ramp));
+    PvkImageViewCreateInfo depthViewInfo = { .image = depth, .levelCount = 1 };
+    CHECK(pvkCreateImageView(device, &depthViewInfo, &depthView));
+    PvkImageViewCreateInfo rampViewInfo = { .image = ramp, .levelCount = 1 };
+    CHECK(pvkCreateImageView(device, &rampViewInfo, &rampView));
     /* Clamp to edge: a dot product past either end of the ramp reads its end
      * texel instead of wrapping round to the other end. */
     PvkSamplerCreateInfo rampSamplerInfo = {
@@ -288,7 +297,7 @@ int main(void)
     CHECK(pvkAllocateDescriptorSets(device, &setInfo, &descriptorSet));
     PvkDescriptorBufferInfo cameraDescriptor = { .buffer = cameraBuffer, .offset = 0, .range = PVK_WHOLE_SIZE };
     PvkDescriptorBufferInfo lightDescriptor  = { .buffer = lightBuffer,  .offset = 0, .range = PVK_WHOLE_SIZE };
-    PvkDescriptorImageInfo rampDescriptor = { .sampler = rampSampler, .image = ramp };
+    PvkDescriptorImageInfo rampDescriptor = { .sampler = rampSampler, .imageView = rampView };
     PvkWriteDescriptorSet writes[] = {
         { .dstSet = descriptorSet, .dstBinding = 0,
           .descriptorType = PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .bufferInfo = &cameraDescriptor },
@@ -347,12 +356,12 @@ int main(void)
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },
             .colorAttachment = {
-                .image      = images[imageIndex],
+                .imageView  = views[imageIndex],
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
                 .clearValue = { .color = { { 0.05f, 0.05f, 0.1f, 1.0f } } },
             },
             .depthAttachment = {
-                .image      = depth,
+                .imageView  = depthView,
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
                 .clearValue = { .depthStencil = { .depth = 1.0f } },
             },

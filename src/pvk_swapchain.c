@@ -72,6 +72,7 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
             return PVK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
         sc->images[i].format = PVK_FORMAT_CT32;
+        sc->images[i].usage  = PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | PVK_IMAGE_USAGE_SAMPLED_BIT;
         fb->address = address;
         fb->width   = sc->width;
         fb->height  = sc->height;

@@ -85,8 +85,8 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
 {
     packet2_reset(cmd->packet, 0);
     cmd->pipeline     = NULL;
-    cmd->colorImage   = NULL;
-    cmd->depthImage   = NULL;
+    cmd->colorView    = NULL;
+    cmd->depthView    = NULL;
     cmd->gsStateDirty = 0;
     cmd->uniformsDirty = 0;
     memset(cmd->sets, 0, sizeof(cmd->sets));
@@ -171,11 +171,10 @@ static uint32_t clear_strips(const PvkRect2D *area)
 /* Fill the render area with the clear values: one sprite pass that writes the
  * color buffer, the depth buffer, or both, masking the one that isn't cleared.
  * Uses 5 + 2 * clear_strips(area) qwords. */
-static qword_t *cmd_clear(qword_t *q, const PvkRenderingInfo *info, int clearColor, int clearDepth)
+static qword_t *cmd_clear(qword_t *q, const PvkRenderingInfo *info, const framebuffer_t *fb, const PvkImage depth,
+                          int clearColor, int clearDepth)
 {
     const PvkRect2D *area = &info->renderArea;
-    const framebuffer_t *fb = &info->colorAttachment.image->fb;
-    const PvkImage depth = info->depthAttachment.image;
     const float *rgba = info->colorAttachment.clearValue.color.float32;
     union { float f; u32 u; } one = { 1.0f };
     uint32_t strips = clear_strips(area);
@@ -208,26 +207,31 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 {
     const PvkRenderingAttachmentInfo *color = &info->colorAttachment;
     const PvkRenderingAttachmentInfo *depth = &info->depthAttachment;
+    PvkImageView colorView = color->imageView, depthView = depth->imageView;
     int clearColor = color->loadOp == PVK_ATTACHMENT_LOAD_OP_CLEAR;
-    int clearDepth = depth->image && depth->loadOp == PVK_ATTACHMENT_LOAD_OP_CLEAR;
+    int clearDepth = depthView && depth->loadOp == PVK_ATTACHMENT_LOAD_OP_CLEAR;
+    PvkImage depthImage = depthView ? depthView->image : NULL;
+    framebuffer_t fb;
     zbuffer_t z = { 0 };
     qword_t *q;
 
-    if (!color->image || color->image->format != PVK_FORMAT_CT32) {
-        pvk_error("pvkCmdBeginRendering: the color attachment must be a PVK_FORMAT_CT32 image\n");
+    if (!colorView || !(colorView->image->usage & PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || colorView->levels != 1) {
+        pvk_error("pvkCmdBeginRendering: the color attachment must be a one-level view of a swapchain image or "
+                  "an image created with PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT\n");
         cmd->failed = 1;
         return;
     }
-    if (depth->image) {
-        if (!is_depth_format(depth->image->format)) {
+    pvk_view_framebuffer(colorView, &fb);
+    if (depthImage) {
+        if (!is_depth_format(depthImage->format)) {
             pvk_error("pvkCmdBeginRendering: the depth attachment is not a depth image\n");
             cmd->failed = 1;
             return;
         }
-        if (depth->image->fb.width != color->image->fb.width) {
+        if (depthImage->fb.width != fb.width) {
             pvk_error("pvkCmdBeginRendering: the depth attachment (%u wide) must be as wide as the "
-                      "color attachment (%u): the GS gives both one width\n",
-                      (unsigned)depth->image->fb.width, (unsigned)color->image->fb.width);
+                      "color attachment's level (%u): the GS gives both one width\n",
+                      (unsigned)depthImage->fb.width, (unsigned)fb.width);
             cmd->failed = 1;
             return;
         }
@@ -237,21 +241,21 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
         return;
 
     /* ZBUF for the environment; the test and write mask come from the pipeline at draw time. */
-    z.enable  = depth->image != NULL;
+    z.enable  = depthImage != NULL;
     z.method  = ZTEST_METHOD_ALLPASS;
-    z.address = depth->image ? depth->image->fb.address : 0;
-    z.zsm     = depth->image ? gs_zsm(depth->image->format) : GS_ZBUF_32;
+    z.address = depthImage ? depthImage->fb.address : 0;
+    z.zsm     = depthImage ? gs_zsm(depthImage->format) : GS_ZBUF_32;
     z.mask    = 1;
 
     q = cmd_open_direct(cmd);
-    q = draw_setup_environment(q, 0, &color->image->fb, &z);
+    q = draw_setup_environment(q, 0, &fb, &z);
     q = draw_primitive_xyoffset(q, 0, PVK_GS_ORIGIN, PVK_GS_ORIGIN);
     if (clearColor || clearDepth)
-        q = cmd_clear(q, info, clearColor, clearDepth);
+        q = cmd_clear(q, info, &fb, depthImage, clearColor, clearDepth);
     cmd_close_direct(cmd, q);
 
-    cmd->colorImage   = color->image;
-    cmd->depthImage   = depth->image;
+    cmd->colorView    = colorView;
+    cmd->depthView    = depthView;
     cmd->gsStateDirty = 1;
     cmd->rendering    = 1;
 }
@@ -265,30 +269,37 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
  * after pvkCmdBeginRendering, pvkCmdBindPipeline or pvkCmdBindDescriptorSets. */
 static void cmd_gs_state(PvkCommandBuffer cmd)
 {
-    const framebuffer_t *fb = &cmd->colorImage->fb;
-    const PvkImage depth = cmd->depthImage;
+    const PvkImage depth = cmd->depthView ? cmd->depthView->image : NULL;
     const PvkPipeline p = cmd->pipeline;
     int textured = p->fs->textured;
     const struct PvkDescriptorSlot *slot = textured ? &cmd->sets[p->samplerSet]->slots[p->samplerSlot] : NULL;
-    int mipmapped = textured && slot->image->levels > 1;
+    int mipmapped = textured && slot->view->levels > 1;
+    framebuffer_t fb;
     qword_t *q;
 
+    pvk_view_framebuffer(cmd->colorView, &fb);
     q = cmd_open_direct(cmd);
     q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 11 : 9) : 4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, 0), GS_REG_FRAME);
+    q = gs_ad(q, GS_SET_FRAME(fb.address >> 11, fb.width >> 6, fb.psm, 0), GS_REG_FRAME);
     q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
                              depth ? p->zmsk : 1), GS_REG_ZBUF);
     /* No alpha test (Vulkan has none); depth test from the pipeline. */
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
     q = gs_ad(q, p->alpha, GS_REG_ALPHA);
     if (textured) {
-        const PvkImage t = slot->image, c = slot->colorTable;
+        const PvkImageView v = slot->view;
+        const PvkImage t = v->image, c = slot->colorTable;
         const PvkSampler s = slot->sampler;
-        uint32_t mxl = t->levels - 1 < s->maxLevel ? t->levels - 1 : s->maxLevel;
-        const uint32_t *a = t->levelAddress, *w = t->levelTbw;
+        uint32_t base = v->baseLevel, mxl = v->levels - 1 < s->maxLevel ? v->levels - 1 : s->maxLevel;
+        uint32_t a[PVK_MAX_MIP_LEVELS] = { 0 }, w[PVK_MAX_MIP_LEVELS] = { 0 }, l;
+        /* The view's levels, renumbered from its base level. */
+        for (l = 0; l < v->levels; l++) {
+            a[l] = t->levelAddress[base + l];
+            w[l] = t->levelTbw[base + l];
+        }
         /* The texture's alpha is used (TCC), the function comes from the fragment
          * shader, filters, levels and LOD from the sampler: LOD = log2(w) + K (L = 0). */
-        q = gs_ad(q, GS_SET_TEX0(t->fb.address >> 6, t->tbw, t->fb.psm, t->tw, t->th, TEXTURE_COMPONENTS_RGBA,
+        q = gs_ad(q, GS_SET_TEX0(a[0] >> 6, w[0], t->fb.psm, t->tw - base, t->th - base, TEXTURE_COMPONENTS_RGBA,
                                  p->fs->textureFunction, c ? c->fb.address >> 6 : 0, c ? c->fb.psm : 0, 0, 0,
                                  c ? 1 : 0), GS_REG_TEX0);
         /* TEXA: CT24 reads opaque, a set CT16 alpha bit is 0x80. */
@@ -381,8 +392,9 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
     uint32_t bytes, qwords, sent = 0, level = region->mipLevel, width, height;
     qword_t *q;
 
-    if (!pvk_is_color_format(image->format)) {
-        pvk_error("pvkCmdCopyBufferToImage: only color images (textures and color tables) can be uploaded to\n");
+    if (!(image->usage & PVK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        pvk_error("pvkCmdCopyBufferToImage: the image was not created with PVK_IMAGE_USAGE_TRANSFER_DST_BIT "
+                  "(textures and color tables have it by default)\n");
         cmd->failed = 1;
         return;
     }
@@ -585,7 +597,7 @@ static PvkDescriptorSet bound_set(PvkCommandBuffer cmd, const char *name, uint32
         return NULL;
     }
     d = &s->slots[slot];
-    if (!d->image && !d->buffer) {
+    if (!d->view && !d->buffer) {
         pvk_error("%s: binding %u of the descriptor set at index %u was never written with "
                   "pvkUpdateDescriptorSets\n", name, (unsigned)binding, (unsigned)index);
         cmd->failed = 1;
@@ -660,10 +672,10 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         cmd->failed = 1;
         return 0;
     }
-    if (p->depthFormat != (cmd->depthImage ? cmd->depthImage->format : PVK_FORMAT_UNDEFINED)) {
+    if (p->depthFormat != (cmd->depthView ? cmd->depthView->image->format : PVK_FORMAT_UNDEFINED)) {
         pvk_error("%s: the pipeline's depthAttachmentFormat (%d) does not match the depth "
                   "attachment of pvkCmdBeginRendering (%d)\n", name, (int)p->depthFormat,
-                  cmd->depthImage ? (int)cmd->depthImage->format : (int)PVK_FORMAT_UNDEFINED);
+                  cmd->depthView ? (int)cmd->depthView->image->format : (int)PVK_FORMAT_UNDEFINED);
         cmd->failed = 1;
         return 0;
     }

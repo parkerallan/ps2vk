@@ -51,6 +51,7 @@ struct PvkDevice_T {
  * and log2 size; MIPTBP1/2 the addresses and widths of the other levels. */
 struct PvkImage_T {
     PvkFormat     format;
+    uint32_t      usage;      /* PvkImageUsageFlagBits */
     int           colorTable; /* a palette of fb.width entries at TEX0.CBP */
     framebuffer_t fb;         /* level 0 */
     uint32_t      tbw;        /* GS TEX0.TBW / BITBLTBUF.DBW: buffer width in 64-texel units */
@@ -67,6 +68,16 @@ uint32_t pvk_format_bits(PvkFormat format);
 int pvk_is_color_format(PvkFormat format);
 /* Fills tbw/tw/th from fb.width and fb.height, and level 0's entries. */
 void pvk_image_texture_params(PvkImage image);
+
+/* A range of an image's mip levels: what a set samples or rendering targets. */
+struct PvkImageView_T {
+    PvkImage image;
+    uint32_t baseLevel;
+    uint32_t levels;
+};
+
+/* The view's base level as a framebuffer_t: FRAME address, width (FBW and SCISSOR), height, psm. */
+void pvk_view_framebuffer(PvkImageView view, framebuffer_t *fb);
 /* Largest depth value a depth format stores; depth is flipped so near = this. */
 float pvk_depth_max(PvkFormat format);
 
@@ -117,7 +128,7 @@ struct PvkSampler_T {
 /* What one bindings[] slot of a set holds: an image and sampler for a combined
  * image sampler, a buffer range for a uniform buffer. All NULL until written. */
 struct PvkDescriptorSlot {
-    PvkImage   image;
+    PvkImageView view;
     PvkImage   colorTable; /* for a T8/T4 image */
     PvkSampler sampler;
     PvkBuffer  buffer;
@@ -181,8 +192,8 @@ struct PvkCommandBuffer_T {
     PvkDevice   device;
     packet2_t  *packet;       /* VIF1 DMA chain */
     PvkPipeline pipeline;
-    PvkImage    colorImage;   /* attachments of the current pvkCmdBeginRendering */
-    PvkImage    depthImage;   /* or NULL */
+    PvkImageView colorView;   /* attachments of the current pvkCmdBeginRendering */
+    PvkImageView depthView;   /* or NULL */
     int         gsStateDirty; /* FRAME/ZBUF/TEST/TEX0 must be re-sent before the next draw */
     int         uniformsDirty; /* the uniform blocks' buffers must be sent to VU1 before the next draw */
     PvkDescriptorSet sets[PVK_MAX_DESCRIPTOR_SETS]; /* bound with pvkCmdBindDescriptorSets, or NULL */

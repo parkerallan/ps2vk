@@ -1,4 +1,4 @@
-/* Descriptor set layouts, pools and sets. A set holds the image and sampler
+/* Descriptor set layouts, pools and sets. A set holds the image view and sampler
  * each of its combined image sampler bindings reads and the buffer range
  * behind each uniform buffer binding; the command buffer turns the bound set
  * into GS TEX0/TEX1/CLAMP with the draw state and VIF UNPACKs of the buffers
@@ -192,6 +192,7 @@ PvkResult pvkAllocateDescriptorSets(PvkDevice device, const PvkDescriptorSetAllo
 void pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const PvkWriteDescriptorSet *writes)
 {
     uint32_t i;
+    PvkImageView view;
 
     (void)device;
 
@@ -232,14 +233,14 @@ void pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const PvkWri
             w->dstSet->slots[slot].range  = range;
             continue;
         }
-        if (!w->imageInfo || !w->imageInfo->image || !pvk_is_color_format(w->imageInfo->image->format) ||
-            w->imageInfo->image->colorTable || !w->imageInfo->sampler) {
-            pvk_error("pvkUpdateDescriptorSets: write %u needs imageInfo with a texture (a color image that is "
-                      "not a color table) and a sampler; skipped\n", (unsigned)i);
+        view = w->imageInfo ? w->imageInfo->imageView : NULL;
+        if (!view || !(view->image->usage & PVK_IMAGE_USAGE_SAMPLED_BIT) || !w->imageInfo->sampler) {
+            pvk_error("pvkUpdateDescriptorSets: write %u needs imageInfo with a view of an image created with "
+                      "PVK_IMAGE_USAGE_SAMPLED_BIT and a sampler; skipped\n", (unsigned)i);
             continue;
         }
         {
-            const PvkImage img = w->imageInfo->image, c = w->imageInfo->colorTable;
+            const PvkImage img = view->image, c = w->imageInfo->colorTable;
             int indexed = img->format == PVK_FORMAT_T8 || img->format == PVK_FORMAT_T4;
             if (indexed ? !c || !c->colorTable || (img->format == PVK_FORMAT_T8 && c->fb.width != 256) : c != NULL) {
                 pvk_error("pvkUpdateDescriptorSets: write %u: a PVK_FORMAT_T8 image needs a 256-entry colorTable, "
@@ -248,7 +249,7 @@ void pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const PvkWri
             }
             w->dstSet->slots[slot].colorTable = c;
         }
-        w->dstSet->slots[slot].image   = w->imageInfo->image;
+        w->dstSet->slots[slot].view    = view;
         w->dstSet->slots[slot].sampler = w->imageInfo->sampler;
     }
 }

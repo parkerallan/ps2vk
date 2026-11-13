@@ -1,5 +1,5 @@
-/* Images: pixel memory in GS VRAM. Depth buffers and textures are created
- * here; framebuffers come from the swapchain. */
+/* Images: pixel memory in GS VRAM. Depth buffers, textures and render targets
+ * are created here, framebuffers by the swapchain; views pick their levels. */
 #include <stdlib.h>
 
 #include "pvk_internal.h"
@@ -119,6 +119,17 @@ void pvk_image_texture_params(PvkImage image)
     image->levelTbw[0]     = image->tbw;
 }
 
+void pvk_view_framebuffer(PvkImageView view, framebuffer_t *fb)
+{
+    const PvkImage img = view->image;
+
+    fb->address = img->levelAddress[view->baseLevel];
+    fb->width   = img->fb.width >> view->baseLevel;
+    fb->height  = img->fb.height >> view->baseLevel;
+    fb->psm     = img->fb.psm;
+    fb->mask    = 0;
+}
+
 PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkImage *image)
 {
     PvkImage img;
@@ -126,6 +137,11 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     int depth = info->format == PVK_FORMAT_Z32 || info->format == PVK_FORMAT_Z24 || info->format == PVK_FORMAT_Z16;
     int table = info->height == 1 && (info->format == PVK_FORMAT_CT32 || info->format == PVK_FORMAT_CT16);
     uint32_t levels = depth || table || !info->mipLevels ? 1 : info->mipLevels, l;
+    uint32_t usage = info->usage ? info->usage
+                   : depth ? PVK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                   : table ? PVK_IMAGE_USAGE_TRANSFER_DST_BIT
+                   : PVK_IMAGE_USAGE_TRANSFER_DST_BIT | PVK_IMAGE_USAGE_SAMPLED_BIT;
+    int target = (usage & PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
 
     (void)device;
 
@@ -134,8 +150,21 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
                   "format (PVK_FORMAT_Z32/Z24/Z16)\n");
         return PVK_ERROR_FORMAT_NOT_SUPPORTED;
     }
+    if (depth ? usage != PVK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+              : (usage & ~(PVK_IMAGE_USAGE_TRANSFER_DST_BIT | PVK_IMAGE_USAGE_SAMPLED_BIT |
+                           PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) || (target && (table || pvk_format_bits(info->format) < 16))) {
+        pvk_error("pvkCreateImage: usage 0x%x does not fit format %d: a depth format is only a depth attachment, "
+                  "a color format is a transfer destination, sampled, or (CT32/CT24/CT16, not a color table) "
+                  "a color attachment\n", (unsigned)usage, (int)info->format);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     if (table && info->width != 16 && info->width != 256) {
         pvk_error("pvkCreateImage: a color table has 16 or 256 entries (%u given)\n", (unsigned)info->width);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (target && info->width < 64) {
+        pvk_error("pvkCreateImage: a color attachment is at least 64 wide (%u given): GS FRAME.FBW counts "
+                  "64-pixel units\n", (unsigned)info->width);
         return PVK_ERROR_VALIDATION_FAILED;
     }
     if (!depth && !table) {
@@ -162,8 +191,8 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     if (!img)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
 
-    /* ZBUF addresses are in 8 KB pages, TEX0 and CBP addresses in 256-byte blocks. */
-    if (depth)
+    /* FRAME and ZBUF addresses are in 8 KB pages, TEX0 and CBP addresses in 256-byte blocks. */
+    if (depth || target)
         address = graph_vram_allocate((int)info->width, (int)info->height, psm, GRAPH_ALIGN_PAGE);
     else if (table)
         address = alloc_blocks(texture_blocks(info->width == 256 ? 16 : 8, info->width == 256 ? 16 : 2,
@@ -179,6 +208,7 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     }
 
     img->format     = info->format;
+    img->usage      = usage;
     img->colorTable = table;
     img->fb.address = address;
     img->fb.width   = info->width;
@@ -191,7 +221,8 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     /* Each further level is its own block-aligned texture, half the size. */
     for (l = 1; l < levels; l++) {
         uint32_t w = info->width >> l, h = info->height >> l;
-        address = alloc_blocks(texture_blocks(w, h, info->format, buffer_width(w, info->format)));
+        address = target ? graph_vram_allocate((int)w, (int)h, psm, GRAPH_ALIGN_PAGE)
+                         : alloc_blocks(texture_blocks(w, h, info->format, buffer_width(w, info->format)));
         if (address < 0) {
             pvk_error("out of GS memory for level %u of a %ux%u texture\n", (unsigned)l, (unsigned)info->width,
                       (unsigned)info->height);
@@ -211,4 +242,40 @@ void pvkDestroyImage(PvkDevice device, PvkImage image)
     /* graph_vram_free only rewinds the allocator, so the VRAM stays taken. */
     (void)device;
     free(image);
+}
+
+PvkResult pvkCreateImageView(PvkDevice device, const PvkImageViewCreateInfo *info, PvkImageView *view)
+{
+    PvkImageView v;
+    uint32_t levels;
+
+    (void)device;
+
+    if (!info->image || (info->format != PVK_FORMAT_UNDEFINED && info->format != info->image->format)) {
+        pvk_error("pvkCreateImageView: needs an image, and format must be its format or PVK_FORMAT_UNDEFINED\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    levels = info->levelCount == PVK_REMAINING_MIP_LEVELS && info->baseMipLevel < info->image->levels
+           ? info->image->levels - info->baseMipLevel : info->levelCount;
+    if (levels == 0 || info->baseMipLevel >= info->image->levels || levels > info->image->levels - info->baseMipLevel) {
+        pvk_error("pvkCreateImageView: levels %u to %u, but the image has %u\n", (unsigned)info->baseMipLevel,
+                  (unsigned)(info->baseMipLevel + info->levelCount), (unsigned)info->image->levels);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+
+    v = calloc(1, sizeof(struct PvkImageView_T));
+    if (!v)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    v->image     = info->image;
+    v->baseLevel = info->baseMipLevel;
+    v->levels    = levels;
+
+    *view = v;
+    return PVK_SUCCESS;
+}
+
+void pvkDestroyImageView(PvkDevice device, PvkImageView view)
+{
+    (void)device;
+    free(view);
 }

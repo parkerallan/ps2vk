@@ -147,21 +147,41 @@ PvkResult pvkDeviceWaitIdle(PvkDevice device);
  * The practical rule: start with T8, drop to T4 for flat art, go up to CT16
  * only when a palette visibly fails, and reserve CT32 for the few textures
  * where alpha gradients or exact values matter.
+ *
+ * A texture created with PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT can also be
+ * rendered into: pvkCmdBeginRendering() points GS FRAME at its VRAM instead
+ * of a swapchain image's, and a later draw samples the same VRAM through
+ * TEX0, which is how the PS2 did mirrors, in-game screens and post effects.
+ * Such an image gets page-aligned VRAM (FRAME addresses in 8 KB pages, where
+ * a plain texture only needs 256-byte blocks) and must be at least 64 wide,
+ * the unit of FRAME.FBW. Everything that reads or renders an image goes
+ * through a PvkImageView, as in Vulkan; a view picks the mip levels used.
  * @{
  */
 
-/** @brief An image in GS VRAM: a swapchain framebuffer, a depth buffer or a texture. */
+/** @brief An image in GS VRAM: a swapchain framebuffer, a depth buffer, a texture or a render target. */
 typedef struct PvkImage_T         *PvkImage;
+/** @brief A way of using an image: the levels a texture is sampled through, or the one level rendered into. */
+typedef struct PvkImageView_T     *PvkImageView;
 
 /** @brief Most mip levels a texture has: GS TEX1.MXL goes up to 6. */
 #define PVK_MAX_MIP_LEVELS 7
 
+/** @brief What an image is used for. Values match Vulkan's VkImageUsageFlagBits. */
+typedef enum PvkImageUsageFlagBits {
+    PVK_IMAGE_USAGE_TRANSFER_DST_BIT             = 0x02, /**< Filled by pvkCmdCopyBufferToImage(): a texture or color table. */
+    PVK_IMAGE_USAGE_SAMPLED_BIT                  = 0x04, /**< Read through a combined image sampler binding: GS TEX0. */
+    PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT         = 0x10, /**< Rendered into as the color attachment: GS FRAME. Page-aligned VRAM, PVK_FORMAT_CT32/CT24/CT16, at least 64 wide. */
+    PVK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT = 0x20  /**< Rendered into as the depth attachment: GS ZBUF. */
+} PvkImageUsageFlagBits;
+
 /** @brief Parameters for pvkCreateImage(). */
 typedef struct PvkImageCreateInfo {
-    uint32_t  width;     /**< Width in pixels; a depth buffer must be as wide as the framebuffer it is used with, a texture a power of two from 8 to 1024, a color table 16 or 256 (its entries). */
+    uint32_t  width;     /**< Width in pixels; a depth buffer must be as wide as the color attachment it is used with, a texture a power of two from 8 to 1024 (64 or more when it is also a color attachment), a color table 16 or 256 (its entries). */
     uint32_t  height;    /**< Height in pixels; a texture a power of two from 8 to 1024, a color table 1. */
     uint32_t  mipLevels; /**< Texture only: number of mip levels, 0 or 1 for the base level alone, up to PVK_MAX_MIP_LEVELS. Each level halves the one before and must stay at least 8 on each side. */
     PvkFormat format;    /**< PVK_FORMAT_CT32, PVK_FORMAT_CT24, PVK_FORMAT_CT16, PVK_FORMAT_T8 or PVK_FORMAT_T4 for a texture; PVK_FORMAT_CT32 or PVK_FORMAT_CT16 for a color table; PVK_FORMAT_Z32, PVK_FORMAT_Z24 or PVK_FORMAT_Z16 for a depth buffer. */
+    uint32_t  usage;     /**< PvkImageUsageFlagBits ORed together, or 0 for the format's usual use: TRANSFER_DST and SAMPLED for a texture, TRANSFER_DST for a color table, DEPTH_STENCIL_ATTACHMENT for a depth format. */
 } PvkImageCreateInfo;
 
 /**
@@ -171,6 +191,8 @@ typedef struct PvkImageCreateInfo {
  * each of its mip levels with pvkCmdCopyBufferToImage() and sample it
  * through a descriptor set (see @ref descriptors). Every level gets its own
  * VRAM, addressed by GS TEX0 and MIPTBP1/MIPTBP2 when the texture is bound.
+ * With PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT in usage each level is page
+ * aligned so it can be rendered into as well (see @ref images).
  * A PVK_FORMAT_CT32 or PVK_FORMAT_CT16 image 16 or 256 wide and 1 high is
  * a color table: the palette a PVK_FORMAT_T4 or PVK_FORMAT_T8 texture's
  * indices pick colors from (GS TEX0.CBP/CPSM, loaded in CSM1 layout). A table
@@ -184,8 +206,9 @@ typedef struct PvkImageCreateInfo {
  * @param device The device.
  * @param info Image parameters.
  * @param[out] image The new image.
- * @return PVK_SUCCESS, PVK_ERROR_FORMAT_NOT_SUPPORTED, PVK_ERROR_OUT_OF_DEVICE_MEMORY
- *         or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ * @return PVK_SUCCESS, PVK_ERROR_FORMAT_NOT_SUPPORTED, PVK_ERROR_VALIDATION_FAILED
+ *         for a usage the format can't have, PVK_ERROR_OUT_OF_DEVICE_MEMORY or
+ *         PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
 PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkImage *image);
 
@@ -195,6 +218,44 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
  * @param image Image to destroy.
  */
 void      pvkDestroyImage(PvkDevice device, PvkImage image);
+
+/** @brief Every level from baseMipLevel on, as the levelCount of a PvkImageViewCreateInfo. */
+#define PVK_REMAINING_MIP_LEVELS (~0u)
+
+/** @brief Parameters for pvkCreateImageView(), like VkImageViewCreateInfo. */
+typedef struct PvkImageViewCreateInfo {
+    PvkImage  image;        /**< The image viewed. */
+    PvkFormat format;       /**< The image's format, or PVK_FORMAT_UNDEFINED for it; the GS reads VRAM in the format it was written in. */
+    uint32_t  baseMipLevel; /**< First mip level of the view; level 0 is the image's full size. */
+    uint32_t  levelCount;   /**< Levels from baseMipLevel on, or PVK_REMAINING_MIP_LEVELS; 1 for a view rendered into. */
+} PvkImageViewCreateInfo;
+
+/**
+ * @brief Creates a view of an image: the mip levels a binding samples or the level rendered into.
+ *
+ * A view of a texture goes into a PvkDescriptorImageInfo: TEX0 then points at
+ * its base level (a smaller TW/TH when it is not level 0) and MIPTBP1/2 at the
+ * levels after it, so one image can be sampled at full size by one set and
+ * from a lower level by another. A view of one level of a color attachment
+ * image, a swapchain image or a depth image goes into a
+ * PvkRenderingAttachmentInfo. Views cost nothing on the PS2: they are a
+ * record of the image and level range, read when a set is written or
+ * rendering begins.
+ *
+ * @param device The device.
+ * @param info The image and its levels.
+ * @param[out] view The new view.
+ * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED for levels the image lacks or
+ *         a format other than the image's, or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ */
+PvkResult pvkCreateImageView(PvkDevice device, const PvkImageViewCreateInfo *info, PvkImageView *view);
+
+/**
+ * @brief Destroys an image view. Sets that hold it must not be drawn with afterwards.
+ * @param device The device.
+ * @param view View to destroy.
+ */
+void      pvkDestroyImageView(PvkDevice device, PvkImageView view);
 
 /** @} */
 
@@ -805,7 +866,7 @@ typedef struct PvkDescriptorSet_T       *PvkDescriptorSet;
 
 /** @brief What a descriptor binding holds. Values match Vulkan's VkDescriptorType. */
 typedef enum PvkDescriptorType {
-    PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = 1, /**< A texture (and its color table) a sampler2D reads: GS TEX0. */
+    PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = 1, /**< An image view (and its color table) a sampler2D reads: GS TEX0. */
     PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER         = 6  /**< Part of a PvkBuffer a vertex shader's uniform block reads: VIF UNPACK into VU1 memory. */
 } PvkDescriptorType;
 
@@ -908,9 +969,9 @@ PvkResult pvkAllocateDescriptorSets(PvkDevice device, const PvkDescriptorSetAllo
 
 /** @brief The image and sampler a combined image sampler binding reads, like VkDescriptorImageInfo. */
 typedef struct PvkDescriptorImageInfo {
-    PvkSampler sampler;    /**< How the image is read (see @ref samplers). */
-    PvkImage   image;      /**< A texture of any color format, or a swapchain image. */
-    PvkImage   colorTable; /**< For a PVK_FORMAT_T8 or PVK_FORMAT_T4 image, the color table its indices read (256 entries, or 16 for T4); NULL for other formats. */
+    PvkSampler   sampler;    /**< How the image is read (see @ref samplers). */
+    PvkImageView imageView;  /**< A view of an image with PVK_IMAGE_USAGE_SAMPLED_BIT: a texture, a render target or a swapchain image. Its base level is what texture coordinates 0 to 1 cover. */
+    PvkImage     colorTable; /**< For a PVK_FORMAT_T8 or PVK_FORMAT_T4 image, the color table its indices read (256 entries, or 16 for T4); NULL for other formats. */
 } PvkDescriptorImageInfo;
 
 /** @brief The rest of a buffer, as the range of a PvkDescriptorBufferInfo. */
@@ -1000,7 +1061,7 @@ typedef struct PvkRect2D {
 
 /** @brief An image to render into and how to start it. */
 typedef struct PvkRenderingAttachmentInfo {
-    PvkImage            image;      /**< Target image: a swapchain image, or a depth image; NULL for no attachment. */
+    PvkImageView        imageView;  /**< A one-level view of the target: a swapchain image or a PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT image for color, a depth image for depth; NULL for no attachment. */
     PvkAttachmentLoadOp loadOp;     /**< What to do with its contents first. */
     PvkClearValue       clearValue; /**< Value used when loadOp is CLEAR. */
 } PvkRenderingAttachmentInfo;
@@ -1008,14 +1069,17 @@ typedef struct PvkRenderingAttachmentInfo {
 /**
  * @brief Parameters for pvkCmdBeginRendering(), like Vulkan 1.3 dynamic rendering.
  *
- * The depth attachment is optional (image NULL). When present it must be as
- * wide as the color attachment, since the GS gives both buffers one width, and
- * the pipelines drawn with it must name its format in depthAttachmentFormat.
+ * The depth attachment is optional (imageView NULL). When present it must be
+ * as wide as the color attachment's level, since the GS gives both buffers one
+ * width, and the pipelines drawn with it must name its format in
+ * depthAttachmentFormat. Rendering into a texture and sampling it later in the
+ * same command buffer needs nothing more: the draw state sent before the
+ * sampling draw includes a GS TEXFLUSH.
  */
 typedef struct PvkRenderingInfo {
-    PvkRect2D                  renderArea;      /**< Area to render (and clear). */
+    PvkRect2D                  renderArea;      /**< Area to render (and clear), in pixels of the attachment's level. */
     PvkRenderingAttachmentInfo colorAttachment; /**< The color image. */
-    PvkRenderingAttachmentInfo depthAttachment; /**< The depth image, or image NULL for none. */
+    PvkRenderingAttachmentInfo depthAttachment; /**< The depth image, or imageView NULL for none. */
 } PvkRenderingInfo;
 
 /**
@@ -1051,8 +1115,11 @@ PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd);
 /**
  * @brief Starts rendering into a color image and optionally a depth image, clearing them if requested.
  *
- * Sets GS FRAME, ZBUF and XYOFFSET. A clear is a sprite fill over the render
- * area; depth and color are cleared in one pass when both ask for it.
+ * Sets GS FRAME, ZBUF, SCISSOR (the attachment level's size) and XYOFFSET. A
+ * clear is a sprite fill over the render area; depth and color are cleared in
+ * one pass when both ask for it. The color attachment may be a swapchain
+ * image or any level of a PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT texture; the
+ * pipelines drawn with it should have a viewport of that level's size.
  *
  * @param cmd The command buffer.
  * @param info Target images, render area and load operations.

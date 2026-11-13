@@ -43,6 +43,7 @@ int main(void)
     PvkQueue queue;
     PvkSwapchain swapchain;
     PvkImage images[2];
+    PvkImageView views[2];
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer;
     PvkShaderModule vs, fs;
@@ -63,6 +64,10 @@ int main(void)
     };
     CHECK(pvkCreateSwapchain(device, &swapchainInfo, &swapchain));
     CHECK(pvkGetSwapchainImages(device, swapchain, &imageCount, images));
+    for (uint32_t i = 0; i < imageCount; i++) {
+        PvkImageViewCreateInfo viewInfo = { .image = images[i], .levelCount = 1 };
+        CHECK(pvkCreateImageView(device, &viewInfo, &views[i]));
+    }
 
     PvkBufferCreateInfo bufferInfo = { .size = sizeof(vertices) };
     CHECK(pvkCreateBuffer(device, &bufferInfo, &vertexBuffer));
@@ -124,7 +129,7 @@ int main(void)
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },
             .colorAttachment = {
-                .image      = images[imageIndex],
+                .imageView  = views[imageIndex],
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
                 .clearValue = { .color = { { 0.1f, 0.1f, 0.2f, 1.0f } } },
             },

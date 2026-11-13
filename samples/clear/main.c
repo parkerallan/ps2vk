@@ -25,6 +25,7 @@ int main(void)
     PvkQueue queue;
     PvkSwapchain swapchain;
     PvkImage images[2];
+    PvkImageView views[2];
     uint32_t imageCount = 2;
     PvkCommandBuffer cmd;
     PvkFence fence;
@@ -40,6 +41,10 @@ int main(void)
     };
     CHECK(pvkCreateSwapchain(device, &swapchainInfo, &swapchain));
     CHECK(pvkGetSwapchainImages(device, swapchain, &imageCount, images));
+    for (uint32_t i = 0; i < imageCount; i++) {
+        PvkImageViewCreateInfo viewInfo = { .image = images[i], .levelCount = 1 };
+        CHECK(pvkCreateImageView(device, &viewInfo, &views[i]));
+    }
     CHECK(pvkCreateCommandBuffer(device, NULL, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
 
@@ -55,7 +60,7 @@ int main(void)
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },
             .colorAttachment = {
-                .image      = images[imageIndex],
+                .imageView  = views[imageIndex],
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
                 .clearValue = { .color = { { t, 0.3f, 1.0f - t, 1.0f } } },
             },
