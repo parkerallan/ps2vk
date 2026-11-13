@@ -715,27 +715,35 @@ static uint32_t batch_qwords(uint32_t vertexQwords, uint32_t indices)
     return n;
 }
 
+/* 1 when the bound sampler takes texture coordinates in texels (PRIM.FST). */
+static uint32_t cmd_fst(PvkCommandBuffer cmd)
+{
+    const PvkPipeline p = cmd->pipeline;
+    return p->fs->textured ? cmd->sets[p->samplerSet]->slots[p->samplerSlot].sampler->fst : 0;
+}
+
 /* Batch header: the GIF tag VU1 copies to its output, how many vertices to
- * process, for an indexed batch where the index list starts, and the winding
+ * process, for an indexed batch where the index list starts, the winding
  * sign to cull with (flipped for an odd strip triangle at draw position
- * `first`). The previous batch must be finished before its memory is
- * overwritten, so a flush comes first. */
+ * `first`) and whether to store UV instead of ST. The previous batch must be
+ * finished before its memory is overwritten, so a flush comes first. */
 static void batch_begin(PvkCommandBuffer cmd, uint32_t count, uint32_t indexOffset, uint32_t first)
 {
     const PvkPipeline p = cmd->pipeline;
+    uint32_t fst = cmd_fst(cmd);
     u64 regs = p->outputQwords == PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED
-             ? GIF_REG_ST | (GIF_REG_RGBAQ << 4) | (GIF_REG_XYZ2 << 8)
+             ? (fst ? GIF_REG_UV : GIF_REG_ST) | (GIF_REG_RGBAQ << 4) | (GIF_REG_XYZ2 << 8)
              : GIF_REG_RGBAQ | (GIF_REG_XYZ2 << 4);
 
     cmd_flush(cmd);
     packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_INPUT_ADDR, 0);
     packet2_add_2x_s64(cmd->packet,
-                       GIF_SET_TAG(count, 1, 1, p->prim, GIF_FLG_PACKED, p->outputQwords),
+                       GIF_SET_TAG(count, 1, 1, p->prim | (fst ? PVK_PRIM_FST : 0), GIF_FLG_PACKED, p->outputQwords),
                        regs);
     packet2_add_u32(cmd->packet, count);
     packet2_add_u32(cmd->packet, indexOffset);
     packet2_add_float(cmd->packet, p->strip && (first & 1) ? -p->cullSign : p->cullSign);
-    packet2_add_u32(cmd->packet, 0);
+    packet2_add_u32(cmd->packet, fst);
     packet2_utils_vu_close_unpack(cmd->packet);
 }
 

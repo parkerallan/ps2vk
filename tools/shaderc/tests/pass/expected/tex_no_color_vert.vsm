@@ -3,7 +3,7 @@
 ; VU1 registers:
 ;   VF01 viewport scale, VF02 viewport offset, VF03 color scale
 ;   VF10.. shader inputs, VF20 gl_Position, VF21 color output
-;   VF19 texture coordinate output (S, T, Q)
+;   VF19 texture coordinate output (S, T, Q, or U, V)
 ;   VF25-VF26 the previous two screen positions (culling)
 ;   VF05-VF09, VF18-VF19, VF27-VF31 push constants, uniforms, constants and temporaries
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
@@ -52,18 +52,25 @@ tex_no_color_vert_fetch:
          NOP                                      move.xyzw     VF21,VF00                  ; no color output: black
          NOP                                      move.xy       VF19,VF11                  ; texture coordinate output, location 3
 ; epilogue: perspective divide, viewport, GS formats, store
+         NOP                                      ilw.w         VI13,1(VI01)               ; 1 = UV in texels (PRIM.FST)
          NOP                                      div           Q,VF00w,VF20w              ; Q = 1 / w
          NOP                                      waitq
          mulq.xyz      VF22,VF20,Q                NOP
+         NOP                                      ibne          VI13,VI00,tex_no_color_vert_uv
+         NOP                                      NOP                                      ; branch delay slot
          mulq.xy       VF19,VF19,Q                NOP                                      ; S / w, T / w
-         addq.z        VF19,VF00,Q                NOP                                      ; Q = 1 / w
+         NOP                                      b             tex_no_color_vert_st
+         addq.z        VF19,VF00,Q                NOP                                      ; delay slot: Q = 1 / w
+tex_no_color_vert_uv:
+         ftoi4.xy      VF19,VF19                  NOP                                      ; U, V to 12.4 fixed point
+tex_no_color_vert_st:
          mul.xyz       VF22,VF22,VF01             NOP                                      ; viewport scale
          add.xyz       VF22,VF22,VF02             NOP                                      ; viewport offset
          ftoi4.xy      VF23,VF22                  NOP                                      ; x, y to 12.4 fixed point
          ftoi0.z       VF23,VF22                  NOP                                      ; z to integer depth
          mul.xyzw      VF24,VF21,VF03             NOP                                      ; color 0..1 to GS range
          ftoi0.xyzw    VF24,VF24                  NOP
-         NOP                                      sq            VF19,0(VI05)               ; ST (and Q)
+         NOP                                      sq            VF19,0(VI05)               ; ST (and Q), or UV
          NOP                                      sq            VF24,1(VI05)               ; RGBAQ
 ; culling: test the triangle this vertex completes
          sub.w         VF23,VF00,VF00             isubiu        VI11,VI11,1                ; ADC off; one vertex closer to a triangle

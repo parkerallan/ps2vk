@@ -108,7 +108,11 @@ struct PvkSampler_T {
     uint32_t maxLevel;   /* TEX1.MXL cap from maxLod */
     uint32_t k;          /* TEX1.K: mipLodBias as signed 7.4 fixed point */
     uint32_t wms, wmt;   /* CLAMP.WMS/WMT: WRAP_* */
+    uint32_t fst;        /* PRIM.FST: coordinates in texels, stored as UV */
 };
+
+/* PRIM.FST, ORed into a pipeline's prim for a draw with such a sampler. */
+#define PVK_PRIM_FST (1ULL << 8)
 
 /* What one bindings[] slot of a set holds: an image and sampler for a combined
  * image sampler, a buffer range for a uniform buffer. All NULL until written. */

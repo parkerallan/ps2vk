@@ -1998,7 +1998,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, ";   VF01 viewport scale, VF02 viewport offset, VF03 color scale\n");
     fprintf(f, ";   VF10.. shader inputs, VF20 gl_Position, VF21 color output\n");
     if (sh->texcoordValue)
-        fprintf(f, ";   VF%02d texture coordinate output (S, T, Q)\n", PVK_VU1_TEXCOORD_REG);
+        fprintf(f, ";   VF%02d texture coordinate output (S, T, Q, or U, V)\n", PVK_VU1_TEXCOORD_REG);
     fprintf(f, ";   VF25-VF26 the previous two screen positions (culling)\n");
     fprintf(f, ";   VF05-VF09, VF18-VF19, VF27-VF31 push constants, uniforms, constants and temporaries\n");
     fprintf(f, ";   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer\n");
@@ -2125,16 +2125,30 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     }
 
     fprintf(f, "; epilogue: perspective divide, viewport, GS formats, store\n");
+    if (sh->texcoordValue) {
+        snprintf(buf, sizeof(buf), "ilw.w         VI13,%d(VI01)", PVK_VU1_INPUT_COUNT);
+        vu(f, "NOP", buf, "1 = UV in texels (PRIM.FST)");
+    }
     vu(f, "NOP", "div           Q,VF00w,VF20w", "Q = 1 / w");
     vu(f, "NOP", "waitq", NULL);
     vu(f, "mulq.xyz      VF22,VF20,Q", "NOP", NULL);
     if (sh->texcoordValue) {
         /* The GS interpolates S/w, T/w and Q = 1/w and divides per pixel, which
-         * makes the texture perspective correct. */
+         * makes the texture perspective correct. With FST it takes U, V in
+         * 12.4 texels as is. */
+        snprintf(buf, sizeof(buf), "ibne          VI13,VI00,%s_uv", sym);
+        vu(f, "NOP", buf, NULL);
+        vu(f, "NOP", "NOP", "branch delay slot");
         snprintf(buf, sizeof(buf), "mulq.xy       VF%02d,VF%02d,Q", PVK_VU1_TEXCOORD_REG, PVK_VU1_TEXCOORD_REG);
         vu(f, buf, "NOP", "S / w, T / w");
+        snprintf(buf, sizeof(buf), "b             %s_st", sym);
+        vu(f, "NOP", buf, NULL);
         snprintf(buf, sizeof(buf), "addq.z        VF%02d,VF00,Q", PVK_VU1_TEXCOORD_REG);
-        vu(f, buf, "NOP", "Q = 1 / w");
+        vu(f, buf, "NOP", "delay slot: Q = 1 / w");
+        fprintf(f, "%s_uv:\n", sym);
+        snprintf(buf, sizeof(buf), "ftoi4.xy      VF%02d,VF%02d", PVK_VU1_TEXCOORD_REG, PVK_VU1_TEXCOORD_REG);
+        vu(f, buf, "NOP", "U, V to 12.4 fixed point");
+        fprintf(f, "%s_st:\n", sym);
     }
     vu(f, "mul.xyz       VF22,VF22,VF01", "NOP", "viewport scale");
     vu(f, "add.xyz       VF22,VF22,VF02", "NOP", "viewport offset");
@@ -2144,7 +2158,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     vu(f, "ftoi0.xyzw    VF24,VF24", "NOP", NULL);
     if (sh->texcoordValue) {
         snprintf(buf, sizeof(buf), "sq            VF%02d,0(VI05)", PVK_VU1_TEXCOORD_REG);
-        vu(f, "NOP", buf, "ST (and Q)");
+        vu(f, "NOP", buf, "ST (and Q), or UV");
         vu(f, "NOP", "sq            VF24,1(VI05)", "RGBAQ");
     } else {
         vu(f, "NOP", "sq            VF24,0(VI05)", "RGBAQ");

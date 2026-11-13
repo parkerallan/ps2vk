@@ -1,5 +1,5 @@
 /* Samplers: the filter, LOD and wrap fields of GS TEX1 and CLAMP, written with
- * the draw state for the texture bound next to them. */
+ * the draw state for the texture bound next to them, and PRIM.FST per batch. */
 #include <math.h>
 #include <stdlib.h>
 
@@ -50,6 +50,13 @@ PvkResult pvkCreateSampler(PvkDevice device, const PvkSamplerCreateInfo *info, P
         pvk_error("pvkCreateSampler: mipLodBias %f is outside TEX1.K's range, -128 to 127.9375\n", info->mipLodBias);
         return PVK_ERROR_VALIDATION_FAILED;
     }
+    if (info->unnormalizedCoordinates &&
+        (info->magFilter != info->minFilter || info->mipmapMode != PVK_SAMPLER_MIPMAP_MODE_NEAREST ||
+         info->maxLod != 0.0f || wms != WRAP_CLAMP || wmt != WRAP_CLAMP)) {
+        pvk_error("pvkCreateSampler: unnormalizedCoordinates needs magFilter == minFilter, "
+                  "PVK_SAMPLER_MIPMAP_MODE_NEAREST, maxLod 0 and PVK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE on both axes\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     if (info->minLod != 0.0f || !(info->maxLod >= 0.0f)) {
         pvk_error("pvkCreateSampler: minLod %f, maxLod %f; the GS only clamps the LOD from above, so minLod "
                   "must be 0 and maxLod at least 0\n", info->minLod, info->maxLod);
@@ -68,6 +75,7 @@ PvkResult pvkCreateSampler(PvkDevice device, const PvkSamplerCreateInfo *info, P
     s->k    = (uint32_t)(int32_t)k & 0xFFF;
     s->wms  = (uint32_t)wms;
     s->wmt  = (uint32_t)wmt;
+    s->fst  = info->unnormalizedCoordinates ? 1 : 0;
 
     *sampler = s;
     return PVK_SUCCESS;

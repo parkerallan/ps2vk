@@ -10,7 +10,8 @@
  *   80  input:   GIF tag for this batch, a count qword, then vertices, then
  *       for an indexed batch the 16-bit indices, one per qword (VIF UNPACK S_16)
  *   512 output:  GIF tag, then per vertex RGBAQ, XYZ2 (sent with XGKICK), or
- *       ST, RGBAQ, XYZ2 when the vertex shader writes a texture coordinate
+ *       ST (UV for a sampler with unnormalized coordinates), RGBAQ, XYZ2 when
+ *       the vertex shader writes a texture coordinate
  */
 #ifndef PS2VK_VU1_LAYOUT_H
 #define PS2VK_VU1_LAYOUT_H
@@ -35,14 +36,15 @@
 #define PVK_VU1_INPUT_COUNT       1   /* x: vertices to process; y: qword offset from the
                                          input base of the index list, 0 = vertices in order;
                                          z: float, winding sign of the batch's first triangle
-                                         (signed area * z < 0 = cull), VU1 flips it per triangle */
+                                         (signed area * z < 0 = cull), VU1 flips it per triangle;
+                                         w: int, 1 = store UV (texels, 12.4) instead of ST and Q */
 #define PVK_VU1_INPUT_HEADER      2   /* qwords before the first vertex */
 
 #define PVK_VU1_OUTPUT_ADDR       512
 #define PVK_VU1_OUTPUT_PER_VERTEX 2   /* RGBAQ, XYZ2 */
 #define PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED 3 /* ST, RGBAQ, XYZ2 */
 
-/* VF register a textured vertex shader builds its ST (S/w, T/w, Q = 1/w) output in. */
+/* VF register a textured vertex shader builds its ST (S/w, T/w, Q = 1/w) or UV output in. */
 #define PVK_VU1_TEXCOORD_REG      19
 
 #define PVK_VU1_MEMORY_QWORDS     1024

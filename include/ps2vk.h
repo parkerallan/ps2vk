@@ -217,6 +217,14 @@ void      pvkDestroyImage(PvkDevice device, PvkImage image);
  * pixels)) for a perspective projection. The same LOD picks magFilter when it
  * is below 0 and minFilter otherwise. minLod must be 0 (the GS cannot clamp
  * from below); maxLod lowers MXL below the image's last level.
+ *
+ * With unnormalizedCoordinates the vertex shader's vec2 output is in texels
+ * rather than 0 to 1, for sprite sheets and text. Draws with such a sampler
+ * set GS PRIM.FST and store a UV register (12.4 fixed point) in place of
+ * ST and Q: VU1 skips the divide by w, so the texture is not perspective
+ * correct. As in Vulkan the sampler must then clamp to edge on both axes,
+ * use one filter for both magFilter and minFilter, nearest mipmapping and
+ * maxLod 0.
  * @{
  */
 
@@ -257,6 +265,7 @@ typedef struct PvkSamplerCreateInfo {
     float                 mipLodBias;   /**< Added to log2(w) to get the LOD (see @ref samplers); -128 to 127.9375, rounded to 1/16. GS TEX1.K. */
     float                 minLod;       /**< Must be 0: the GS has no lower LOD clamp. */
     float                 maxLod;       /**< Highest level used: 0 is the base level alone, PVK_LOD_CLAMP_NONE every level. The whole part becomes GS TEX1.MXL, capped at the image's last level. */
+    uint32_t              unnormalizedCoordinates; /**< Nonzero: texture coordinates are in texels, not 0 to 1 (see @ref samplers). GS PRIM.FST with UV. */
 } PvkSamplerCreateInfo;
 
 /**
@@ -266,8 +275,9 @@ typedef struct PvkSamplerCreateInfo {
  * @param[out] sampler The new sampler.
  * @return PVK_SUCCESS, PVK_ERROR_FEATURE_NOT_PRESENT for an address mode the GS
  *         lacks or a minLod other than 0, PVK_ERROR_VALIDATION_FAILED for a
- *         value outside the enums or a mipLodBias outside TEX1.K's range, or
- *         PVK_ERROR_OUT_OF_HOST_MEMORY.
+ *         value outside the enums, a mipLodBias outside TEX1.K's range or
+ *         unnormalizedCoordinates with filters, mipmapping, maxLod or address
+ *         modes Vulkan forbids with it, or PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
 PvkResult pvkCreateSampler(PvkDevice device, const PvkSamplerCreateInfo *info, PvkSampler *sampler);
 
@@ -510,7 +520,7 @@ typedef struct PvkShaderCode {
     uint32_t        inputCount;            /**< Vertex: number of inputs, each one vec4. */
     uint32_t        inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< Vertex: input locations, in the order VU1 reads them. */
     int32_t         colorOutputLocation;   /**< Vertex: location of the color output, or -1 if none. */
-    int32_t         texcoordOutputLocation;/**< Vertex: location of the vec2 texture coordinate output, or -1 if none. When set, VU1 emits ST, RGBAQ, XYZ2 per vertex instead of RGBAQ, XYZ2. */
+    int32_t         texcoordOutputLocation;/**< Vertex: location of the vec2 texture coordinate output, or -1 if none. When set, VU1 emits ST (or UV for a sampler with unnormalizedCoordinates), RGBAQ, XYZ2 per vertex instead of RGBAQ, XYZ2. */
     uint32_t        pushConstantBytes;     /**< Vertex: size of its push constant block, 0 if it has none. */
     uint32_t        uniformBlockCount;     /**< Vertex: number of entries in uniformBlocks. */
     PvkShaderUniformBlock uniformBlocks[PVK_MAX_UNIFORM_BLOCKS]; /**< Vertex: its uniform blocks, in (set, binding) order. */
