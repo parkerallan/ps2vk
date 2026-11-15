@@ -160,6 +160,8 @@ static void mat_perspective(float *m, float fovY, float aspect, float near, floa
 int main(void)
 {
     PvkInstance instance;
+    PvkPhysicalDevice physicalDevice;
+    uint32_t physicalDeviceCount = 1;
     PvkDevice device;
     PvkQueue queue;
     PvkSwapchain swapchain;
@@ -187,7 +189,8 @@ int main(void)
 
     PvkInstanceCreateInfo instanceInfo = { .applicationName = "lighting" };
     CHECK(pvkCreateInstance(&instanceInfo, &instance));
-    CHECK(pvkCreateDevice(instance, NULL, &device));
+    CHECK(pvkEnumeratePhysicalDevices(instance, &physicalDeviceCount, &physicalDevice));
+    CHECK(pvkCreateDevice(physicalDevice, NULL, &device));
     pvkGetDeviceQueue(device, &queue);
 
     PvkSwapchainCreateInfo swapchainInfo = {

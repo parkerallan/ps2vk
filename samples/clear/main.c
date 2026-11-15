@@ -21,7 +21,12 @@
 int main(void)
 {
     PvkInstance instance;
+    PvkPhysicalDevice physicalDevice;
+    uint32_t physicalDeviceCount = 1;
     PvkDevice device;
+    PvkPhysicalDeviceProperties properties;
+    PvkPhysicalDeviceFeatures features;
+    PvkPhysicalDeviceMemoryProperties memory;
     PvkQueue queue;
     PvkSwapchain swapchain;
     PvkImage images[2];
@@ -33,7 +38,20 @@ int main(void)
 
     PvkInstanceCreateInfo instanceInfo = { .applicationName = "clear" };
     CHECK(pvkCreateInstance(&instanceInfo, &instance));
-    CHECK(pvkCreateDevice(instance, NULL, &device));
+    CHECK(pvkEnumeratePhysicalDevices(instance, &physicalDeviceCount, &physicalDevice));
+    pvkGetPhysicalDeviceProperties(physicalDevice, &properties);
+    pvkGetPhysicalDeviceFeatures(physicalDevice, &features);
+    pvkGetPhysicalDeviceMemoryProperties(physicalDevice, &memory);
+    printf("clear: %s, API %u.%u, textures up to %u with %u mip levels, %u bytes of push constants, "
+           "%u descriptor sets, %u vertex bindings, robustBufferAccess %u\n",
+           properties.deviceName, (unsigned)(properties.apiVersion >> 22), (unsigned)((properties.apiVersion >> 12) & 0x3ff),
+           (unsigned)properties.limits.maxImageDimension2D, (unsigned)properties.limits.maxMipLevels,
+           (unsigned)properties.limits.maxPushConstantsSize, (unsigned)properties.limits.maxBoundDescriptorSets,
+           (unsigned)properties.limits.maxVertexInputBindings, (unsigned)features.robustBufferAccess);
+    for (uint32_t i = 0; i < memory.memoryHeapCount; i++)
+        printf("clear: heap %u: %u KB%s\n", (unsigned)i, (unsigned)(memory.memoryHeaps[i].size >> 10),
+               memory.memoryHeaps[i].flags & PVK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " (GS VRAM)" : "");
+    CHECK(pvkCreateDevice(physicalDevice, NULL, &device));
     pvkGetDeviceQueue(device, &queue);
 
     PvkSwapchainCreateInfo swapchainInfo = {

@@ -169,19 +169,20 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     }
     if (!depth && !table) {
         /* The GS addresses a texture by log2 size (TEX0.TW/TH), so a texture is a
-         * power of two on each side, up to the 1024 the GS samples. */
-        if (info->width < 8 || info->height < 8 || info->width > 1024 || info->height > 1024 ||
+         * power of two on each side, up to maxImageDimension2D. */
+        if (info->width < 8 || info->height < 8 || info->width > pvk_limits.maxImageDimension2D ||
+            info->height > pvk_limits.maxImageDimension2D ||
             (info->width & (info->width - 1)) || (info->height & (info->height - 1))) {
-            pvk_error("pvkCreateImage: a texture must be a power of two from 8 to 1024 on each side "
-                      "(%ux%u given); a color table is 16 or 256 by 1\n", (unsigned)info->width,
-                      (unsigned)info->height);
+            pvk_error("pvkCreateImage: a texture must be a power of two from 8 to %u on each side "
+                      "(%ux%u given); a color table is 16 or 256 by 1\n", (unsigned)pvk_limits.maxImageDimension2D,
+                      (unsigned)info->width, (unsigned)info->height);
             return PVK_ERROR_FEATURE_NOT_PRESENT;
         }
         /* MXL is 3 bits (levels 0 to 6); the smallest level keeps the 8-texel minimum. */
-        if (levels > PVK_MAX_MIP_LEVELS || (info->width >> (levels - 1)) < 8 || (info->height >> (levels - 1)) < 8) {
+        if (levels > pvk_limits.maxMipLevels || (info->width >> (levels - 1)) < 8 || (info->height >> (levels - 1)) < 8) {
             pvk_error("pvkCreateImage: %u mip levels, but a %ux%u texture has at most %u (each at least 8 "
-                      "on each side, up to PVK_MAX_MIP_LEVELS)\n", (unsigned)levels, (unsigned)info->width,
-                      (unsigned)info->height, (unsigned)PVK_MAX_MIP_LEVELS);
+                      "on each side, up to maxMipLevels)\n", (unsigned)levels, (unsigned)info->width,
+                      (unsigned)info->height, (unsigned)pvk_limits.maxMipLevels);
             return PVK_ERROR_VALIDATION_FAILED;
         }
     }

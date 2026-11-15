@@ -26,6 +26,7 @@ extern "C" {
 /** @brief Result codes. Values match Vulkan's where the meaning is the same. */
 typedef enum PvkResult {
     PVK_SUCCESS                        = 0,           /**< The call succeeded. */
+    PVK_INCOMPLETE                     = 5,           /**< The array given was too small for every result. */
     PVK_ERROR_OUT_OF_HOST_MEMORY       = -1,          /**< EE main RAM allocation failed. */
     PVK_ERROR_OUT_OF_DEVICE_MEMORY     = -2,          /**< Not enough GS VRAM. */
     PVK_ERROR_INITIALIZATION_FAILED    = -3,          /**< Hardware setup failed. */
@@ -126,6 +127,8 @@ typedef enum PvkFormat {
 
 /** @brief The connection to ps2vk. */
 typedef struct PvkInstance_T      *PvkInstance;
+/** @brief The graphics hardware as it can be queried before a device exists, like VkPhysicalDevice. The instance has exactly one. */
+typedef struct PvkPhysicalDevice_T *PvkPhysicalDevice;
 /** @brief The PS2 graphics hardware (EE DMA, VU1, GS). There is only one. */
 typedef struct PvkDevice_T        *PvkDevice;
 /** @brief Where command buffers are submitted. The device has exactly one. */
@@ -136,19 +139,133 @@ typedef struct PvkInstanceCreateInfo {
     const char *applicationName; /**< Application name (informational). */
 } PvkInstanceCreateInfo;
 
+/** @brief What kind of device a physical device is. Values match Vulkan's VkPhysicalDeviceType. */
+typedef enum PvkPhysicalDeviceType {
+    PVK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU = 1 /**< The GS shares the console with the EE. */
+} PvkPhysicalDeviceType;
+
+/** @brief Length of PvkPhysicalDeviceProperties::deviceName, like VK_MAX_PHYSICAL_DEVICE_NAME_SIZE. */
+#define PVK_MAX_PHYSICAL_DEVICE_NAME_SIZE 256
+
+/**
+ * @brief Most mip levels a texture can have. Not a Vulkan limit: Vulkan
+ * derives it from maxImageDimension2D, the GS caps it at 7 (TEX1.MXL is 3
+ * bits) whatever the size.
+ */
+#define PVK_MAX_MIP_LEVELS 7
+
+/**
+ * @brief What the hardware can do, like VkPhysicalDeviceLimits.
+ *
+ * The fields with Vulkan's names mean what they mean in Vulkan, with the
+ * PS2's values. The library checks against the same values, so a creation
+ * call that stays within them does not fail for size. The fields marked PS2
+ * only have no Vulkan counterpart.
+ *
+ * | Limit | Value | Where it comes from |
+ * | --- | --- | --- |
+ * | maxImageDimension2D | 1024 | GS TEX0.TW/TH are log2 sizes up to 10 |
+ * | maxMipLevels (PS2 only) | PVK_MAX_MIP_LEVELS | TEX1.MXL |
+ * | maxUniformBufferRange | PVK_MAX_UNIFORM_BYTES | the VU1 uniform area |
+ * | maxPushConstantsSize | PVK_MAX_PUSH_CONSTANT_BYTES | 8 qwords of VU1 memory |
+ * | maxBoundDescriptorSets | PVK_MAX_DESCRIPTOR_SETS | the set table in the command buffer |
+ * | maxDescriptorSetBindings (PS2 only) | PVK_MAX_DESCRIPTOR_BINDINGS | the binding table of a set |
+ * | maxPerStageDescriptorSamplers, maxPerStageDescriptorSampledImages | 1 | the GS has one TEX0 |
+ * | maxPerStageDescriptorUniformBuffers | PVK_MAX_UNIFORM_BLOCKS | shaderc's block table |
+ * | maxVertexInputAttributes | PVK_MAX_VERTEX_INPUTS | one VU1 input qword each |
+ * | maxVertexInputBindings | PVK_MAX_VERTEX_BINDINGS | one DMA REF per binding per batch |
+ * | maxViewports | 1 | one XYOFFSET/SCISSOR pair |
+ * | maxViewportDimensions | 2048 x 2048 | the 4096 primitive space minus the origin margin |
+ * | viewportBoundsRange | -1024 to 3071 | XYOFFSET puts pixel 0 at 1024 of 4096 |
+ * | maxFramebufferWidth, maxFramebufferHeight | 2048 | FRAME.FBW in 64-pixel units, DISPLAY height |
+ * | maxColorAttachments | 1 | one FRAME register |
+ * | minUniformBufferOffsetAlignment, minMemoryMapAlignment | 16, 64 | a VIF UNPACK qword, a cache line |
+ * | maxSamplerLodBias | 127.9375 | TEX1.K is signed 7.4 fixed point |
+ * | maxSamplerAnisotropy | 1 | none |
+ * | pointSizeRange, lineWidthRange | 1 to 1 | GS points and lines are one pixel |
+ * | subPixelPrecisionBits | 4 | XYZ2 is 12.4 fixed point |
+ */
+typedef struct PvkPhysicalDeviceLimits {
+    uint32_t maxImageDimension2D;                 /**< Widest and tallest texture, in texels. */
+    uint32_t maxMipLevels;                        /**< PS2 only: most mip levels of a texture. */
+    uint32_t maxUniformBufferRange;               /**< Largest uniform buffer range, in bytes. */
+    uint32_t maxPushConstantsSize;                /**< Bytes of push constants. */
+    uint32_t maxBoundDescriptorSets;              /**< Descriptor sets a pipeline layout has and a command buffer binds. */
+    uint32_t maxDescriptorSetBindings;            /**< PS2 only: bindings in one descriptor set layout. */
+    uint32_t maxPerStageDescriptorSamplers;       /**< Samplers one shader stage reads. */
+    uint32_t maxPerStageDescriptorUniformBuffers; /**< Uniform buffers one shader stage reads. */
+    uint32_t maxPerStageDescriptorSampledImages;  /**< Sampled images one shader stage reads. */
+    uint32_t maxVertexInputAttributes;            /**< Vertex attributes a pipeline declares. */
+    uint32_t maxVertexInputBindings;              /**< Vertex buffer bindings a pipeline declares. */
+    uint32_t maxViewports;                        /**< Viewports a pipeline has. */
+    uint32_t maxViewportDimensions[2];            /**< Widest and tallest viewport, in pixels. */
+    float    viewportBoundsRange[2];              /**< Lowest and highest viewport corner coordinate. */
+    uint32_t maxFramebufferWidth;                 /**< Widest color or depth attachment. */
+    uint32_t maxFramebufferHeight;                /**< Tallest color or depth attachment. */
+    uint32_t maxColorAttachments;                 /**< Color attachments of one rendering pass. */
+    size_t   minUniformBufferOffsetAlignment;     /**< Alignment of PvkDescriptorBufferInfo::offset. */
+    size_t   minMemoryMapAlignment;               /**< Alignment of what pvkMapMemory() returns. */
+    float    maxSamplerLodBias;                   /**< Largest magnitude of PvkSamplerCreateInfo::mipLodBias. */
+    float    maxSamplerAnisotropy;                /**< Largest anisotropy; 1 means none. */
+    float    pointSizeRange[2];                   /**< Smallest and largest point size, in pixels. */
+    float    lineWidthRange[2];                   /**< Thinnest and widest line, in pixels. */
+    uint32_t subPixelPrecisionBits;               /**< Fraction bits of a rasterized position. */
+} PvkPhysicalDeviceLimits;
+
+/** @brief Who and what the physical device is, like VkPhysicalDeviceProperties. */
+typedef struct PvkPhysicalDeviceProperties {
+    uint32_t              apiVersion;    /**< The ps2vk API version, PVK_API_VERSION_1_0. */
+    uint32_t              driverVersion; /**< The library version. */
+    uint32_t              vendorID;      /**< 0x054C: Sony. */
+    uint32_t              deviceID;      /**< 0: the Graphics Synthesizer. */
+    PvkPhysicalDeviceType deviceType;    /**< PVK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU. */
+    char                  deviceName[PVK_MAX_PHYSICAL_DEVICE_NAME_SIZE]; /**< "PlayStation 2 Graphics Synthesizer". */
+    PvkPhysicalDeviceLimits limits;      /**< What it can do. */
+} PvkPhysicalDeviceProperties;
+
+/** @brief The API version pvkGetPhysicalDeviceProperties() reports: major 1, minor 0, patch 0 in Vulkan's packing. */
+#define PVK_API_VERSION_1_0 (1u << 22)
+
 /**
  * @brief Optional device behaviour an application turns on, like VkPhysicalDeviceFeatures.
  *
- * Every feature is off unless the application enables it in
- * PvkDeviceCreateInfo. With robustBufferAccess a vertex shader's run-time
- * index into a block array (see PvkShaderUniformBlock) is clamped to the
- * array, so an index past the end reads the last element; the PS2 pays 3 to
- * 4 VU1 instructions per indexed read for it. Off, such a read takes
- * whatever VU1 memory follows the array, undefined as in Vulkan.
+ * pvkGetPhysicalDeviceFeatures() says which the hardware supports; every
+ * feature is off unless the application enables it in PvkDeviceCreateInfo,
+ * and pvkCreateDevice() fails with PVK_ERROR_FEATURE_NOT_PRESENT for one the
+ * hardware lacks. With robustBufferAccess a vertex shader's run-time index
+ * into a block array (see PvkShaderUniformBlock) is clamped to the array, so
+ * an index past the end reads the last element; the PS2 pays 3 to 4 VU1
+ * instructions per indexed read for it. Off, such a read takes whatever VU1
+ * memory follows the array, undefined as in Vulkan.
  */
 typedef struct PvkPhysicalDeviceFeatures {
     uint32_t robustBufferAccess; /**< Nonzero: run-time indices into block arrays are clamped. */
 } PvkPhysicalDeviceFeatures;
+
+/** @brief Properties of a memory heap, like VkMemoryHeapFlagBits. */
+typedef enum PvkMemoryHeapFlagBits {
+    PVK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 1 /**< GS VRAM: only the GS reads and writes it. */
+} PvkMemoryHeapFlagBits;
+
+/** @brief One pool of memory, like VkMemoryHeap. */
+typedef struct PvkMemoryHeap {
+    size_t   size;  /**< Bytes in the heap. */
+    uint32_t flags; /**< PvkMemoryHeapFlagBits. */
+} PvkMemoryHeap;
+
+/** @brief Most heaps pvkGetPhysicalDeviceMemoryProperties() lists. */
+#define PVK_MAX_MEMORY_HEAPS 2
+
+/**
+ * @brief The device's memory, like VkPhysicalDeviceMemoryProperties.
+ *
+ * Heap 0 is EE main RAM (buffers), heap 1 is GS VRAM (images), both whole.
+ * Memory types, which Vulkan lists here too, come with pvkAllocateMemory().
+ */
+typedef struct PvkPhysicalDeviceMemoryProperties {
+    uint32_t      memoryHeapCount;                   /**< Heaps listed. */
+    PvkMemoryHeap memoryHeaps[PVK_MAX_MEMORY_HEAPS]; /**< The heaps. */
+} PvkPhysicalDeviceMemoryProperties;
 
 /** @brief Parameters for pvkCreateDevice(). May be NULL. */
 typedef struct PvkDeviceCreateInfo {
@@ -170,13 +287,43 @@ PvkResult pvkCreateInstance(const PvkInstanceCreateInfo *info, PvkInstance *inst
 void      pvkDestroyInstance(PvkInstance instance);
 
 /**
- * @brief Prepares the graphics hardware: resets the GIF and sets up the GIF and VIF1 DMA channels.
+ * @brief Lists the physical devices: the one PS2.
  * @param instance The instance.
+ * @param[in,out] count With @p devices NULL, receives how many there are (1); otherwise how many fit, then how many were written.
+ * @param[out] devices The devices, or NULL to ask for the count.
+ * @return PVK_SUCCESS, or PVK_INCOMPLETE when @p count was 0 with @p devices given.
+ */
+PvkResult pvkEnumeratePhysicalDevices(PvkInstance instance, uint32_t *count, PvkPhysicalDevice *devices);
+
+/**
+ * @brief Reports what the hardware is and its limits.
+ * @param physicalDevice The physical device.
+ * @param[out] properties Filled in.
+ */
+void      pvkGetPhysicalDeviceProperties(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceProperties *properties);
+
+/**
+ * @brief Reports which features the hardware supports, each nonzero if it does.
+ * @param physicalDevice The physical device.
+ * @param[out] features Filled in.
+ */
+void      pvkGetPhysicalDeviceFeatures(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceFeatures *features);
+
+/**
+ * @brief Reports the memory heaps.
+ * @param physicalDevice The physical device.
+ * @param[out] properties Filled in.
+ */
+void      pvkGetPhysicalDeviceMemoryProperties(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceMemoryProperties *properties);
+
+/**
+ * @brief Prepares the graphics hardware: resets the GIF and sets up the GIF and VIF1 DMA channels.
+ * @param physicalDevice The physical device from pvkEnumeratePhysicalDevices().
  * @param info Device parameters and the features to enable, or NULL for none.
  * @param[out] device The new device.
- * @return PVK_SUCCESS or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ * @return PVK_SUCCESS, PVK_ERROR_FEATURE_NOT_PRESENT for an enabled feature the hardware lacks, or PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
-PvkResult pvkCreateDevice(PvkInstance instance, const PvkDeviceCreateInfo *info, PvkDevice *device);
+PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreateInfo *info, PvkDevice *device);
 
 /**
  * @brief Waits for the device to go idle, then destroys it.
@@ -243,9 +390,6 @@ PvkResult pvkDeviceWaitIdle(PvkDevice device);
 typedef struct PvkImage_T         *PvkImage;
 /** @brief A way of using an image: the levels a texture is sampled through, or the one level rendered into. */
 typedef struct PvkImageView_T     *PvkImageView;
-
-/** @brief Most mip levels a texture has: GS TEX1.MXL goes up to 6. */
-#define PVK_MAX_MIP_LEVELS 7
 
 /** @brief What an image is used for. Values match Vulkan's VkImageUsageFlagBits. */
 typedef enum PvkImageUsageFlagBits {

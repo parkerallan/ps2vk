@@ -30,9 +30,17 @@
 
 #define pvk_error(...) printf("ps2vk: " __VA_ARGS__)
 
-struct PvkInstance_T {
+/* The one PS2; its properties are constants. */
+struct PvkPhysicalDevice_T {
     int unused;
 };
+
+struct PvkInstance_T {
+    struct PvkPhysicalDevice_T physicalDevice;
+};
+
+/* What pvkGetPhysicalDeviceProperties reports; every size check reads it. */
+extern const PvkPhysicalDeviceLimits pvk_limits;
 
 /* One in-order queue. Only one submission is in flight at a time: the GS
  * FINISH flag can't tell submissions apart, so submit waits for the last one. */

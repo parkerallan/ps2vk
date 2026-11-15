@@ -32,9 +32,9 @@ PvkResult pvkCreateDescriptorSetLayout(PvkDevice device, const PvkDescriptorSetL
 
     (void)device;
 
-    if (info->bindingCount > PVK_MAX_DESCRIPTOR_BINDINGS) {
-        pvk_error("descriptor set layout: %u bindings; at most %d\n", (unsigned)info->bindingCount,
-                  PVK_MAX_DESCRIPTOR_BINDINGS);
+    if (info->bindingCount > pvk_limits.maxDescriptorSetBindings) {
+        pvk_error("descriptor set layout: %u bindings; at most %u (maxDescriptorSetBindings)\n",
+                  (unsigned)info->bindingCount, (unsigned)pvk_limits.maxDescriptorSetBindings);
         return PVK_ERROR_VALIDATION_FAILED;
     }
     for (i = 0; i < info->bindingCount; i++) {

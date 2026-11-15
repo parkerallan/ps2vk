@@ -235,9 +235,9 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
 
     (void)device;
 
-    if (info->setLayoutCount > PVK_MAX_DESCRIPTOR_SETS) {
-        pvk_error("pipeline layout: %u descriptor set layouts; at most %d\n", (unsigned)info->setLayoutCount,
-                  PVK_MAX_DESCRIPTOR_SETS);
+    if (info->setLayoutCount > pvk_limits.maxBoundDescriptorSets) {
+        pvk_error("pipeline layout: %u descriptor set layouts; at most %u (maxBoundDescriptorSets)\n",
+                  (unsigned)info->setLayoutCount, (unsigned)pvk_limits.maxBoundDescriptorSets);
         return PVK_ERROR_VALIDATION_FAILED;
     }
 
@@ -255,10 +255,10 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
         const PvkPushConstantRange *r = &info->pushConstantRanges[i];
         uint32_t mask;
 
-        if ((r->offset | r->size) & 3 || r->size == 0 || r->offset + r->size > PVK_MAX_PUSH_CONSTANT_BYTES) {
+        if ((r->offset | r->size) & 3 || r->size == 0 || r->offset + r->size > pvk_limits.maxPushConstantsSize) {
             pvk_error("pipeline layout: push constant range %u (offset %u, size %u) must be multiples "
-                      "of 4 within %d bytes\n", (unsigned)i, (unsigned)r->offset, (unsigned)r->size,
-                      PVK_MAX_PUSH_CONSTANT_BYTES);
+                      "of 4 within %u bytes (maxPushConstantsSize)\n", (unsigned)i, (unsigned)r->offset,
+                      (unsigned)r->size, (unsigned)pvk_limits.maxPushConstantsSize);
             free(l);
             return PVK_ERROR_VALIDATION_FAILED;
         }
@@ -427,7 +427,7 @@ static PvkResult setup_vertex_input(PvkPipeline p, const PvkGraphicsPipelineCrea
     for (i = 0; i < info->bindingCount; i++) {
         const PvkVertexInputBinding *b = &info->bindings[i];
 
-        if (b->binding >= PVK_MAX_VERTEX_BINDINGS || !b->stride || p->vertexBindings[b->binding].stride) {
+        if (b->binding >= pvk_limits.maxVertexInputBindings || !b->stride || p->vertexBindings[b->binding].stride) {
             pvk_error("pipeline: vertex binding %u is out of range, declared twice or has stride 0\n",
                       (unsigned)b->binding);
             return PVK_ERROR_VALIDATION_FAILED;
@@ -463,7 +463,7 @@ static PvkResult setup_vertex_input(PvkPipeline p, const PvkGraphicsPipelineCrea
                       (int)attr->format, (unsigned)attr->location);
             return PVK_ERROR_FORMAT_NOT_SUPPORTED;
         }
-        if (attr->binding >= PVK_MAX_VERTEX_BINDINGS || !p->vertexBindings[attr->binding].stride) {
+        if (attr->binding >= pvk_limits.maxVertexInputBindings || !p->vertexBindings[attr->binding].stride) {
             pvk_error("pipeline: the attribute at location %u reads vertex binding %u, which is not declared\n",
                       (unsigned)attr->location, (unsigned)attr->binding);
             return PVK_ERROR_VALIDATION_FAILED;

@@ -354,7 +354,7 @@ void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, ui
 {
     uint32_t i;
 
-    if (firstSet + setCount > layout->setLayoutCount || firstSet + setCount > PVK_MAX_DESCRIPTOR_SETS) {
+    if (firstSet + setCount > layout->setLayoutCount || firstSet + setCount > pvk_limits.maxBoundDescriptorSets) {
         pvk_error("pvkCmdBindDescriptorSets: sets %u to %u, but the pipeline layout has %u set layouts\n",
                   (unsigned)firstSet, (unsigned)(firstSet + setCount), (unsigned)layout->setLayoutCount);
         cmd->failed = 1;
@@ -578,9 +578,10 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_
     uint32_t first, last, q, i, mask;
     const uint32_t *words;
 
-    if ((offset | size) & 3 || size == 0 || offset + size > PVK_MAX_PUSH_CONSTANT_BYTES) {
+    if ((offset | size) & 3 || size == 0 || offset + size > pvk_limits.maxPushConstantsSize) {
         pvk_error("pvkCmdPushConstants: offset %u and size %u must be multiples of 4 "
-                  "within %d bytes\n", (unsigned)offset, (unsigned)size, PVK_MAX_PUSH_CONSTANT_BYTES);
+                  "within %u bytes (maxPushConstantsSize)\n", (unsigned)offset, (unsigned)size,
+                  (unsigned)pvk_limits.maxPushConstantsSize);
         cmd->failed = 1;
         return;
     }
@@ -628,8 +629,8 @@ void pvkCmdBindVertexBuffers(PvkCommandBuffer cmd, uint32_t firstBinding, uint32
 {
     uint32_t i;
 
-    if (firstBinding + bindingCount > PVK_MAX_VERTEX_BINDINGS) {
-        pvk_error("pvkCmdBindVertexBuffers: bindings %u..%u go past PVK_MAX_VERTEX_BINDINGS\n",
+    if (firstBinding + bindingCount > pvk_limits.maxVertexInputBindings) {
+        pvk_error("pvkCmdBindVertexBuffers: bindings %u..%u go past maxVertexInputBindings\n",
                   (unsigned)firstBinding, (unsigned)(firstBinding + bindingCount - 1));
         cmd->failed = 1;
         return;
