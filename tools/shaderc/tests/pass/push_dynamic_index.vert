@@ -1,7 +1,7 @@
 #version 450
 
-// An array index that is itself a push constant: dynamic indexing is a later
-// plan item, so it must be rejected clearly for now.
+// An array element picked by an int push constant: ILW reads the int straight
+// from VU1 memory into VI08 and the element is loaded relative to it.
 layout(location = 0) in vec4 inPos;
 
 layout(push_constant) uniform Push {

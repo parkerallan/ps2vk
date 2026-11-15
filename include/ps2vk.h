@@ -136,9 +136,23 @@ typedef struct PvkInstanceCreateInfo {
     const char *applicationName; /**< Application name (informational). */
 } PvkInstanceCreateInfo;
 
+/**
+ * @brief Optional device behaviour an application turns on, like VkPhysicalDeviceFeatures.
+ *
+ * Every feature is off unless the application enables it in
+ * PvkDeviceCreateInfo. With robustBufferAccess a vertex shader's run-time
+ * index into a block array (see PvkShaderUniformBlock) is clamped to the
+ * array, so an index past the end reads the last element; the PS2 pays 3 to
+ * 4 VU1 instructions per indexed read for it. Off, such a read takes
+ * whatever VU1 memory follows the array, undefined as in Vulkan.
+ */
+typedef struct PvkPhysicalDeviceFeatures {
+    uint32_t robustBufferAccess; /**< Nonzero: run-time indices into block arrays are clamped. */
+} PvkPhysicalDeviceFeatures;
+
 /** @brief Parameters for pvkCreateDevice(). May be NULL. */
 typedef struct PvkDeviceCreateInfo {
-    uint32_t reserved; /**< Unused; set to 0. */
+    const PvkPhysicalDeviceFeatures *enabledFeatures; /**< Features to turn on, or NULL for none, like VkDeviceCreateInfo::pEnabledFeatures. */
 } PvkDeviceCreateInfo;
 
 /**
@@ -158,7 +172,7 @@ void      pvkDestroyInstance(PvkInstance instance);
 /**
  * @brief Prepares the graphics hardware: resets the GIF and sets up the GIF and VIF1 DMA channels.
  * @param instance The instance.
- * @param info Device parameters, or NULL.
+ * @param info Device parameters and the features to enable, or NULL for none.
  * @param[out] device The new device.
  * @return PVK_SUCCESS or PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
@@ -626,6 +640,15 @@ typedef enum PvkPrimitiveTopology {
  * shaderc places a shader's blocks one after another, in (set, binding)
  * order, in the PVK_MAX_UNIFORM_BYTES of VU1 memory reserved for them; the
  * draw fills each from the buffer in the bound descriptor set.
+ *
+ * A block, push constant or uniform, holds float, vec2, vec3, vec4, int and
+ * matrix members and arrays of vectors or matrices, column-major. An array
+ * element or matrix column may be picked at run time by an int member of a
+ * block, gl_InstanceIndex or int() of a float, one such index per read. VU1
+ * forms the address in an integer register, so the elements must be whole
+ * 16-byte qwords (vec4, matrices, or any std140 array) and a vector's
+ * component cannot be picked. The index is clamped to the array only when
+ * the device has PvkPhysicalDeviceFeatures::robustBufferAccess.
  */
 typedef struct PvkShaderUniformBlock {
     uint32_t set;     /**< Descriptor set index of the block (0 when the GLSL names none). */
@@ -648,6 +671,8 @@ typedef struct PvkShaderCode {
     const uint32_t *vu1CodeStart;          /**< Vertex: start of the VU1 microcode, linked into the ELF. */
     const uint32_t *vu1CodeEnd;            /**< Vertex: end of the VU1 microcode. */
     const uint32_t *vu1Convert;            /**< Vertex: the input conversion block in the microcode, preceded by one load per input: a branch, its delay slot, then 4 instructions per input (itof0 with loi scale, muli with loi -1, maxi, mul by VF00). pvkCreateGraphicsPipeline() rewrites the block in its copy of the code for each attribute's format and points each load at the input's qword of the vertex or the instance. */
+    uint32_t        vu1ClampCount;         /**< Vertex: number of entries in vu1Clamps. */
+    const uint32_t *const *vu1Clamps;      /**< Vertex: the run-time index clamps in the microcode, 3 instruction pairs each, NOP'd in the pipeline's copy unless the device has robustBufferAccess. */
     uint32_t        inputCount;            /**< Vertex: number of inputs, each one vec4. */
     uint32_t        inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< Vertex: input locations, in the order VU1 reads them. */
     int32_t         colorOutputLocation;   /**< Vertex: location of the color output, or -1 if none. */

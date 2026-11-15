@@ -9,9 +9,11 @@
  *   vertex:   gl_Position, an optional vec4 color output and an optional vec2
  *             texture coordinate output computed from vec4 inputs, push
  *             constants (a block of float/vec2/vec3/vec4/matrix members and
- *             arrays of vectors, up to 128 bytes), uniform blocks (the same
- *             members, std140, up to 1 KB together, each a descriptor set
- *             binding) and float/vec4/matrix constants with +, -, *, / and
+ *             arrays of vectors or matrices, up to 128 bytes), uniform blocks
+ *             (the same members, std140, up to 1 KB together, each a
+ *             descriptor set binding), array elements and matrix columns
+ *             picked by an int block member, gl_InstanceIndex or int() of a
+ *             float, and float/vec4/matrix constants with +, -, *, / and
  *             negation, matrix * vector, swizzles (v.xyz, v.bgra), component
  *             reads (v.w), vector constructors and math built-ins
  *   fragment: outColor = vColor;                      (Gouraud)
@@ -46,7 +48,7 @@ enum {
     OpTypeMatrix = 24, OpTypeImage = 25, OpTypeSampler = 26, OpTypeSampledImage = 27,
     OpTypeArray = 28, OpTypeRuntimeArray = 29, OpTypeStruct = 30, OpTypePointer = 32,
     OpTypeFunction = 33, OpConstantTrue = 41, OpConstantFalse = 42, OpConstant = 43,
-    OpConvertSToF = 111, OpIAdd = 128, OpISub = 130, OpIMul = 132,
+    OpConvertFToS = 110, OpConvertSToF = 111, OpIAdd = 128, OpISub = 130, OpIMul = 132,
     OpConstantComposite = 44, OpFunction = 54, OpFunctionParameter = 55, OpFunctionEnd = 56,
     OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
     OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
@@ -57,7 +59,8 @@ enum {
     OpMatrixTimesVector = 145, OpMatrixTimesMatrix = 146, OpOuterProduct = 147, OpDot = 148,
     OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249,
     OpBranchConditional = 250, OpKill = 252, OpReturn = 253, OpReturnValue = 254,
-    OpNoLine = 317, OpModuleProcessed = 330
+    OpNoLine = 317, OpModuleProcessed = 330,
+    OpDynLoad = 0x10000             /* ours: lq of a block qword through VI08 */
 };
 
 enum { DecBlock = 2, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
@@ -141,6 +144,12 @@ typedef struct {
     int      fromConst;      /* constant qword: 0..PVK_VU1_PUSH_QWORDS-1 the push constants, then the
                                 uniform area, then INSTANCE_QWORD; or -1 */
     int      instanceIndex;  /* the int value of gl_InstanceIndex, only float() may read it */
+    /* indexing at run time */
+    uint32_t dynIndex;       /* pointer: id of the index value computed at run time, 0 if none */
+    int      dynStride;      /* pointer: qwords per element the index counts */
+    int      dynCount;       /* pointer: elements (or columns) the index is clamped to */
+    uint32_t floatIndex;     /* int value: the float it is int() of, 0 if none */
+    uint32_t dynCol0;        /* matrix read at run time: id of its first column value, the rest follow */
     /* values that live inside another value's register: v.w, v.xyz */
     uint32_t aliasOf;        /* id whose register this value shares, 0 if its own */
     int      comp;           /* field (0..3) holding a scalar value */
@@ -166,6 +175,8 @@ static MemberDecor g_memberDecors[MAX_MEMBER_DECORS];
 static int g_memberDecorCount;
 
 static const char *g_src = "shader";
+static const char *g_sym = "";       /* symbol prefix of the microcode being written */
+static int g_clamps = 0;             /* run-time index clamps labelled so far */
 static const char *g_file = NULL;    /* from OpLine/OpString, if present */
 static uint32_t g_line = 0;
 
@@ -210,6 +221,8 @@ static const char *op_name(uint32_t op)
     case OpDot: return "OpDot (dot product)";
     case OpIAdd: case OpISub: case OpIMul: return "integer arithmetic (VU1 computes with floats only)";
     case OpConvertSToF: return "OpConvertSToF (float() of an integer)";
+    case OpConvertFToS: return "OpConvertFToS (int() of a float)";
+    case OpDynLoad: return "a block element picked at run time";
     case OpBranch: case OpBranchConditional: case OpSelectionMerge: case OpLoopMerge:
         return "control flow (if/else or loops)";
     case OpKill: return "discard";
@@ -322,6 +335,11 @@ typedef struct {
     int      fieldOp[4];            /* maps: operand index per result field, or FIELD_* */
     int      fieldComp[4];          /* maps: operand field per result field */
     int      dead;                  /* maps: result only feeds other maps, emit nothing */
+    int      dynBase;               /* OpDynLoad: VU1 address the index is added to */
+    int      dynStride;             /* OpDynLoad: qwords per element; 0 = VI08 still holds the address */
+    int      dynInt;                /* OpDynLoad: ops[0] holds the index as an int (itof0 first), else a float */
+    int      dynComp;               /* OpDynLoad: field of ops[0] holding the index */
+    uint32_t dynLast;               /* OpDynLoad: the last valid index, float bits */
     uint32_t line;                  /* GLSL line, 0 if unknown */
 } BodyOp;
 
@@ -369,6 +387,7 @@ typedef struct {
     Block    uniforms[PVK_MAX_UNIFORM_BLOCKS]; /* uniform blocks, sorted by (set, binding) */
     int      uniformCount;
     uint32_t constBase;             /* synthetic id of constant qword 0 (then qword 1, ...) */
+    uint32_t nextId;                /* next free synthetic id, after the constant qwords */
     uint32_t positionVar;           /* gl_PerVertex or Position variable, 0 if none */
     uint32_t positionValue;         /* value id stored to gl_Position, 0 if never */
     uint32_t colorValue;            /* value id stored to the color output, 0 if never */
@@ -481,36 +500,38 @@ static uint32_t check_block(const IdInfo *ids, uint32_t structType, const char *
              kind[0] == 'p' ? "push_constant" : "binding = 0", name);
     for (int m = 0; m < s->memberCount; m++) {
         uint32_t t = s->members[m], off = member_offset(structType, (uint32_t)m), end;
-        if (ids[t].type == T_ARRAY) {
-            if (!type_size(ids, ids[t].elemType))
-                fail("member %d of %s block '%s' is an array of something other than "
-                     "float, vec2, vec3 or vec4, which is not supported yet%s", m, kind, name,
-                     matrix_cols(ids, ids[t].elemType) ? " (arrays of matrices come with skinning)" : "");
-            end = off + ids[t].stride * ids[t].elemCount;
-        } else if (type_size(ids, t)) {
-            end = off + 4 * (uint32_t)type_size(ids, t);
-        } else if (matrix_cols(ids, t)) {
+        uint32_t e = ids[t].type == T_ARRAY ? ids[t].elemType : t;
+        if (ids[t].type == T_ARRAY && !type_size(ids, e) && !matrix_cols(ids, e))
+            fail("member %d of %s block '%s' is an array of something other than "
+                 "float, vec2, vec3, vec4 or a matrix, which is not supported yet", m, kind, name);
+        if (matrix_cols(ids, e)) {
             /* VU1 reads a column per qword and broadcasts the vector's fields over
              * them, so the columns must be the qwords: column-major, 16 bytes apart
              * (what std430 and std140 give every matCxR). */
             const MemberDecor *d = member_decor(structType, (uint32_t)m, 0);
-            if (d->rowMajor)
+            if (d && d->rowMajor)
                 fail("member %d of %s block '%s' is a row_major matrix; VU1 "
                      "multiplies by columns, so leave the block column-major (the default)",
                      m, kind, name);
-            if (d->matrixStride != 16)
+            if (!d || d->matrixStride != 16)
                 fail("corrupt SPIR-V: matrix member %d of %s block '%s' has a "
-                     "column stride of %u bytes, not 16", m, kind, name, (unsigned)d->matrixStride);
+                     "column stride of %u bytes, not 16", m, kind, name, d ? (unsigned)d->matrixStride : 0u);
             if (off % 16)
                 fail("member %d of %s block '%s' is a matrix at byte %u, which is "
                      "not 16-byte aligned", m, kind, name, (unsigned)off);
+        }
+        if (ids[t].type == T_ARRAY) {
+            end = off + ids[t].stride * ids[t].elemCount;
+        } else if (type_size(ids, t)) {
+            end = off + 4 * (uint32_t)type_size(ids, t);
+        } else if (matrix_cols(ids, t)) {
             end = off + 16 * (uint32_t)matrix_cols(ids, t);
         } else if (ids[t].type == T_INT && ids[t].width == 32) {
             end = off + 4;   /* may be declared; using it in arithmetic is rejected */
         } else {
             fail("member %d of %s block '%s' is something other than float, "
-                 "vec2, vec3, vec4, a matrix, int or an array of vectors (arrays of "
-                 "matrices and nested blocks are not supported yet)", m, kind, name);
+                 "vec2, vec3, vec4, a matrix, int or an array of vectors or matrices "
+                 "(nested blocks are not supported yet)", m, kind, name);
         }
         if (end > bytes)
             bytes = end;
@@ -542,6 +563,56 @@ static void place_uniforms(Shader *sh)
     if (qword > PVK_VU1_UNIFORM_QWORDS)
         fail("the uniform blocks take %u bytes together; ps2vk reserves %d bytes of VU1 memory "
              "for uniform buffers", (unsigned)qword * 16, PVK_VU1_UNIFORM_QWORDS * 16);
+}
+
+/* VU1 address of constant qword q (the push constants, then the uniform area). */
+static int const_addr(int q)
+{
+    return q < PVK_VU1_PUSH_QWORDS ? PVK_VU1_PUSH_ADDR + q : PVK_VU1_UNIFORM_ADDR + q - PVK_VU1_PUSH_QWORDS;
+}
+
+/* Defines value id as qword `col` of the element pointer ptr picks at run
+ * time: a body op that loads it through VI08. The first column computes the
+ * address from the index (an int block member, gl_InstanceIndex or a float,
+ * clamped to the array then truncated with FTOI0), the others reuse it. */
+static void define_dyn_load(IdInfo *ids, Shader *sh, uint32_t id, uint32_t type, uint32_t ptr, int col)
+{
+    const IdInfo *idx = &ids[ids[ptr].dynIndex];
+    float last = (float)(ids[ptr].dynCount - 1);
+    BodyOp *b;
+
+    if (sh->bodyCount == MAX_BODY)
+        fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+    ids[id].kind = ID_VALUE;
+    ids[id].valType = type;
+    b = &sh->body[sh->bodyCount++];
+    b->op = OpDynLoad;
+    b->result = id;
+    b->line = g_line;
+    b->dynBase = const_addr(ids[ptr].fromConst) + col;
+    b->dynStride = col ? 0 : ids[ptr].dynStride;
+    memcpy(&b->dynLast, &last, sizeof(last));
+    if (col)
+        return;
+    if (idx->floatIndex) {
+        b->ops[b->nops++] = idx->floatIndex;
+        b->dynComp = ids[idx->floatIndex].comp;
+    } else if (idx->instanceIndex) {
+        b->ops[b->nops++] = sh->constBase + INSTANCE_QWORD;
+        b->dynComp = 2;
+    } else {
+        b->ops[b->nops++] = sh->constBase + (uint32_t)idx->fromConst;
+        b->dynComp = idx->comp;
+        b->dynInt = 1;
+    }
+}
+
+/* A fresh id with no SPIR-V counterpart. */
+static uint32_t new_id(Shader *sh)
+{
+    if (sh->nextId == MAX_IDS)
+        fail("shader is too large (%u ids)", (unsigned)sh->nextId);
+    return sh->nextId++;
 }
 
 /* Defines value id (a float or vecN of `size` fields) as the given fields: a
@@ -619,7 +690,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     sh->colorLocation = sh->texcoordLocation = -1;
     sh->colorInput = sh->texcoordInput = sh->samplerBinding = sh->samplerSet = -1;
     sh->constBase = bound;
-    for (uint32_t i = 0; i < bound + CONST_QWORDS; i++) {
+    sh->nextId = bound + CONST_QWORDS;
+    for (uint32_t i = 0; i < MAX_IDS; i++) {
         ids[i].location = ids[i].binding = ids[i].set = ids[i].builtin = ids[i].structPosMember = -1;
         ids[i].fromInput = ids[i].fromConst = -1;
     }
@@ -947,6 +1019,36 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 break;
             case OpLoad: {
                 uint32_t id = w[2], ptr = w[3];
+                if (ids[ptr].kind == ID_PTR && ids[ptr].dynIndex) {
+                    /* An element picked at run time: loaded by a body op (per column
+                     * for a matrix) once VI08 holds its address. */
+                    int cols = matrix_cols(ids, w[1]), size = type_size(ids, w[1]);
+                    if (cols) {
+                        ids[id].kind = ID_VALUE;
+                        ids[id].valType = w[1];
+                        ids[id].dynCol0 = sh->nextId;
+                        for (int c = 0; c < cols; c++)
+                            define_dyn_load(ids, sh, new_id(sh), ids[w[1]].elemType, ptr, c);
+                    } else if (size > 1 && ids[ptr].comp) {
+                        /* A vec2/vec3 past field x: copied to the leading fields like a
+                         * constant one. */
+                        uint32_t q = new_id(sh);
+                        Field fl[4];
+                        define_dyn_load(ids, sh, q, w[1], ptr, 0);
+                        for (int j = 0; j < size; j++) {
+                            fl[j].src = q;
+                            fl[j].comp = ids[ptr].comp + j;
+                        }
+                        define_map(ids, sh, OpLoad, id, w[1], fl, size);
+                    } else if (size) {
+                        define_dyn_load(ids, sh, id, w[1], ptr, 0);
+                        ids[id].comp = ids[ptr].comp;
+                    } else {
+                        fail("vertex shader reads something other than a float, vector or matrix "
+                             "at an index computed at run time");
+                    }
+                    break;
+                }
                 if (ids[ptr].kind == ID_PTR && ids[ptr].fromConst >= 0) {
                     /* A push constant member: its qword is loaded into a register in
                      * the prologue, so this reads that register in place... */
@@ -1024,6 +1126,20 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[id].valType = w[1];
                 ids[id].fromConst = INSTANCE_QWORD;
                 ids[id].comp = 2;
+                break;
+            }
+            case OpConvertFToS: {
+                /* int(f): only as an array or column index, where FTOI0 makes the address. */
+                uint32_t id = w[2], src = w[3];
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                if (value_size(ids, src, stage) != 1)
+                    fail("corrupt SPIR-V: int() of something other than a float");
+                ids[id].kind = ID_VALUE;
+                ids[id].valType = w[1];
+                ids[id].floatIndex = src;
+                ids[id].comp = ids[src].comp;
                 break;
             }
             case OpFAdd: case OpFSub: case OpFMul: case OpFDiv: case OpFNegate:
@@ -1115,6 +1231,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 } else if (ids[m].kind == ID_VALUE && ids[m].fromConst >= 0) {
                     for (int c = 0; c < cols; c++)
                         b->ops[c] = sh->constBase + (uint32_t)(ids[m].fromConst + c);
+                } else if (ids[m].kind == ID_VALUE && ids[m].dynCol0) {
+                    for (int c = 0; c < cols; c++)
+                        b->ops[c] = ids[m].dynCol0 + (uint32_t)c;
                 } else {
                     fail("vertex shader multiplies by a matrix that is neither a push constant, "
                          "a uniform nor a constant; only those are supported so far");
@@ -1269,14 +1388,44 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 if (kind) {
                     /* pc.member, pc.array[i], pc.member.z: a constant byte offset into
                      * the block, which VU1 memory holds as qwords. */
-                    uint32_t type = ids[ids[base].varType].elemType, off = 0;
-                    int size;
+                    uint32_t type = ids[ids[base].varType].elemType, off = 0, dynIndex = 0;
+                    int size, dynStride = 0, dynCount = 0;
 
                     for (uint32_t i = 4; i < n; i++) {
                         uint32_t idx = w[i], v;
-                        if (ids[idx].kind != ID_CONST)
-                            fail("vertex shader indexes %ss with a value computed at "
-                                 "run time; only constant indices are supported so far", kind);
+                        if (ids[idx].kind != ID_CONST) {
+                            /* pc.array[i], pc.m[i]: VI08 = i * qwords per element, added
+                             * to the element's static address, i clamped to the array like
+                             * robustBufferAccess. The index is an int block member,
+                             * gl_InstanceIndex or int() of a float. */
+                            if (dynIndex)
+                                fail("vertex shader reads %ss with two indices computed at run time; "
+                                     "only one per read is supported", kind);
+                            if (ids[idx].kind != ID_VALUE ||
+                                !(ids[idx].floatIndex || ids[idx].instanceIndex ||
+                                  (ids[idx].fromConst >= 0 && ids[ids[idx].valType].type == T_INT)))
+                                fail("vertex shader indexes %ss with something other than an int "
+                                     "%s member, gl_InstanceIndex or int() of a float; VU1 has no "
+                                     "integer arithmetic to offer", kind, kind);
+                            if (ids[type].type == T_ARRAY) {
+                                if (ids[type].stride % 16)
+                                    fail("vertex shader indexes a %s array of %u-byte elements at run "
+                                         "time; VU1 addresses qwords, so make them vec4 or use std140",
+                                         kind, (unsigned)ids[type].stride);
+                                dynStride = (int)(ids[type].stride / 16);
+                            } else if (ids[type].type == T_MATRIX) {
+                                dynStride = 1;
+                            } else if (ids[type].type == T_VECTOR) {
+                                fail("vertex shader picks a %s vector's component at run time; VU1 "
+                                     "addresses qwords, so index an array of floats instead", kind);
+                            } else {
+                                fail("corrupt SPIR-V: %s access chain indexes a scalar", kind);
+                            }
+                            dynIndex = idx;
+                            dynCount = (int)ids[type].elemCount;
+                            type = ids[type].elemType;
+                            continue;
+                        }
                         v = ids[idx].value;
                         if (ids[type].type == T_STRUCT) {
                             if (v >= (uint32_t)ids[type].memberCount)
@@ -1312,6 +1461,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                             fail("corrupt SPIR-V: %s read past the end of the block", kind);
                         ids[id].kind = ID_PTR;
                         ids[id].fromConst = blockQword + (int)(off / 16);
+                        ids[id].dynIndex = dynIndex;
+                        ids[id].dynStride = dynStride;
+                        ids[id].dynCount = dynCount;
                         break;
                     }
                     size = type_size(ids, type);
@@ -1328,6 +1480,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     ids[id].kind = ID_PTR;
                     ids[id].fromConst = blockQword + (int)(off / 16);
                     ids[id].comp = (int)(off % 16 / 4);
+                    ids[id].dynIndex = dynIndex;
+                    ids[id].dynStride = dynStride;
+                    ids[id].dynCount = dynCount;
                     break;
                 }
                 if (ids[base].kind == ID_VAR && ids[base].fromInput >= 0) {
@@ -1974,6 +2129,35 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, con
     case OpVectorShuffle: case OpCompositeConstruct: case OpCompositeExtract:
         emit_map(f, b, d, regs, size, line);
         break;
+    case OpDynLoad: {
+        /* VI08 = clamp(index, 0, count - 1) * stride, then the element's qword(s)
+         * relative to it. */
+        const char *c = b->dynStride ? line : NULL;
+        const char *fm = &"x\0y\0z\0w"[b->dynComp * 2];
+        char fc = field[b->dynComp];
+        if (b->dynStride) {
+            if (b->dynInt) {
+                emit_u(f, &c, mn("itof0", 0, fm), "VF%02d,VF%02d", d, a);
+                a = d;
+            }
+            fprintf(f, "%s_Clamp%d:\n", g_sym, g_clamps++);
+            emit_u(f, &c, mn("maxx", 0, fm), "VF%02d,VF%02d,VF00x", d, a);
+            emit_loi(f, &c, b->dynLast);
+            emit_u(f, &c, mn("minii", 0, fm), "VF%02d,VF%02d,I", d, d);
+            emit_u(f, &c, mn("ftoi0", 0, fm), "VF%02d,VF%02d", d, d);
+            emit_l(f, &c, "mtir", "VI08,VF%02d%c", d, fc);
+            if (b->dynStride == 2 || b->dynStride == 4)
+                emit_l(f, &c, "iadd", "VI08,VI08,VI08");
+            if (b->dynStride == 4)
+                emit_l(f, &c, "iadd", "VI08,VI08,VI08");
+            if (b->dynStride == 3) {
+                emit_l(f, &c, "iadd", "VI13,VI08,VI08");
+                emit_l(f, &c, "iadd", "VI08,VI08,VI13");
+            }
+        }
+        emit_l(f, &c, "lq", "VF%02d,%d(VI08)", d, b->dynBase);
+        break;
+    }
     case OpDot: case OpExtInst:
         emit_builtin(f, b, size, type_size(ids, ids[b->ops[0]].valType), dest, d, regs,
                      ca, cb, cc, line);
@@ -1987,6 +2171,8 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     char buf[64], buf2[64];
     static Regs r;
     int i, constants = 0;
+
+    g_sym = sym;
 
     /* Registers: inputs are fixed, constants live for the whole program,
      * temporaries and push constant/uniform qwords are freed after their last read. */
@@ -2242,6 +2428,8 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     vu(f, "NOP[E]", "NOP", NULL);
     vu(f, "NOP", "NOP", NULL);
     fprintf(f, "\t\t.align 4\n%s_CodeEnd:\n", sym);
+    for (i = 0; i < g_clamps; i++)
+        fprintf(f, "\t\t.global\t%s_Clamp%d\n", sym, i);
     fclose(f);
 
     f = open_out(base, ".c");
@@ -2249,13 +2437,25 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, "#include \"ps2vk.h\"\n\n");
     fprintf(f, "extern uint32_t %s_CodeStart __attribute__((section(\".vudata\")));\n", sym);
     fprintf(f, "extern uint32_t %s_Convert __attribute__((section(\".vudata\")));\n", sym);
-    fprintf(f, "extern uint32_t %s_CodeEnd __attribute__((section(\".vudata\")));\n\n", sym);
-    fprintf(f, "const PvkShaderCode %s = {\n", sym);
+    fprintf(f, "extern uint32_t %s_CodeEnd __attribute__((section(\".vudata\")));\n", sym);
+    for (i = 0; i < g_clamps; i++)
+        fprintf(f, "extern uint32_t %s_Clamp%d __attribute__((section(\".vudata\")));\n", sym, i);
+    if (g_clamps) {
+        fprintf(f, "\nstatic const uint32_t *const %s_Clamps[] = {", sym);
+        for (i = 0; i < g_clamps; i++)
+            fprintf(f, "%s&%s_Clamp%d", i ? ", " : " ", sym, i);
+        fprintf(f, " };\n");
+    }
+    fprintf(f, "\nconst PvkShaderCode %s = {\n", sym);
     fprintf(f, "    .stage = PVK_SHADER_STAGE_VERTEX,\n");
     fprintf(f, "    .name = \"%s\",\n", g_src);
     fprintf(f, "    .vu1CodeStart = &%s_CodeStart,\n", sym);
     fprintf(f, "    .vu1CodeEnd = &%s_CodeEnd,\n", sym);
     fprintf(f, "    .vu1Convert = &%s_Convert,\n", sym);
+    if (g_clamps) {
+        fprintf(f, "    .vu1ClampCount = %d,\n", g_clamps);
+        fprintf(f, "    .vu1Clamps = %s_Clamps,\n", sym);
+    }
     fprintf(f, "    .inputCount = %d,\n", sh->inputCount);
     fprintf(f, "    .inputLocations = {");
     for (i = 0; i < sh->inputCount; i++)

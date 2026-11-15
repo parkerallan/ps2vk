@@ -1,0 +1,1 @@
+dynamic_component.vert:13: error: vertex shader picks a push constant vector's component at run time; VU1 addresses qwords, so index an array of floats instead

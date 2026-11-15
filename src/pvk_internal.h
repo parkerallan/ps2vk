@@ -46,6 +46,7 @@ void pvk_queue_wait_idle(PvkQueue queue);
 
 struct PvkDevice_T {
     struct PvkQueue_T queue;
+    PvkPhysicalDeviceFeatures features;
 };
 
 /* Color images keep libdraw's framebuffer_t (the swapchain presents from it);

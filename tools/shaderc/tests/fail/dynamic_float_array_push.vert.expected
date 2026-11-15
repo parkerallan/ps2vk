@@ -1,0 +1,1 @@
+dynamic_float_array_push.vert:14: error: vertex shader indexes a push constant array of 4-byte elements at run time; VU1 addresses qwords, so make them vec4 or use std140

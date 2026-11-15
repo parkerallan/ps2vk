@@ -512,8 +512,10 @@ static void vu_nop(uint32_t *pair)
  * pairs `itof0` + `loi` scale, `muli` + `loi` -1, `maxi` and `mul.mask
  * VFn,VF00,VF00` (0 and 1 for the components the format lacks), each NOP'd
  * when the format does not need it (a `loi` feeds the next pair), and the
- * branch skips the leading inputs that need nothing. */
-static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const uint32_t *qword, const int *instance)
+ * branch skips the leading inputs that need nothing. The run-time index
+ * clamps (vu1Clamps) are NOP'd unless the device has robustBufferAccess. */
+static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const uint32_t *qword, const int *instance,
+                           int robust)
 {
     const PvkShaderCode *vs = p->vs;
     size_t words = (size_t)(vs->vu1CodeEnd - vs->vu1CodeStart);
@@ -560,6 +562,17 @@ static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const 
     }
     target = 2 + 4 * first;
     blk[0] = VU_LOWER_B | ((target - 1) & 0x7FF);
+
+    for (i = 0; i < vs->vu1ClampCount && !robust; i++) {
+        const uint32_t *c = vs->vu1Clamps[i];
+        if (c < vs->vu1CodeStart || c + 6 > vs->vu1CodeEnd) {
+            pvk_error("pipeline: vertex shader '%s' has a run-time index clamp outside its code\n", vs->name);
+            return PVK_ERROR_INVALID_SHADER;
+        }
+        vu_nop(p->code + (c - vs->vu1CodeStart));
+        vu_nop(p->code + (c - vs->vu1CodeStart) + 2);
+        vu_nop(p->code + (c - vs->vu1CodeStart) + 4);
+    }
     return PVK_SUCCESS;
 }
 
@@ -598,8 +611,6 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     PvkResult res;
     float *ctx, depthMax;
 
-    (void)device;
-
     if ((res = validate_shaders(vs, fs)) != PVK_SUCCESS)
         return res;
     if ((unsigned)info->topology >= sizeof(topologies) / sizeof(topologies[0])) {
@@ -617,7 +628,7 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     p->layout       = info->layout;
     if ((res = validate_layout(p, info)) != PVK_SUCCESS ||
         (res = setup_vertex_input(p, info, fmt, qword, instance)) != PVK_SUCCESS ||
-        (res = copy_code(p, fmt, qword, instance)) != PVK_SUCCESS) {
+        (res = copy_code(p, fmt, qword, instance, device->features.robustBufferAccess != 0)) != PVK_SUCCESS) {
         pvkDestroyPipeline(device, p);
         return res;
     }

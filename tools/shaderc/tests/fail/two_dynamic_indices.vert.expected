@@ -1,0 +1,1 @@
+two_dynamic_indices.vert:14: error: vertex shader reads uniforms with two indices computed at run time; only one per read is supported

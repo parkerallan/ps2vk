@@ -1,7 +1,6 @@
 #version 450
 
-// An array index that is itself a uniform: dynamic indexing is a later plan
-// item, so it must be rejected clearly for now.
+// An array element picked by an int uniform member.
 layout(location = 0) in vec4 inPos;
 
 layout(set = 0, binding = 0) uniform Palette {

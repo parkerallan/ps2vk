@@ -20,12 +20,13 @@ PvkResult pvkCreateDevice(PvkInstance instance, const PvkDeviceCreateInfo *info,
     PvkDevice dev;
 
     (void)instance;
-    (void)info;
 
     dev = calloc(1, sizeof(struct PvkDevice_T));
     if (!dev)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
     dev->queue.device = dev;
+    if (info && info->enabledFeatures)
+        dev->features = *info->enabledFeatures;
 
     /* Reset the GIF: the BIOS (OSDSYS) leaves it busy, which stalls the first
      * VIF1 DIRECT transfer forever (ps2gl does the same in glutInit). */
