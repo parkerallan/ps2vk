@@ -142,7 +142,7 @@ int main(void)
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(mvp), mvp);
         pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
-        pvkCmdDrawIndexed(cmd, 3, 0, 0);
+        pvkCmdDrawIndexed(cmd, 3, 1, 0, 0, 0);
         pvkCmdEndRendering(cmd);
         CHECK(pvkEndCommandBuffer(cmd));
 

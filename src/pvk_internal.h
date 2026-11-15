@@ -23,6 +23,9 @@
 #define PVK_GS_ORIGIN 1024.0f
 
 #define PVK_DEFAULT_CMD_QWORDS 4096
+
+/* VU1 input memory a batch can fill, after the header. */
+#define PVK_BATCH_INPUT_QWORDS (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER)
 #define PVK_MAX_SWAPCHAIN_IMAGES 2
 
 #define pvk_error(...) printf("ps2vk: " __VA_ARGS__)
@@ -163,12 +166,14 @@ uint32_t pvk_push_word_mask(uint32_t offset, uint32_t size);
 /* Nonzero if the two layouts have the same push constant ranges. */
 int pvk_layout_push_compatible(const struct PvkPipelineLayout_T *a, const struct PvkPipelineLayout_T *b);
 
-/* One vertex buffer binding of a pipeline: a stream the VIF unpacks with one format. */
+/* One vertex buffer binding of a pipeline: a stream the VIF unpacks with one
+ * format, one element per vertex or per instance. */
 struct PvkVertexBinding {
     int      used;            /* declared, and some shader input reads it */
-    uint32_t stride;          /* bytes per vertex */
+    int      instance;        /* advances per instance, not per vertex */
+    uint32_t stride;          /* bytes per element */
     uint32_t count;           /* attributes (consecutive shader inputs) it holds */
-    uint32_t slot;            /* VU1 qword of its first attribute within a vertex */
+    uint32_t slot;            /* VU1 qword of its first attribute within a vertex (or an instance) */
     uint32_t mode;            /* VIF UNPACK format (P2_UNPACK_*) */
     uint32_t usn;             /* unsigned 8/16-bit data */
     uint32_t align;           /* vertices per whole 16-byte unit: 16 / gcd(16, stride) */
@@ -184,10 +189,13 @@ struct PvkPipeline_T {
     uint32_t samplerSet;      /* when fs->textured: set index and bindings[] slot of its sampler2D */
     uint32_t samplerSlot;
     uint32_t uniformSlots[PVK_MAX_UNIFORM_BLOCKS]; /* bindings[] slot of each vs->uniformBlocks[] entry in its set layout */
-    uint32_t inputQwords;    /* qwords per vertex in VU1 memory */
+    uint32_t vertexQwords;    /* qwords per vertex in VU1 memory: the vertex-rate inputs */
+    uint32_t instanceQwords;  /* qwords per instance: the instance-rate inputs, 0 = none */
     uint32_t outputQwords;    /* qwords per vertex VU1 emits: RGBAQ, XYZ2, plus ST when textured */
     struct PvkVertexBinding vertexBindings[PVK_MAX_VERTEX_BINDINGS];
-    uint32_t align;           /* batches start on a vertex that is a multiple of this: lcm of the bindings' align */
+    uint32_t align;           /* batches start on a vertex that is a multiple of this: lcm of the vertex-rate bindings' align */
+    uint32_t instanceAlign;   /* the same for the instance-rate bindings */
+    uint32_t inputBudget;     /* input qwords a batch's vertices and indices may take: room for one instance is kept */
     uint32_t maxBatch;        /* vertices per VU1 run, a whole number of list primitives */
     uint32_t primStep;        /* vertices a draw grows by: the list primitive's size, 1 for strips and fans */
     uint32_t primOverlap;     /* vertices a strip or fan batch repeats from the previous batch */

@@ -7,14 +7,14 @@
  *   16  uniform buffers: 64 qwords = 1 KB; the vertex shader's uniform blocks,
  *       placed by shaderc in (set, binding) order, each filled from the buffer
  *       in the bound descriptor set before the first draw after a bind
- *   80  input:   GIF tag for this batch, a count qword, a first-vertex qword,
- *       then vertices (one qword per shader input; a few unused ones may come
- *       first and last, as the VIF unpacks whole 16-byte units of each
- *       binding), then for an indexed batch the 16-bit indices, one per
- *       qword (VIF UNPACK S_16)
- *   512 output:  GIF tag, then per vertex RGBAQ, XYZ2 (sent with XGKICK), or
- *       ST (UV for a sampler with unnormalized coordinates), RGBAQ, XYZ2 when
- *       the vertex shader writes a texture coordinate
+ *   80  input:   a 4-qword header, then vertices (one qword per vertex-rate
+ *       shader input; a few unused ones may come first and last, as the VIF
+ *       unpacks whole 16-byte units of each binding), for an indexed batch the
+ *       16-bit indices, one per qword (VIF UNPACK S_16), then the instances
+ *       (one qword per instance-rate input, aligned the same way)
+ *   512 output:  per instance a GIF tag, then per vertex RGBAQ, XYZ2, or ST (UV
+ *       for a sampler with unnormalized coordinates), RGBAQ, XYZ2 when the
+ *       vertex shader writes a texture coordinate; one XGKICK sends them all
  */
 #ifndef PS2VK_VU1_LAYOUT_H
 #define PS2VK_VU1_LAYOUT_H
@@ -35,15 +35,19 @@
 #define PVK_VU1_UNIFORM_QWORDS    64  /* PVK_MAX_UNIFORM_BYTES / 16 */
 
 #define PVK_VU1_INPUT_ADDR        80
-#define PVK_VU1_INPUT_GIFTAG      0
-#define PVK_VU1_INPUT_COUNT       1   /* x: vertices to process; y: qword offset from the
-                                         input base of the index list, 0 = vertices in order;
-                                         z: float, winding sign of the batch's first triangle
-                                         (signed area * z < 0 = cull), VU1 flips it per triangle;
-                                         w: int, 1 = store UV (texels, 12.4) instead of ST and Q */
-#define PVK_VU1_INPUT_FIRST       2   /* x: int, qwords from the first unpacked vertex to the
-                                         batch's first (the alignment lead) */
-#define PVK_VU1_INPUT_HEADER      3   /* qwords before the first unpacked vertex */
+#define PVK_VU1_INPUT_GIFTAG      0   /* with EOP; VU1 clears EOP on every instance's copy but the last */
+#define PVK_VU1_INPUT_COUNT       1   /* x: vertices per instance; y: qword offset from the input
+                                         base of the index list, 0 = vertices in order; z: float,
+                                         winding sign of the current triangle (signed area * z < 0
+                                         = cull), VU1 flips it per triangle; w: int, 1 = store UV
+                                         (texels, 12.4) instead of ST and Q */
+#define PVK_VU1_INPUT_FIRST       2   /* x: int, qword offset from the input base of the first
+                                         vertex; y: float, winding sign of each instance's first
+                                         triangle; z: int, instances; w: int, qword offset from
+                                         the input base of the first instance */
+#define PVK_VU1_INPUT_STRIDE      3   /* x: int, qwords per vertex; y: int, qwords per instance;
+                                         z: float, gl_InstanceIndex of the current instance */
+#define PVK_VU1_INPUT_HEADER      4   /* qwords before the first unpacked vertex */
 
 #define PVK_VU1_OUTPUT_ADDR       512
 #define PVK_VU1_OUTPUT_PER_VERTEX 2   /* RGBAQ, XYZ2 */

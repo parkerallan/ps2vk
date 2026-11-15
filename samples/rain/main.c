@@ -360,25 +360,25 @@ int main(void)
         pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
 
         pvkCmdBindPipeline(cmd, skyPipe);
-        pvkCmdDraw(cmd, SKY_VERTS, SKY_FIRST);
+        pvkCmdDraw(cmd, SKY_VERTS, 1, SKY_FIRST, 0);
 
         pvkCmdBindPipeline(cmd, starPipe);
-        pvkCmdDraw(cmd, STARS, STAR_FIRST);
+        pvkCmdDraw(cmd, STARS, 1, STAR_FIRST, 0);
 
         pvkCmdBindPipeline(cmd, moonPipe);
         for (i = 0; i < 3; i++)
-            pvkCmdDraw(cmd, FAN_VERTS, MOON_FIRST + i * FAN_VERTS);
+            pvkCmdDraw(cmd, FAN_VERTS, 1, MOON_FIRST + i * FAN_VERTS, 0);
 
         pvkCmdBindPipeline(cmd, ripplePipe);
         for (i = 0; i < RIPPLES; i++)
             if (ripples[i].age < RIPPLE_LIFE)
-                pvkCmdDraw(cmd, RIPPLE_VERTS, RIPPLE_FIRST + i * RIPPLE_VERTS);
+                pvkCmdDraw(cmd, RIPPLE_VERTS, 1, RIPPLE_FIRST + i * RIPPLE_VERTS, 0);
 
         pvkCmdBindPipeline(cmd, rainPipe);
-        pvkCmdDraw(cmd, DROPS * 2, RAIN_FIRST);
+        pvkCmdDraw(cmd, DROPS * 2, 1, RAIN_FIRST, 0);
 
         pvkCmdBindPipeline(cmd, splashPipe);
-        pvkCmdDraw(cmd, SPLASHES * 2, SPLASH_FIRST);
+        pvkCmdDraw(cmd, SPLASHES * 2, 1, SPLASH_FIRST, 0);
 
         pvkCmdEndRendering(cmd);
         CHECK(pvkEndCommandBuffer(cmd));

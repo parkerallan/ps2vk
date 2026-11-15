@@ -325,7 +325,7 @@ int main(void)
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(innerMvp), innerMvp);
         pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
-        pvkCmdDrawIndexed(cmd, 36, 0, 0);
+        pvkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
         pvkCmdEndRendering(cmd);
 
         /* Pass 2: the outer cube on screen, textured with pass 1's result. */
@@ -348,7 +348,7 @@ int main(void)
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(outerMvp), outerMvp);
         pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
-        pvkCmdDrawIndexed(cmd, 36, 0, 0);
+        pvkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
         pvkCmdEndRendering(cmd);
 
         CHECK(pvkEndCommandBuffer(cmd));

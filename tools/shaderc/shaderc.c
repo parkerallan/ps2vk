@@ -46,6 +46,7 @@ enum {
     OpTypeMatrix = 24, OpTypeImage = 25, OpTypeSampler = 26, OpTypeSampledImage = 27,
     OpTypeArray = 28, OpTypeRuntimeArray = 29, OpTypeStruct = 30, OpTypePointer = 32,
     OpTypeFunction = 33, OpConstantTrue = 41, OpConstantFalse = 42, OpConstant = 43,
+    OpConvertSToF = 111, OpIAdd = 128, OpISub = 130, OpIMul = 132,
     OpConstantComposite = 44, OpFunction = 54, OpFunctionParameter = 55, OpFunctionEnd = 56,
     OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
     OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
@@ -61,7 +62,7 @@ enum {
 
 enum { DecBlock = 2, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
        DecBuiltIn = 11, DecLocation = 30, DecBinding = 33, DecDescriptorSet = 34, DecOffset = 35 };
-enum { BuiltInPosition = 0 };
+enum { BuiltInPosition = 0, BuiltInInstanceIndex = 43 };
 enum { ScUniformConstant = 0, ScInput = 1, ScUniform = 2, ScOutput = 3, ScFunction = 7,
        ScPushConstant = 9, ScStorageBuffer = 12 };
 enum { ExecVertex = 0, ExecFragment = 4 };
@@ -138,7 +139,8 @@ typedef struct {
     /* values: which input or constant qword a loaded value came from */
     int      fromInput;      /* index into inputs[], or -1 */
     int      fromConst;      /* constant qword: 0..PVK_VU1_PUSH_QWORDS-1 the push constants, then the
-                                uniform area; or -1 */
+                                uniform area, then INSTANCE_QWORD; or -1 */
+    int      instanceIndex;  /* the int value of gl_InstanceIndex, only float() may read it */
     /* values that live inside another value's register: v.w, v.xyz */
     uint32_t aliasOf;        /* id whose register this value shares, 0 if its own */
     int      comp;           /* field (0..3) holding a scalar value */
@@ -206,6 +208,8 @@ static const char *op_name(uint32_t op)
     case OpTranspose: return "OpTranspose (transpose: do it on the CPU)";
     case OpOuterProduct: return "OpOuterProduct (outer product)";
     case OpDot: return "OpDot (dot product)";
+    case OpIAdd: case OpISub: case OpIMul: return "integer arithmetic (VU1 computes with floats only)";
+    case OpConvertSToF: return "OpConvertSToF (float() of an integer)";
     case OpBranch: case OpBranchConditional: case OpSelectionMerge: case OpLoopMerge:
         return "control flow (if/else or loops)";
     case OpKill: return "discard";
@@ -341,7 +345,8 @@ typedef struct {
 } Block;
 
 /* Constant qwords a shader may read: the push constants, then the uniform area. */
-#define CONST_QWORDS (PVK_VU1_PUSH_QWORDS + PVK_VU1_UNIFORM_QWORDS)
+#define INSTANCE_QWORD (PVK_VU1_PUSH_QWORDS + PVK_VU1_UNIFORM_QWORDS) /* gl_InstanceIndex as a float in z */
+#define CONST_QWORDS (INSTANCE_QWORD + 1)
 
 typedef struct {
     uint32_t execModel;
@@ -359,6 +364,7 @@ typedef struct {
     int      texcoordLocation;      /* -1 if none */
     uint32_t texcoordValue;         /* value id stored to the texcoord output, 0 if never */
     uint32_t pushVar;               /* push constant block variable, 0 if none */
+    uint32_t instanceIndexVar;      /* gl_InstanceIndex, 0 if none */
     uint32_t pushBytes;             /* size of the push constant block */
     Block    uniforms[PVK_MAX_UNIFORM_BLOCKS]; /* uniform blocks, sorted by (set, binding) */
     int      uniformCount;
@@ -795,7 +801,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             uint32_t pointee = ids[w[1]].elemType;
             const char *name = ids[id].name ? ids[id].name : "variable";
 
-            if (storage == ScInput) {
+            if (storage == ScInput && ids[id].builtin == BuiltInInstanceIndex && sh->execModel == ExecVertex) {
+                sh->instanceIndexVar = id;
+            } else if (storage == ScInput) {
                 int size = type_size(ids, pointee);
 
                 if (ids[id].builtin >= 0)
@@ -971,6 +979,12 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     ids[id].texel = TEXEL_SAMPLER;
                     break;
                 }
+                if (ptr && ptr == sh->instanceIndexVar) {
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    ids[id].instanceIndex = 1;
+                    break;
+                }
                 if ((ids[ptr].kind != ID_VAR && ids[ptr].kind != ID_PTR) || ids[ptr].fromInput < 0)
                     fail("%s shader reads something other than a vertex input, push constant or uniform", stage);
                 ids[id].kind = ID_VALUE;
@@ -995,6 +1009,21 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[id].kind = ID_VALUE;
                 ids[id].valType = w[1];
                 ids[id].texel = TEXEL_SAMPLE;
+                break;
+            }
+            case OpConvertSToF: {
+                /* float(gl_InstanceIndex): the batch header keeps the index as a float. */
+                uint32_t id = w[2], src = w[3];
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                if (ids[src].kind != ID_VALUE || !ids[src].instanceIndex)
+                    fail("vertex shader converts an integer to float; VU1 computes with floats only, "
+                         "so only float(gl_InstanceIndex) is supported");
+                ids[id].kind = ID_VALUE;
+                ids[id].valType = w[1];
+                ids[id].fromConst = INSTANCE_QWORD;
+                ids[id].comp = 2;
                 break;
             }
             case OpFAdd: case OpFSub: case OpFMul: case OpFDiv: case OpFNegate:
@@ -1424,27 +1453,6 @@ static void vu(FILE *f, const char *upper, const char *lower, const char *commen
         fprintf(f, "         %-40s %s\n", upper, lower);
 }
 
-/*
- * VI08 = VI07 * qwords, the VU1 memory offset of an indexed vertex. VU1's
- * integer unit has no multiply or shift, so VI07 is doubled for each bit of
- * the count and the set bits are summed; at most 6 instructions for 8 inputs.
- */
-static void emit_index_scale(FILE *f, uint32_t qwords)
-{
-    int first = 1;
-    char buf[64];
-
-    for (uint32_t bit = 1; bit <= qwords; bit <<= 1) {
-        if (qwords & bit) {
-            snprintf(buf, sizeof(buf), "iadd          VI08,VI%s,VI07", first ? "00" : "08");
-            vu(f, "NOP", buf, first ? "index * qwords per vertex" : NULL);
-            first = 0;
-        }
-        if ((bit << 1) <= qwords)
-            vu(f, "NOP", "iadd          VI07,VI07,VI07", NULL);
-    }
-}
-
 /* Culling: when a vertex completes a triangle with the two before it (VF25,
  * VF26), a negative signed area * winding sign sets ADC in its XYZ2. */
 static void emit_cull(FILE *f, const char *sym)
@@ -1455,7 +1463,8 @@ static void emit_cull(FILE *f, const char *sym)
     vu(f, "sub.w         VF23,VF00,VF00", "isubiu        VI11,VI11,1", "ADC off; one vertex closer to a triangle");
     snprintf(buf, sizeof(buf), "ibeq          VI12,VI00,%s_xyz", sym);
     vu(f, "NOP", buf, "no culling");
-    vu(f, "NOP", "NOP", "branch delay slot");
+    snprintf(buf, sizeof(buf), "ilw.y         VI08,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_CULL);
+    vu(f, "NOP", buf, "delay slot: 1 for a fan");
     snprintf(buf, sizeof(buf), "ibne          VI11,VI00,%s_shift", sym);
     vu(f, "NOP", buf, "triangle not complete yet");
     vu(f, "NOP", "NOP", "branch delay slot");
@@ -1466,11 +1475,11 @@ static void emit_cull(FILE *f, const char *sym)
     vu(f, "opmsub.xyz    VF20,VF21,VF20", "NOP", "z = signed area");
     snprintf(buf, sizeof(buf), "lq            VF21,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_CULL);
     vu(f, "mul.z         VF20,VF20,VF24", buf, "area * sign, negative = cull; cull context");
-    vu(f, "NOP", "NOP", "MAC flags land 4 cycles later");
+    vu(f, "NOP", "iaddiu        VI13,VI00,0x20", "MAC flags land 4 cycles later; z negative flag");
     vu(f, "NOP", "NOP", NULL);
     vu(f, "NOP", "NOP", NULL);
     vu(f, "NOP", "NOP", NULL);
-    vu(f, "mulx.z        VF24,VF24,VF21", "fmand         VI13,VI14", "next triangle's sign; sign flag of z");
+    vu(f, "mulx.z        VF24,VF24,VF21", "fmand         VI13,VI13", "next triangle's sign; sign flag of z");
     snprintf(buf, sizeof(buf), "sq            VF24,%d(VI01)", PVK_VU1_INPUT_COUNT);
     vu(f, "NOP", buf, NULL);
     snprintf(buf, sizeof(buf), "ibeq          VI13,VI00,%s_shift", sym);
@@ -1481,7 +1490,7 @@ static void emit_cull(FILE *f, const char *sym)
     vu(f, "NOP", "mfir.w        VF23,VI13", "ADC on: the GS keeps the vertex but draws nothing");
     fprintf(f, "%s_shift:\n", sym);
     vu(f, "NOP", "isubiu        VI13,VI11,2", "0 at the batch's first vertex");
-    snprintf(buf, sizeof(buf), "ibeq          VI15,VI00,%s_p0", sym);
+    snprintf(buf, sizeof(buf), "ibeq          VI08,VI00,%s_p0", sym);
     vu(f, "NOP", buf, "not a fan: P0 <- P1");
     vu(f, "NOP", "NOP", "branch delay slot");
     snprintf(buf, sizeof(buf), "ibne          VI13,VI00,%s_p1", sym);
@@ -1555,7 +1564,10 @@ static void emit_const_load(FILE *f, const Shader *sh, int q, int reg)
 {
     char buf[64], buf2[64];
 
-    if (q < PVK_VU1_PUSH_QWORDS) {
+    if (q == INSTANCE_QWORD) {
+        snprintf(buf, sizeof(buf), "lq            VF%02d,%d(VI00)", reg, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_STRIDE);
+        snprintf(buf2, sizeof(buf2), "batch header, z = gl_InstanceIndex");
+    } else if (q < PVK_VU1_PUSH_QWORDS) {
         snprintf(buf, sizeof(buf), "lq            VF%02d,%d(VI00)", reg, PVK_VU1_PUSH_ADDR + q);
         snprintf(buf2, sizeof(buf2), "push constants, bytes %d..%d", q * 16, q * 16 + 15);
     } else {
@@ -2002,14 +2014,14 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, ";   VF25-VF26 the previous two screen positions (culling)\n");
     fprintf(f, ";   VF05-VF09, VF18-VF19, VF27-VF31 push constants, uniforms, constants and temporaries\n");
     fprintf(f, ";   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer\n");
-    fprintf(f, ";   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),\n");
-    fprintf(f, ";   VI10 first vertex, VI11 vertices to the next triangle, VI12 vertices per triangle\n");
-    fprintf(f, ";   (0 = no culling), VI13 unused vertices before the first, VI14 MAC flag mask, VI15 fan\n\n");
+    fprintf(f, ";   VI06 index pointer, VI07 qwords per vertex, VI08 scratch, VI09 index list offset\n");
+    fprintf(f, ";   (0 = in order), VI10 first vertex, VI11 vertices to the next triangle, VI12 vertices\n");
+    fprintf(f, ";   per triangle (0 = no culling), VI13 scratch, VI14 instances left, VI15 instance pointer\n\n");
     fprintf(f, "\t\t.vu\n\t\t.align 4\n");
     fprintf(f, "\t\t.global\t%s_CodeStart\n\t\t.global\t%s_Convert\n\t\t.global\t%s_CodeEnd\n", sym, sym, sym);
     fprintf(f, "%s_CodeStart:\n", sym);
 
-    fprintf(f, "; prologue: constants, batch header, GIF tag to the output\n");
+    fprintf(f, "; prologue: constants and the batch header\n");
     snprintf(buf, sizeof(buf), "lq            VF01,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_VIEWPORT_SCALE);
     vu(f, "NOP", buf, NULL);
     snprintf(buf, sizeof(buf), "lq            VF02,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_VIEWPORT_OFFSET);
@@ -2019,28 +2031,24 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     snprintf(buf, sizeof(buf), "iaddiu        VI01,VI00,%d", PVK_VU1_INPUT_ADDR);
     vu(f, "NOP", buf, "input base");
     snprintf(buf, sizeof(buf), "lq            VF04,%d(VI01)", PVK_VU1_INPUT_GIFTAG);
-    vu(f, "NOP", buf, "GIF tag for this batch");
+    vu(f, "NOP", buf, "GIF tag for each instance");
     snprintf(buf, sizeof(buf), "ilw.x         VI13,%d(VI01)", PVK_VU1_INPUT_FIRST);
-    vu(f, "NOP", buf, "qwords of unused vertices before the first");
-    snprintf(buf, sizeof(buf), "ilw.x         VI02,%d(VI01)", PVK_VU1_INPUT_COUNT);
-    vu(f, "NOP", buf, "vertex count");
-    snprintf(buf, sizeof(buf), "iaddiu        VI03,VI01,%d", PVK_VU1_INPUT_HEADER);
-    vu(f, "NOP", buf, "first unpacked vertex");
-    vu(f, "NOP", "iadd          VI03,VI03,VI13", "first vertex");
+    vu(f, "NOP", buf, "qword offset of the first vertex");
     snprintf(buf, sizeof(buf), "ilw.y         VI09,%d(VI01)", PVK_VU1_INPUT_COUNT);
     vu(f, "NOP", buf, "index list offset, 0 = vertices in order");
-    vu(f, "NOP", "iadd          VI10,VI03,VI00", "first vertex, kept for indexed fetches");
-    vu(f, "NOP", "iadd          VI06,VI01,VI09", "index pointer");
+    vu(f, "NOP", "iadd          VI10,VI01,VI13", "first vertex");
+    snprintf(buf, sizeof(buf), "ilw.x         VI07,%d(VI01)", PVK_VU1_INPUT_STRIDE);
+    vu(f, "NOP", buf, "qwords per vertex");
+    snprintf(buf, sizeof(buf), "ilw.z         VI14,%d(VI01)", PVK_VU1_INPUT_FIRST);
+    vu(f, "NOP", buf, "instances");
+    snprintf(buf, sizeof(buf), "ilw.w         VI15,%d(VI01)", PVK_VU1_INPUT_FIRST);
+    vu(f, "NOP", buf, "qword offset of the first instance");
     snprintf(buf, sizeof(buf), "iaddiu        VI04,VI00,%d", PVK_VU1_OUTPUT_ADDR);
     vu(f, "NOP", buf, "output base");
-    vu(f, "sub.xyzw      VF23,VF00,VF00", "sq            VF04,0(VI04)", "XYZ2 w = 0 (ADC off)");
-    vu(f, "NOP", "iaddiu        VI05,VI04,1", "output pointer");
-    vu(f, "NOP", "iaddiu        VI11,VI00,3", "the third vertex completes the first triangle");
+    vu(f, "sub.xyzw      VF23,VF00,VF00", "iadd          VI15,VI01,VI15", "XYZ2 w = 0 (ADC off); instance pointer");
+    vu(f, "NOP", "iadd          VI05,VI04,VI00", "output pointer");
     snprintf(buf, sizeof(buf), "ilw.z         VI12,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_CULL);
     vu(f, "NOP", buf, "vertices per triangle, 0 = no culling");
-    snprintf(buf, sizeof(buf), "ilw.y         VI15,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_CULL);
-    vu(f, "NOP", buf, "1 for a fan");
-    vu(f, "NOP", "iaddiu        VI14,VI00,0x20", "MAC flag: z negative");
 
     for (i = 0; i <= sh->bodyCount + 2; i++) {
         uint32_t use[MAX_OPERANDS] = { 0 };
@@ -2065,17 +2073,38 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         }
     }
 
+    fprintf(f, "%s_instance:\n", sym);
+    fprintf(f, "; each instance restarts the primitive with a GIF tag of its own\n");
+    vu(f, "NOP", "isubiu        VI14,VI14,1", "instances after this one");
+    snprintf(buf, sizeof(buf), "ilw.x         VI08,%d(VI01)", PVK_VU1_INPUT_GIFTAG);
+    vu(f, "NOP", buf, "NLOOP with EOP");
+    vu(f, "NOP", "sq            VF04,0(VI05)", "the instance's GIF tag");
+    vu(f, "NOP", "isubiu        VI08,VI08,0x4000", NULL);
+    snprintf(buf, sizeof(buf), "ibeq          VI14,VI00,%s_eop", sym);
+    vu(f, "NOP", buf, "the last instance keeps EOP");
+    vu(f, "NOP", "isubiu        VI08,VI08,0x4000", "delay slot: EOP off");
+    vu(f, "NOP", "isw.x         VI08,0(VI05)", "more instances follow");
+    fprintf(f, "%s_eop:\n", sym);
+    vu(f, "NOP", "iaddiu        VI05,VI05,1", NULL);
+    snprintf(buf, sizeof(buf), "lq            VF24,%d(VI01)", PVK_VU1_INPUT_FIRST);
+    vu(f, "NOP", buf, "y = winding sign of the first triangle");
+    snprintf(buf, sizeof(buf), "ilw.x         VI02,%d(VI01)", PVK_VU1_INPUT_COUNT);
+    vu(f, "NOP", buf, "vertices per instance");
+    vu(f, "NOP", "iadd          VI03,VI10,VI00", "first vertex");
+    vu(f, "NOP", "iadd          VI06,VI01,VI09", "index pointer");
+    vu(f, "addy.z        VF24,VF00,VF24", "iaddiu        VI11,VI00,3", "the third vertex completes the first triangle");
+    snprintf(buf, sizeof(buf), "sq.z          VF24,%d(VI01)", PVK_VU1_INPUT_COUNT);
+    vu(f, "NOP", buf, "the current triangle's sign");
     fprintf(f, "%s_loop:\n", sym);
-    fprintf(f, "; indexed batch: the next vertex is first vertex + index * %u\n", (unsigned)sh->inputCount);
+    fprintf(f, "; indexed batch: the list holds each vertex's qword offset from the first\n");
     snprintf(buf, sizeof(buf), "ibeq          VI09,VI00,%s_fetch", sym);
     vu(f, "NOP", buf, "vertices in order: VI03 already points at the next one");
     vu(f, "NOP", "NOP", "branch delay slot");
-    vu(f, "NOP", "ilw.x         VI07,0(VI06)", "index");
+    vu(f, "NOP", "ilw.x         VI08,0(VI06)", "index");
     vu(f, "NOP", "iaddiu        VI06,VI06,1", NULL);
-    emit_index_scale(f, sh->inputCount);
     vu(f, "NOP", "iadd          VI03,VI10,VI08", "vertex it refers to");
     fprintf(f, "%s_fetch:\n", sym);
-    fprintf(f, "; load inputs (location order)\n");
+    fprintf(f, "; load inputs (location order; the pipeline repoints each at its binding's stream)\n");
     for (i = 0; i < sh->inputCount; i++) {
         snprintf(buf, sizeof(buf), "lq            VF%02d,%d(VI03)", 10 + i, i);
         snprintf(buf2, sizeof(buf2), "location %d", sh->inputs[i].location);
@@ -2192,11 +2221,19 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX);
     }
     vu(f, "NOP", buf, NULL);
-    snprintf(buf, sizeof(buf), "iaddiu        VI03,VI03,%d", sh->inputCount);
-    vu(f, "NOP", buf, NULL);
+    vu(f, "NOP", "iadd          VI03,VI03,VI07", "next vertex");
     vu(f, "NOP", "isubiu        VI02,VI02,1", NULL);
-    vu(f, "NOP", "NOP", NULL);
+    snprintf(buf, sizeof(buf), "ilw.y         VI08,%d(VI01)", PVK_VU1_INPUT_STRIDE);
+    vu(f, "NOP", buf, "qwords per instance");
     snprintf(buf, sizeof(buf), "ibne          VI02,VI00,%s_loop", sym);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "lq            VF24,%d(VI01)", PVK_VU1_INPUT_STRIDE);
+    vu(f, "NOP", buf, "delay slot: z = gl_InstanceIndex");
+    vu(f, "NOP", "iadd          VI15,VI15,VI08", "next instance");
+    vu(f, "addw.z        VF24,VF24,VF00", "NOP", "gl_InstanceIndex + 1");
+    snprintf(buf, sizeof(buf), "sq.z          VF24,%d(VI01)", PVK_VU1_INPUT_STRIDE);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "ibne          VI14,VI00,%s_instance", sym);
     vu(f, "NOP", buf, NULL);
     vu(f, "NOP", "NOP", "branch delay slot");
 

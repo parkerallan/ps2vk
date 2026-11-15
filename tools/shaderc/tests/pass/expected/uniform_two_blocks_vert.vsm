@@ -6,9 +6,9 @@
 ;   VF25-VF26 the previous two screen positions (culling)
 ;   VF05-VF09, VF18-VF19, VF27-VF31 push constants, uniforms, constants and temporaries
 ;   VI02 vertices left, VI03 input pointer, VI04 output base, VI05 output pointer
-;   VI06 index pointer, VI07-VI08 index scaling, VI09 index list offset (0 = in order),
-;   VI10 first vertex, VI11 vertices to the next triangle, VI12 vertices per triangle
-;   (0 = no culling), VI13 unused vertices before the first, VI14 MAC flag mask, VI15 fan
+;   VI06 index pointer, VI07 qwords per vertex, VI08 scratch, VI09 index list offset
+;   (0 = in order), VI10 first vertex, VI11 vertices to the next triangle, VI12 vertices
+;   per triangle (0 = no culling), VI13 scratch, VI14 instances left, VI15 instance pointer
 
 		.vu
 		.align 4
@@ -16,39 +16,50 @@
 		.global	uniform_two_blocks_vert_Convert
 		.global	uniform_two_blocks_vert_CodeEnd
 uniform_two_blocks_vert_CodeStart:
-; prologue: constants, batch header, GIF tag to the output
+; prologue: constants and the batch header
          NOP                                      lq            VF01,0(VI00)
          NOP                                      lq            VF02,1(VI00)
          NOP                                      lq            VF03,2(VI00)
          NOP                                      iaddiu        VI01,VI00,80               ; input base
-         NOP                                      lq            VF04,0(VI01)               ; GIF tag for this batch
-         NOP                                      ilw.x         VI13,2(VI01)               ; qwords of unused vertices before the first
-         NOP                                      ilw.x         VI02,1(VI01)               ; vertex count
-         NOP                                      iaddiu        VI03,VI01,3                ; first unpacked vertex
-         NOP                                      iadd          VI03,VI03,VI13             ; first vertex
+         NOP                                      lq            VF04,0(VI01)               ; GIF tag for each instance
+         NOP                                      ilw.x         VI13,2(VI01)               ; qword offset of the first vertex
          NOP                                      ilw.y         VI09,1(VI01)               ; index list offset, 0 = vertices in order
-         NOP                                      iadd          VI10,VI03,VI00             ; first vertex, kept for indexed fetches
-         NOP                                      iadd          VI06,VI01,VI09             ; index pointer
+         NOP                                      iadd          VI10,VI01,VI13             ; first vertex
+         NOP                                      ilw.x         VI07,3(VI01)               ; qwords per vertex
+         NOP                                      ilw.z         VI14,2(VI01)               ; instances
+         NOP                                      ilw.w         VI15,2(VI01)               ; qword offset of the first instance
          NOP                                      iaddiu        VI04,VI00,512              ; output base
-         sub.xyzw      VF23,VF00,VF00             sq            VF04,0(VI04)               ; XYZ2 w = 0 (ADC off)
-         NOP                                      iaddiu        VI05,VI04,1                ; output pointer
-         NOP                                      iaddiu        VI11,VI00,3                ; the third vertex completes the first triangle
+         sub.xyzw      VF23,VF00,VF00             iadd          VI15,VI01,VI15             ; XYZ2 w = 0 (ADC off); instance pointer
+         NOP                                      iadd          VI05,VI04,VI00             ; output pointer
          NOP                                      ilw.z         VI12,3(VI00)               ; vertices per triangle, 0 = no culling
-         NOP                                      ilw.y         VI15,3(VI00)               ; 1 for a fan
-         NOP                                      iaddiu        VI14,VI00,0x20             ; MAC flag: z negative
 ; constants
          sub.xyzw      VF05,VF00,VF00             NOP                                      ; float constant
+uniform_two_blocks_vert_instance:
+; each instance restarts the primitive with a GIF tag of its own
+         NOP                                      isubiu        VI14,VI14,1                ; instances after this one
+         NOP                                      ilw.x         VI08,0(VI01)               ; NLOOP with EOP
+         NOP                                      sq            VF04,0(VI05)               ; the instance's GIF tag
+         NOP                                      isubiu        VI08,VI08,0x4000
+         NOP                                      ibeq          VI14,VI00,uniform_two_blocks_vert_eop ; the last instance keeps EOP
+         NOP                                      isubiu        VI08,VI08,0x4000           ; delay slot: EOP off
+         NOP                                      isw.x         VI08,0(VI05)               ; more instances follow
+uniform_two_blocks_vert_eop:
+         NOP                                      iaddiu        VI05,VI05,1
+         NOP                                      lq            VF24,2(VI01)               ; y = winding sign of the first triangle
+         NOP                                      ilw.x         VI02,1(VI01)               ; vertices per instance
+         NOP                                      iadd          VI03,VI10,VI00             ; first vertex
+         NOP                                      iadd          VI06,VI01,VI09             ; index pointer
+         addy.z        VF24,VF00,VF24             iaddiu        VI11,VI00,3                ; the third vertex completes the first triangle
+         NOP                                      sq.z          VF24,1(VI01)               ; the current triangle's sign
 uniform_two_blocks_vert_loop:
-; indexed batch: the next vertex is first vertex + index * 2
+; indexed batch: the list holds each vertex's qword offset from the first
          NOP                                      ibeq          VI09,VI00,uniform_two_blocks_vert_fetch ; vertices in order: VI03 already points at the next one
          NOP                                      NOP                                      ; branch delay slot
-         NOP                                      ilw.x         VI07,0(VI06)               ; index
+         NOP                                      ilw.x         VI08,0(VI06)               ; index
          NOP                                      iaddiu        VI06,VI06,1
-         NOP                                      iadd          VI07,VI07,VI07
-         NOP                                      iadd          VI08,VI00,VI07             ; index * qwords per vertex
          NOP                                      iadd          VI03,VI10,VI08             ; vertex it refers to
 uniform_two_blocks_vert_fetch:
-; load inputs (location order)
+; load inputs (location order; the pipeline repoints each at its binding's stream)
          NOP                                      lq            VF10,0(VI03)               ; location 0
          NOP                                      lq            VF11,1(VI03)               ; location 1
 ; input conversion: the pipeline patches each input's 4 pairs for its attribute format
@@ -100,7 +111,7 @@ uniform_two_blocks_vert_body:
 ; culling: test the triangle this vertex completes
          sub.w         VF23,VF00,VF00             isubiu        VI11,VI11,1                ; ADC off; one vertex closer to a triangle
          NOP                                      ibeq          VI12,VI00,uniform_two_blocks_vert_xyz ; no culling
-         NOP                                      NOP                                      ; branch delay slot
+         NOP                                      ilw.y         VI08,3(VI00)               ; delay slot: 1 for a fan
          NOP                                      ibne          VI11,VI00,uniform_two_blocks_vert_shift ; triangle not complete yet
          NOP                                      NOP                                      ; branch delay slot
          sub.xy        VF20,VF26,VF25             iadd          VI11,VI12,VI00             ; P1 - P0; vertices to the next triangle
@@ -108,11 +119,11 @@ uniform_two_blocks_vert_body:
          opmula.xyz    ACC,VF20,VF21              NOP
          opmsub.xyz    VF20,VF21,VF20             NOP                                      ; z = signed area
          mul.z         VF20,VF20,VF24             lq            VF21,3(VI00)               ; area * sign, negative = cull; cull context
-         NOP                                      NOP                                      ; MAC flags land 4 cycles later
+         NOP                                      iaddiu        VI13,VI00,0x20             ; MAC flags land 4 cycles later; z negative flag
          NOP                                      NOP
          NOP                                      NOP
          NOP                                      NOP
-         mulx.z        VF24,VF24,VF21             fmand         VI13,VI14                  ; next triangle's sign; sign flag of z
+         mulx.z        VF24,VF24,VF21             fmand         VI13,VI13                  ; next triangle's sign; sign flag of z
          NOP                                      sq            VF24,1(VI01)
          NOP                                      ibeq          VI13,VI00,uniform_two_blocks_vert_shift ; front facing: draw
          NOP                                      ilw.w         VI13,3(VI00)               ; delay slot: ADC bit
@@ -120,7 +131,7 @@ uniform_two_blocks_vert_body:
          NOP                                      mfir.w        VF23,VI13                  ; ADC on: the GS keeps the vertex but draws nothing
 uniform_two_blocks_vert_shift:
          NOP                                      isubiu        VI13,VI11,2                ; 0 at the batch's first vertex
-         NOP                                      ibeq          VI15,VI00,uniform_two_blocks_vert_p0 ; not a fan: P0 <- P1
+         NOP                                      ibeq          VI08,VI00,uniform_two_blocks_vert_p0 ; not a fan: P0 <- P1
          NOP                                      NOP                                      ; branch delay slot
          NOP                                      ibne          VI13,VI00,uniform_two_blocks_vert_p1 ; a fan's P0 stays its hub
          NOP                                      NOP                                      ; branch delay slot
@@ -134,10 +145,15 @@ uniform_two_blocks_vert_p1:
 uniform_two_blocks_vert_xyz:
          NOP                                      sq            VF23,1(VI05)               ; XYZ2 (draws unless ADC is set)
          NOP                                      iaddiu        VI05,VI05,2
-         NOP                                      iaddiu        VI03,VI03,2
+         NOP                                      iadd          VI03,VI03,VI07             ; next vertex
          NOP                                      isubiu        VI02,VI02,1
-         NOP                                      NOP
+         NOP                                      ilw.y         VI08,3(VI01)               ; qwords per instance
          NOP                                      ibne          VI02,VI00,uniform_two_blocks_vert_loop
+         NOP                                      lq            VF24,3(VI01)               ; delay slot: z = gl_InstanceIndex
+         NOP                                      iadd          VI15,VI15,VI08             ; next instance
+         addw.z        VF24,VF24,VF00             NOP                                      ; gl_InstanceIndex + 1
+         NOP                                      sq.z          VF24,3(VI01)
+         NOP                                      ibne          VI14,VI00,uniform_two_blocks_vert_instance
          NOP                                      NOP                                      ; branch delay slot
 ; send the batch to the GS and stop
          NOP                                      xgkick        VI04

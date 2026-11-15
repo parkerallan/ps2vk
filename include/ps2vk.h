@@ -647,7 +647,7 @@ typedef struct PvkShaderCode {
 
     const uint32_t *vu1CodeStart;          /**< Vertex: start of the VU1 microcode, linked into the ELF. */
     const uint32_t *vu1CodeEnd;            /**< Vertex: end of the VU1 microcode. */
-    const uint32_t *vu1Convert;            /**< Vertex: the input conversion block in the microcode: a branch, its delay slot, then 4 instructions per input (itof0 with loi scale, muli with loi -1, maxi, mul by VF00) that pvkCreateGraphicsPipeline() rewrites in its copy of the code for the attribute's format. */
+    const uint32_t *vu1Convert;            /**< Vertex: the input conversion block in the microcode, preceded by one load per input: a branch, its delay slot, then 4 instructions per input (itof0 with loi scale, muli with loi -1, maxi, mul by VF00). pvkCreateGraphicsPipeline() rewrites the block in its copy of the code for each attribute's format and points each load at the input's qword of the vertex or the instance. */
     uint32_t        inputCount;            /**< Vertex: number of inputs, each one vec4. */
     uint32_t        inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< Vertex: input locations, in the order VU1 reads them. */
     int32_t         colorOutputLocation;   /**< Vertex: location of the color output, or -1 if none. */
@@ -718,6 +718,12 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
  */
 void      pvkDestroyPipelineLayout(PvkDevice device, PvkPipelineLayout layout);
 
+/** @brief How often a vertex buffer binding advances. Values match Vulkan's VkVertexInputRate. */
+typedef enum PvkVertexInputRate {
+    PVK_VERTEX_INPUT_RATE_VERTEX   = 0, /**< One element per vertex. */
+    PVK_VERTEX_INPUT_RATE_INSTANCE = 1  /**< One element per instance of the draw: every vertex of an instance reads the same values. */
+} PvkVertexInputRate;
+
 /**
  * @brief A vertex buffer binding: one stream of vertices, like VkVertexInputBindingDescription.
  *
@@ -728,11 +734,19 @@ void      pvkDestroyPipelineLayout(PvkDevice device, PvkPipelineLayout layout);
  * share a binding; an attribute of any other format is a binding of its own
  * (its stride is the format's size: 16-bit RGB normals are 6 bytes, 8-bit RGBA
  * colors 4). So a mesh with mixed formats keeps one array per format, bound
- * with pvkCmdBindVertexBuffers(). No per-instance rate.
+ * with pvkCmdBindVertexBuffers().
+ *
+ * A binding with PVK_VERTEX_INPUT_RATE_INSTANCE holds one element per
+ * instance of a draw instead of per vertex: the draw's instanceCount and
+ * firstInstance pick which, and VU1 reads the element once per instance while
+ * it runs the vertices again. gl_InstanceIndex is firstInstance plus the
+ * instance's number, as in Vulkan; VU1 keeps it as a float, so a shader reads
+ * it only as float(gl_InstanceIndex).
  */
 typedef struct PvkVertexInputBinding {
-    uint32_t binding; /**< Binding number, below PVK_MAX_VERTEX_BINDINGS. */
-    uint32_t stride;  /**< Bytes per vertex in this binding: the attributes' format size times their count. */
+    uint32_t           binding;   /**< Binding number, below PVK_MAX_VERTEX_BINDINGS. */
+    uint32_t           stride;    /**< Bytes per element in this binding: the attributes' format size times their count. */
+    PvkVertexInputRate inputRate; /**< Per vertex or per instance. */
 } PvkVertexInputBinding;
 
 /** @brief One vertex attribute, like VkVertexInputAttributeDescription. */
@@ -915,7 +929,9 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  * PvkPipelineColorBlendAttachmentState). Every vertex shader input needs an
  * attribute in a declared binding (see PvkVertexInputBinding); the pipeline
  * keeps its own copy of the VU1 code with the integer-to-float conversion
- * each input's format needs patched in, so float inputs cost nothing.
+ * each input's format needs patched in, so float inputs cost nothing, and
+ * each input's load pointed at its binding's per-vertex or per-instance
+ * stream.
  *
  * @param device The device.
  * @param info Pipeline parameters.
@@ -1340,35 +1356,45 @@ void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, ui
                               uint32_t setCount, const PvkDescriptorSet *sets);
 
 /**
- * @brief Draws vertices from the bound vertex buffer.
+ * @brief Draws vertices from the bound vertex buffers, like vkCmdDraw.
  *
  * Must be called between pvkCmdBeginRendering() and pvkCmdEndRendering(),
- * with a pipeline and vertex buffer bound. The pipeline's depthAttachmentFormat
- * must match the depth attachment (or its absence). The pipeline's topology
- * groups the vertices into primitives; only whole ones are drawn.
+ * with a pipeline and its vertex buffers bound. The pipeline's
+ * depthAttachmentFormat must match the depth attachment (or its absence). The
+ * pipeline's topology groups the vertices into primitives; only whole ones are
+ * drawn. The vertices are drawn once per instance, in instance order, each
+ * instance starting its primitives afresh, with the instance-rate bindings
+ * supplying what differs between them. When the whole draw fits one batch of
+ * VU1 work, a batch holds as many instances as its output has room for, so
+ * a small mesh drawn many times is sent once per batch.
  *
  * @param cmd The command buffer.
  * @param vertexCount Number of vertices to draw.
+ * @param instanceCount Number of instances; 0 draws nothing.
  * @param firstVertex Index of the first vertex.
+ * @param firstInstance Index of the first instance in the instance-rate bindings.
  */
-void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t firstVertex);
+void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
+                uint32_t firstInstance);
 
 /**
- * @brief Draws vertices from the bound vertex buffer in the order the bound
- *        index buffer gives.
+ * @brief Draws vertices in the order the bound index buffer gives, like vkCmdDrawIndexed.
  *
  * Needs what pvkCmdDraw() needs plus an index buffer. The vertices a batch
  * refers to are sent to VU1 as one block, so index lists that stay local in
  * the vertex buffer (a mesh in draw order) use the least DMA; VU1 then fetches
  * each vertex by its index. The pipeline's topology groups the indices into
- * primitives; only whole ones are drawn.
+ * primitives; only whole ones are drawn. Instances work as in pvkCmdDraw().
  *
  * @param cmd The command buffer.
  * @param indexCount Number of indices to draw.
+ * @param instanceCount Number of instances; 0 draws nothing.
  * @param firstIndex Position of the first index in the index buffer.
  * @param vertexOffset Added to every index before it selects a vertex.
+ * @param firstInstance Index of the first instance in the instance-rate bindings.
  */
-void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset);
+void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
+                       int32_t vertexOffset, uint32_t firstInstance);
 
 /** @} */
 

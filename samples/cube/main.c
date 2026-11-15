@@ -401,7 +401,7 @@ int main(void)
         size_t vertexOffsets[2] = { 0, sizeof(positions) };
         pvkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, vertexOffsets);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
-        pvkCmdDrawIndexed(cmd, 36, 0, 0);
+        pvkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
         pvkCmdEndRendering(cmd);
         CHECK(pvkEndCommandBuffer(cmd));
 
