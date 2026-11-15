@@ -1,1 +1,0 @@
-instance_index_int.vert:8: error: vertex shader uses integer arithmetic (VU1 computes with floats only), which this version of ps2vk-shaderc does not compile yet

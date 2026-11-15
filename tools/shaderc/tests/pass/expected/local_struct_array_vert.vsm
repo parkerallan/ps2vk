@@ -40,7 +40,6 @@ local_struct_array_vert_CodeStart:
          addi.y        VF05,VF05,I                NOP
          NOP                                      loi           0x3f4d41b3                 ; 0.801783741
          addi.z        VF05,VF05,I                NOP
-         sub.xyzw      VF06,VF00,VF00             NOP                                      ; float constant
 local_struct_array_vert_instance:
 ; each instance restarts the primitive with a GIF tag of its own
          NOP                                      isubiu        VI14,VI14,1                ; instances after this one
@@ -83,15 +82,15 @@ local_struct_array_vert_Convert:
          mul.xyzw      VF11,VF00,VF00             NOP                                      ; components the format lacks: 0, w = 1
 local_struct_array_vert_body:
 ; shader body
-         add.xyzw      VF07,VF10,VF05             NOP                                      ; line 22: OpFAdd (addition)
-         mul.xyzw      VF08,VF10,VF05             NOP                                      ; line 25: dot()
-         addy.x        VF08,VF08,VF08y            NOP
-         addz.x        VF08,VF08,VF08z            NOP
-         addw.x        VF08,VF08,VF08w            NOP
-         maxx.x        VF09,VF08,VF06x            NOP                                      ; line 25: max()
-         mulx.xyzw     VF08,VF11,VF09x            NOP                                      ; line 25: OpVectorTimesScalar (vector * scalar)
-         NOP                                      move.xyzw     VF20,VF07                  ; gl_Position
-         NOP                                      move.xyzw     VF21,VF08                  ; color output, location 0
+         add.xyzw      VF06,VF10,VF05             NOP                                      ; line 22: OpFAdd (addition)
+         mul.xyzw      VF07,VF10,VF05             NOP                                      ; line 25: dot()
+         addy.x        VF07,VF07,VF07y            NOP
+         addz.x        VF07,VF07,VF07z            NOP
+         addw.x        VF07,VF07,VF07w            NOP
+         maxx.x        VF08,VF07,VF00x            NOP                                      ; line 25: max()
+         mulx.xyzw     VF07,VF11,VF08x            NOP                                      ; line 25: OpVectorTimesScalar (vector * scalar)
+         NOP                                      move.xyzw     VF20,VF06                  ; gl_Position
+         NOP                                      move.xyzw     VF21,VF07                  ; color output, location 0
 ; epilogue: perspective divide, viewport, GS formats, store
          NOP                                      div           Q,VF00w,VF20w              ; Q = 1 / w
          NOP                                      waitq

@@ -1,0 +1,1 @@
+int_divide.vert:12: error: vertex shader uses integer division (VU1 computes with floats only: divide floats and take int() of the result), which this version of ps2vk-shaderc does not compile yet

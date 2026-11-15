@@ -32,8 +32,6 @@ uniform_two_blocks_vert_CodeStart:
          sub.xyzw      VF23,VF00,VF00             iadd          VI15,VI01,VI15             ; XYZ2 w = 0 (ADC off); instance pointer
          NOP                                      iadd          VI05,VI04,VI00             ; output pointer
          NOP                                      ilw.z         VI12,3(VI00)               ; vertices per triangle, 0 = no culling
-; constants
-         sub.xyzw      VF05,VF00,VF00             NOP                                      ; float constant
 uniform_two_blocks_vert_instance:
 ; each instance restarts the primitive with a GIF tag of its own
          NOP                                      isubiu        VI14,VI14,1                ; instances after this one
@@ -76,27 +74,27 @@ uniform_two_blocks_vert_Convert:
          mul.xyzw      VF11,VF00,VF00             NOP                                      ; components the format lacks: 0, w = 1
 uniform_two_blocks_vert_body:
 ; shader body
-         NOP                                      lq            VF06,4(VI00)               ; push constants, bytes 0..15
-         add.xyzw      VF06,VF10,VF06             NOP                                      ; line 28: OpFAdd (addition)
-         NOP                                      lq            VF07,20(VI00)              ; uniform 'cam', bytes 0..15
-         NOP                                      lq            VF08,21(VI00)              ; uniform 'cam', bytes 16..31
-         NOP                                      lq            VF09,22(VI00)              ; uniform 'cam', bytes 32..47
-         NOP                                      lq            VF18,23(VI00)              ; uniform 'cam', bytes 48..63
-         mulax.xyzw    ACC,VF07,VF06x             NOP                                      ; line 28: OpMatrixTimesVector (matrix * vector)
-         madday.xyzw   ACC,VF08,VF06y             NOP
-         maddaz.xyzw   ACC,VF09,VF06z             NOP
-         maddw.xyzw    VF06,VF18,VF06w            NOP
-         NOP                                      lq            VF07,16(VI00)              ; uniform 'lights', bytes 0..15
-         mul.xyz       VF08,VF11,VF07             NOP                                      ; line 29: dot()
-         addy.x        VF08,VF08,VF08y            NOP
-         addz.x        VF08,VF08,VF08z            NOP
-         maxx.x        VF07,VF08,VF05x            NOP                                      ; line 29: max()
-         NOP                                      lq            VF08,18(VI00)              ; uniform 'lights', bytes 32..47
-         mulx.x        VF07,VF07,VF08x            NOP                                      ; line 29: OpFMul (multiplication)
-         NOP                                      lq            VF08,19(VI00)              ; uniform 'lights', bytes 48..63
-         mulx.xyzw     VF07,VF08,VF07x            NOP                                      ; line 29: OpVectorTimesScalar (vector * scalar)
-         NOP                                      move.xyzw     VF20,VF06                  ; gl_Position
-         NOP                                      move.xyzw     VF21,VF07                  ; color output, location 0
+         NOP                                      lq            VF05,4(VI00)               ; push constants, bytes 0..15
+         add.xyzw      VF05,VF10,VF05             NOP                                      ; line 28: OpFAdd (addition)
+         NOP                                      lq            VF06,20(VI00)              ; uniform 'cam', bytes 0..15
+         NOP                                      lq            VF07,21(VI00)              ; uniform 'cam', bytes 16..31
+         NOP                                      lq            VF08,22(VI00)              ; uniform 'cam', bytes 32..47
+         NOP                                      lq            VF09,23(VI00)              ; uniform 'cam', bytes 48..63
+         mulax.xyzw    ACC,VF06,VF05x             NOP                                      ; line 28: OpMatrixTimesVector (matrix * vector)
+         madday.xyzw   ACC,VF07,VF05y             NOP
+         maddaz.xyzw   ACC,VF08,VF05z             NOP
+         maddw.xyzw    VF05,VF09,VF05w            NOP
+         NOP                                      lq            VF06,16(VI00)              ; uniform 'lights', bytes 0..15
+         mul.xyz       VF07,VF11,VF06             NOP                                      ; line 29: dot()
+         addy.x        VF07,VF07,VF07y            NOP
+         addz.x        VF07,VF07,VF07z            NOP
+         maxx.x        VF06,VF07,VF00x            NOP                                      ; line 29: max()
+         NOP                                      lq            VF07,18(VI00)              ; uniform 'lights', bytes 32..47
+         mulx.x        VF06,VF06,VF07x            NOP                                      ; line 29: OpFMul (multiplication)
+         NOP                                      lq            VF07,19(VI00)              ; uniform 'lights', bytes 48..63
+         mulx.xyzw     VF06,VF07,VF06x            NOP                                      ; line 29: OpVectorTimesScalar (vector * scalar)
+         NOP                                      move.xyzw     VF20,VF05                  ; gl_Position
+         NOP                                      move.xyzw     VF21,VF06                  ; color output, location 0
 ; epilogue: perspective divide, viewport, GS formats, store
          NOP                                      div           Q,VF00w,VF20w              ; Q = 1 / w
          NOP                                      waitq

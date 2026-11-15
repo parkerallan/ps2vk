@@ -1,0 +1,1 @@
+compare_vector.vert:8: error: vertex shader compares vectors; VU1 tests one value at a time, so compare components one by one

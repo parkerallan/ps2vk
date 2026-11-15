@@ -5,8 +5,9 @@
  *   .frag --glslangValidator--> .spv --shaderc--> .c                            (GS settings in a PvkShaderCode)
  *
  * shaderc first runs spirv-opt (SPIRV-Tools) on its input to inline function
- * calls and turn local variables into plain values, so the body it compiles
- * is straight-line code over ids that live in registers.
+ * calls, turn local variables into plain values and unroll loops with a
+ * constant count, so the body it compiles is a few blocks of code over ids
+ * that live in registers, joined by branches and phis.
  *
  * This version accepts:
  *
@@ -19,9 +20,12 @@
  *             picked by an int block member, gl_InstanceIndex or int() of a
  *             float, and float/vec4/matrix constants with +, -, *, / and
  *             negation, matrix * vector, swizzles (v.xyz, v.bgra), component
- *             reads (v.w), vector constructors, math built-ins, local
- *             variables (vectors, matrices, structs and arrays indexed by
- *             constants) and calls to the shader's own functions
+ *             reads (v.w) and writes (v.w = x), vector constructors, math
+ *             built-ins, local variables (vectors, matrices, structs and
+ *             arrays indexed by constants), calls to the shader's own
+ *             functions, int counters and arithmetic (+, -, * as floats),
+ *             comparisons with &&, || and !, if/else, ?: and loops (unrolled
+ *             when the count is constant, else VU1 branches)
  *   fragment: outColor = vColor;                      (Gouraud)
  *             outColor = texture(tex, vUV);           (GS TFX decal)
  *             outColor = texture(tex, vUV) * vColor;  (GS TFX modulate)
@@ -43,7 +47,9 @@
 #define MAX_IDS     4096
 #define MAX_INPUTS  8
 #define MAX_BODY    256
-#define MAX_OPERANDS 5
+#define MAX_OPERANDS 8
+#define MAX_PHIS    64
+#define MAX_PHI_PREDS 8
 
 /* SPIR-V opcodes used here (SPIR-V 1.x specification). */
 enum {
@@ -54,20 +60,36 @@ enum {
     OpTypeMatrix = 24, OpTypeImage = 25, OpTypeSampler = 26, OpTypeSampledImage = 27,
     OpTypeArray = 28, OpTypeRuntimeArray = 29, OpTypeStruct = 30, OpTypePointer = 32,
     OpTypeFunction = 33, OpConstantTrue = 41, OpConstantFalse = 42, OpConstant = 43,
-    OpConvertFToS = 110, OpConvertSToF = 111, OpIAdd = 128, OpISub = 130, OpIMul = 132,
+    OpConvertFToU = 109, OpConvertFToS = 110, OpConvertSToF = 111, OpConvertUToF = 112,
+    OpBitcast = 124, OpSNegate = 126, OpIAdd = 128, OpISub = 130, OpIMul = 132,
+    OpUDiv = 134, OpSDiv = 135, OpUMod = 137, OpSRem = 138, OpSMod = 139,
     OpConstantComposite = 44, OpFunction = 54, OpFunctionParameter = 55, OpFunctionEnd = 56,
     OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
     OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
-    OpCompositeExtract = 81, OpTranspose = 84, OpSampledImage = 86,
+    OpCompositeExtract = 81, OpCompositeInsert = 82, OpTranspose = 84, OpSampledImage = 86,
     OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
     OpFNegate = 127, OpFAdd = 129, OpFSub = 131, OpFMul = 133, OpFDiv = 136,
     OpVectorTimesScalar = 142, OpMatrixTimesScalar = 143, OpVectorTimesMatrix = 144,
     OpMatrixTimesVector = 145, OpMatrixTimesMatrix = 146, OpOuterProduct = 147, OpDot = 148,
-    OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249,
-    OpBranchConditional = 250, OpKill = 252, OpReturn = 253, OpReturnValue = 254,
-    OpNoLine = 317, OpModuleProcessed = 330,
-    OpDynLoad = 0x10000             /* ours: lq of a block qword through VI08 */
+    OpAny = 154, OpAll = 155, OpLogicalOr = 166, OpLogicalAnd = 167, OpLogicalNot = 168,
+    OpSelect = 169, OpIEqual = 170, OpINotEqual = 171, OpUGreaterThan = 172,
+    OpSGreaterThan = 173, OpUGreaterThanEqual = 174, OpSGreaterThanEqual = 175,
+    OpULessThan = 176, OpSLessThan = 177, OpULessThanEqual = 178, OpSLessThanEqual = 179,
+    OpFOrdEqual = 180, OpFUnordEqual = 181, OpFOrdNotEqual = 182, OpFUnordNotEqual = 183,
+    OpFOrdLessThan = 184, OpFUnordLessThan = 185, OpFOrdGreaterThan = 186,
+    OpFUnordGreaterThan = 187, OpFOrdLessThanEqual = 188, OpFUnordLessThanEqual = 189,
+    OpFOrdGreaterThanEqual = 190, OpFUnordGreaterThanEqual = 191,
+    OpShiftRightLogical = 194, OpBitwiseXor = 198, OpNot = 200,
+    OpPhi = 245, OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249,
+    OpBranchConditional = 250, OpSwitch = 251, OpKill = 252, OpReturn = 253, OpReturnValue = 254,
+    OpUnreachable = 255, OpNoLine = 317, OpModuleProcessed = 330,
+    OpDynLoad = 0x10000,            /* ours: lq of a block qword through VI08 */
+    OpPhiMove = 0x10001,            /* ours: copy a value into a phi's register at the end of a block */
+    OpConstLoad = 0x10002,          /* ours: lq of a push constant or uniform qword */
+    OpBoolToFloat = 0x10003         /* ours: a condition as a float, 0 = false, for a bool kept by a phi */
 };
+#define LoopControlUnroll     1
+#define LoopControlDontUnroll 2
 
 enum { DecBlock = 2, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
        DecBuiltIn = 11, DecLocation = 30, DecBinding = 33, DecDescriptorSet = 34, DecOffset = 35 };
@@ -119,7 +141,12 @@ static const ExtFn *ext_fn(uint32_t num)
 /* What we know about each SPIR-V result id. */
 typedef enum { ID_NONE, ID_TYPE, ID_CONST, ID_VAR, ID_VALUE, ID_PTR } IdKind;
 typedef enum { T_OTHER, T_FLOAT, T_INT, T_VECTOR, T_MATRIX, T_STRUCT, T_POINTER, T_ARRAY,
-               T_SAMPLER /* sampler2D: OpTypeSampledImage */ } TypeKind;
+               T_SAMPLER /* sampler2D: OpTypeSampledImage */, T_BOOL } TypeKind;
+
+/* How a bool is known. VU1 has no bool registers: a comparison is made where it
+ * is tested (the MAC flags of a subtraction), and/or/not combine such tests with
+ * short-circuit branches, and a bool a phi carries across blocks is a float. */
+enum { BOOL_NONE, BOOL_CMP, BOOL_FLOAT, BOOL_AND, BOOL_OR };
 
 typedef struct {
     IdKind   kind;
@@ -137,6 +164,7 @@ typedef struct {
     uint32_t valType;        /* type id of a constant or value */
     uint32_t comps[4];       /* constant components (float bits) */
     int      compCount;      /* 0 if the constant isn't a float or float vector */
+    int      vf00;           /* scalar constant 0 or 1: read from VF00 (field comp) */
     /* variables and pointers */
     uint32_t varType;        /* pointer type id */
     int      location;       /* -1 if none */
@@ -156,6 +184,14 @@ typedef struct {
     int      dynCount;       /* pointer: elements (or columns) the index is clamped to */
     uint32_t floatIndex;     /* int value: the float it is int() of, 0 if none */
     uint32_t dynCol0;        /* matrix read at run time: id of its first column value, the rest follow */
+    /* ints: VU1 computes with floats, so an int that is counted or compared is one */
+    int      intIsFloat;     /* int value held as a float (a counter, a sum, a phi) */
+    uint32_t asFloat;        /* int value: id of its float form once made, 0 if not yet */
+    /* bools */
+    int      boolKind;       /* BOOL_* */
+    uint32_t boolA, boolB;   /* CMP: a - b is tested; FLOAT: the float; AND/OR: the two bools */
+    int      boolZero;       /* CMP: test the zero flag (==) instead of the sign flag (<) */
+    int      boolInv;        /* CMP/FLOAT: true when the flag is clear */
     /* values that live inside another value's register: v.w, v.xyz */
     uint32_t aliasOf;        /* id whose register this value shares, 0 if its own */
     int      comp;           /* field (0..3) holding a scalar value */
@@ -229,8 +265,17 @@ static const char *op_name(uint32_t op)
     case OpConvertSToF: return "OpConvertSToF (float() of an integer)";
     case OpConvertFToS: return "OpConvertFToS (int() of a float)";
     case OpDynLoad: return "a block element picked at run time";
+    case OpCompositeInsert: return "OpCompositeInsert (a component write)";
+    case OpSelect: return "OpSelect (?:)";
+    case OpPhi: return "OpPhi (a value chosen by a branch)";
     case OpBranch: case OpBranchConditional: case OpSelectionMerge: case OpLoopMerge:
         return "control flow (if/else or loops)";
+    case OpSwitch: return "switch (write if/else)";
+    case OpAny: case OpAll: return "any()/all() (compare components one at a time)";
+    case OpUDiv: case OpSDiv: case OpUMod: case OpSRem: case OpSMod:
+        return "integer division (VU1 computes with floats only: divide floats and take int() of the result)";
+    case OpShiftRightLogical: case OpBitwiseXor: case OpNot: case OpBitcast:
+        return "bit manipulation (VU1 computes with floats only)";
     case OpKill: return "discard";
     default: return NULL;
     }
@@ -254,7 +299,33 @@ static void unsupported(uint32_t op, const char *stage)
          "compile yet", what);
 }
 
-/* Inlines calls and promotes locals to values; the result goes next to the output. */
+static uint32_t *read_spirv(const char *path, size_t *words);
+
+/* Marks every loop for unrolling unless the GLSL says [[dont_unroll]]: spirv-opt
+ * unrolls only loops that carry the flag, and only when it knows the count. */
+static void mark_loops_unroll(const char *path)
+{
+    size_t words, pc;
+    uint32_t *code = read_spirv(path, &words);
+    FILE *f;
+
+    for (pc = 5; pc < words;) {
+        uint32_t op = code[pc] & 0xffff, n = code[pc] >> 16;
+        if (n == 0 || pc + n > words)
+            fail("corrupt SPIR-V from spirv-opt");
+        if (op == OpLoopMerge && n >= 4 && !(code[pc + 3] & LoopControlDontUnroll))
+            code[pc + 3] |= LoopControlUnroll;
+        pc += n;
+    }
+    f = fopen(path, "wb");
+    if (!f || fwrite(code, 4, words, f) != words)
+        fail("cannot write %s", path);
+    fclose(f);
+    free(code);
+}
+
+/* Inlines calls, promotes locals to values and unrolls constant loops; the
+ * result goes next to the output. */
 static const char *optimize(const char *in, const char *outBase)
 {
     static char opt[512];
@@ -263,9 +334,15 @@ static const char *optimize(const char *in, const char *outBase)
     snprintf(opt, sizeof(opt), "%s.opt.spv", outBase);
     snprintf(cmd, sizeof(cmd),
              "spirv-opt --inline-entry-points-exhaustive --eliminate-dead-functions "
-             "--scalar-replacement=100 --eliminate-local-single-block "
+             "--convert-local-access-chains --scalar-replacement=100 --eliminate-local-single-block "
              "--eliminate-local-single-store --eliminate-local-multi-store "
              "--simplify-instructions --eliminate-dead-code-aggressive -o \"%s\" \"%s\"", opt, in);
+    if (system(cmd) != 0)
+        fail("spirv-opt failed on %s (SPIRV-Tools must be installed)", in);
+    mark_loops_unroll(opt);
+    snprintf(cmd, sizeof(cmd),
+             "spirv-opt --loop-unroll --merge-blocks --simplify-instructions --ccp "
+             "--eliminate-dead-code-aggressive --simplify-instructions -o \"%s\" \"%s\"", opt, opt);
     if (system(cmd) != 0)
         fail("spirv-opt failed on %s (SPIRV-Tools must be installed)", in);
     return opt;
@@ -299,11 +376,17 @@ static int is_float(const IdInfo *ids, uint32_t type)
     return ids[type].type == T_FLOAT && ids[type].width == 32;
 }
 
-/* Component count of a float or vecN type, 0 for anything else. */
+static int is_int(const IdInfo *ids, uint32_t type)
+{
+    return ids[type].type == T_INT && ids[type].width == 32;
+}
+
+/* Component count of a float, int or vecN type, 0 for anything else. An int is
+ * a float to VU1, exact below 2^24. */
 static int type_size(const IdInfo *ids, uint32_t type)
 {
     const IdInfo *t = &ids[type];
-    if (is_float(ids, type))
+    if (is_float(ids, type) || is_int(ids, type))
         return 1;
     if (t->type == T_VECTOR && t->elemCount >= 2 && t->elemCount <= 4 && is_float(ids, t->elemType))
         return (int)t->elemCount;
@@ -321,6 +404,30 @@ static int value_size(const IdInfo *ids, uint32_t id, const char *stage)
     if (!size)
         fail("%s shader computes with a type other than float, vec2, vec3 or vec4; only those are supported so far", stage);
     return size;
+}
+
+/* a < b and the like as VU1 tests them: the sign (S) or zero (Z) MAC flag of
+ * a - b, or of b - a when swap is set, true when the flag is set unless inv. */
+static int compare_kind(uint32_t op, int *swap, int *zero, int *inv)
+{
+    *swap = *zero = *inv = 0;
+    switch (op) {
+    case OpIEqual: case OpFOrdEqual: case OpFUnordEqual:
+        *zero = 1; return 1;
+    case OpINotEqual: case OpFOrdNotEqual: case OpFUnordNotEqual:
+        *zero = 1; *inv = 1; return 1;
+    case OpULessThan: case OpSLessThan: case OpFOrdLessThan: case OpFUnordLessThan:
+        return 1;
+    case OpUGreaterThan: case OpSGreaterThan: case OpFOrdGreaterThan: case OpFUnordGreaterThan:
+        *swap = 1; return 1;
+    case OpULessThanEqual: case OpSLessThanEqual: case OpFOrdLessThanEqual: case OpFUnordLessThanEqual:
+        *swap = 1; *inv = 1; return 1;    /* !(b < a) */
+    case OpUGreaterThanEqual: case OpSGreaterThanEqual: case OpFOrdGreaterThanEqual:
+    case OpFUnordGreaterThanEqual:
+        *inv = 1; return 1;               /* !(a < b) */
+    default:
+        return 0;
+    }
 }
 
 /* The value that owns the register an alias (v.w, v.xyz) lives in. */
@@ -363,17 +470,36 @@ typedef struct {
     int      dynInt;                /* OpDynLoad: ops[0] holds the index as an int (itof0 first), else a float */
     int      dynComp;               /* OpDynLoad: field of ops[0] holding the index */
     uint32_t dynLast;               /* OpDynLoad: the last valid index, float bits */
+    uint32_t target, target2;       /* OpBranch(Conditional): labels taken when true, false */
+    uint32_t cond;                  /* OpBranchConditional, OpSelect, OpBoolToFloat: the bool; its
+                                       comparisons' operands follow the other operands in ops[] */
+    int      outVar;                /* OpStore: OUT_* */
     uint32_t line;                  /* GLSL line, 0 if unknown */
 } BodyOp;
 
+enum { OUT_POSITION, OUT_COLOR, OUT_TEXCOORD, OUT_COUNT };
 enum { FIELD_ZERO = -1, FIELD_ONE = -2, FIELD_UNDEF = -3 };
 #define SHUFFLE_UNDEF 0xffffffffu
 
 static int is_map_op(uint32_t op)
 {
     return op == OpVectorShuffle || op == OpCompositeConstruct || op == OpCompositeExtract ||
+           op == OpCompositeInsert ||
            op == OpLoad;   /* a vec2/vec3 push constant or uniform that does not start at field x */
 }
+
+static int is_branch_op(uint32_t op)
+{
+    return op == OpBranch || op == OpBranchConditional;
+}
+
+/* A phi: the value of its block is the source from whichever block ran last. */
+typedef struct {
+    uint32_t id;
+    uint32_t vals[MAX_PHI_PREDS], preds[MAX_PHI_PREDS];
+    int      count;
+    int      isBool, isInt;
+} Phi;
 
 /* A uniform block: a descriptor set binding whose buffer the draw copies into
  * the VU1 uniform area, at the qword shaderc gives it. */
@@ -411,13 +537,33 @@ typedef struct {
     int      uniformCount;
     uint32_t constBase;             /* synthetic id of constant qword 0 (then qword 1, ...) */
     uint32_t nextId;                /* next free synthetic id, after the constant qwords */
+    uint32_t floatType;             /* id of the 32-bit float type */
     uint32_t positionVar;           /* gl_PerVertex or Position variable, 0 if none */
     uint32_t positionValue;         /* value id stored to gl_Position, 0 if never */
     uint32_t colorValue;            /* value id stored to the color output, 0 if never */
     int      colorLocation;         /* -1 if none */
     BodyOp   body[MAX_BODY];
     int      bodyCount;
+    Phi      phis[MAX_PHIS];
+    int      phiCount;
+    int      returns;               /* OpReturns seen; the body may have only one */
+    uint32_t lastLabel;             /* the block OpReturn ends */
 } Shader;
+
+/* The next body op, zeroed, at the current GLSL line. */
+static BodyOp *new_op(BodyOp *body, int *count, uint32_t op, uint32_t result)
+{
+    BodyOp *b;
+
+    if (*count == MAX_BODY)
+        fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+    b = &body[(*count)++];
+    memset(b, 0, sizeof(*b));
+    b->op = op;
+    b->result = result;
+    b->line = g_line;
+    return b;
+}
 
 /* Where component j of value id really lives: (source id, field), seen through
  * aliases and earlier maps. */
@@ -456,8 +602,8 @@ static Field field_of(const IdInfo *ids, const Shader *sh, uint32_t id, int j)
         }
         return field_of(ids, sh, m->ops[m->fieldOp[j]], m->fieldComp[j]);
     }
-    if (ids[id].aliasOf)
-        return field_of(ids, sh, ids[id].aliasOf, ids[id].comp + j);
+    if (ids[id].aliasOf)   /* comp is the field in the register; the root adds its own */
+        return field_of(ids, sh, ids[id].aliasOf, ids[id].comp - ids[ids[id].aliasOf].comp + j);
     /* Every load of an input (or push constant qword) reads the same register:
      * name it by the variable so in.x and in.y loaded separately still group
      * into one MOVE. */
@@ -598,36 +744,44 @@ static int const_addr(int q)
  * time: a body op that loads it through VI08. The first column computes the
  * address from the index (an int block member, gl_InstanceIndex or a float,
  * clamped to the array then truncated with FTOI0), the others reuse it. */
+static uint32_t int_operand(IdInfo *ids, Shader *sh, uint32_t id, BodyOp *body, int *count);
+
 static void define_dyn_load(IdInfo *ids, Shader *sh, uint32_t id, uint32_t type, uint32_t ptr, int col)
 {
-    const IdInfo *idx = &ids[ids[ptr].dynIndex];
+    uint32_t dynIndex = ids[ptr].dynIndex;
+    const IdInfo *idx = &ids[dynIndex];
     float last = (float)(ids[ptr].dynCount - 1);
+    uint32_t src = 0;
+    int comp = 0, isInt = 0;
     BodyOp *b;
 
-    if (sh->bodyCount == MAX_BODY)
-        fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+    if (!col) {
+        if (idx->floatIndex) {
+            src = idx->floatIndex;
+            comp = ids[src].comp;
+        } else if (idx->instanceIndex) {
+            src = sh->constBase + INSTANCE_QWORD;
+            comp = 2;
+        } else if (idx->fromConst >= 0 && !idx->intIsFloat) {
+            src = sh->constBase + (uint32_t)idx->fromConst;
+            comp = idx->comp;
+            isInt = 1;
+        } else {
+            src = int_operand(ids, sh, dynIndex, sh->body, &sh->bodyCount);
+            comp = ids[src].comp;
+        }
+    }
     ids[id].kind = ID_VALUE;
     ids[id].valType = type;
-    b = &sh->body[sh->bodyCount++];
-    b->op = OpDynLoad;
-    b->result = id;
-    b->line = g_line;
+    b = new_op(sh->body, &sh->bodyCount, OpDynLoad, id);
     b->dynBase = const_addr(ids[ptr].fromConst) + col;
     b->dynStride = col ? 0 : ids[ptr].dynStride;
     memcpy(&b->dynLast, &last, sizeof(last));
     if (col)
         return;
-    if (idx->floatIndex) {
-        b->ops[b->nops++] = idx->floatIndex;
-        b->dynComp = ids[idx->floatIndex].comp;
-    } else if (idx->instanceIndex) {
-        b->ops[b->nops++] = sh->constBase + INSTANCE_QWORD;
-        b->dynComp = 2;
-    } else {
-        b->ops[b->nops++] = sh->constBase + (uint32_t)idx->fromConst;
-        b->dynComp = idx->comp;
-        b->dynInt = 1;
-    }
+    b->ops[b->nops++] = src;
+    b->dynComp = comp;
+    b->dynInt = isInt;
 }
 
 /* A fresh id with no SPIR-V counterpart. */
@@ -636,6 +790,95 @@ static uint32_t new_id(Shader *sh)
     if (sh->nextId == MAX_IDS)
         fail("shader is too large (%u ids)", (unsigned)sh->nextId);
     return sh->nextId++;
+}
+
+/* Defines id as the same value as src (float(i) of an int VU1 already holds as a float). */
+static void alias_value(IdInfo *ids, uint32_t id, uint32_t type, uint32_t src)
+{
+    ids[id].kind = ID_VALUE;
+    ids[id].valType = type;
+    ids[id].comp = ids[src].comp;
+    if (ids[src].fromConst >= 0 || ids[src].fromInput >= 0) {
+        ids[id].fromConst = ids[src].fromConst;
+        ids[id].fromInput = ids[src].fromInput;
+    } else {
+        ids[id].aliasOf = root(ids, src);
+    }
+}
+
+/* An int as the float VU1 computes with: a counter or sum as is, int() of a
+ * float truncated, an int read from a block through ITOF0 (appended to body),
+ * a constant as a float constant. */
+static uint32_t int_operand(IdInfo *ids, Shader *sh, uint32_t id, BodyOp *body, int *count)
+{
+    uint32_t n;
+    BodyOp *b;
+
+    if (ids[id].kind == ID_CONST || !is_int(ids, ids[id].valType) || ids[id].intIsFloat)
+        return id;
+    if (ids[id].kind != ID_VALUE)
+        fail("vertex shader computes with something other than inputs and constants");
+    if (ids[id].asFloat)
+        return ids[id].asFloat;
+    n = new_id(sh);
+    ids[n].kind = ID_VALUE;
+    ids[n].valType = sh->floatType;
+    if (ids[id].instanceIndex) {
+        ids[n].fromConst = INSTANCE_QWORD;
+        ids[n].comp = 2;
+    } else if (ids[id].floatIndex) {
+        b = new_op(body, count, OpExtInst, n);
+        b->ext = GlslTrunc;
+        b->ops[b->nops++] = ids[id].floatIndex;
+        ids[n].comp = ids[ids[id].floatIndex].comp;
+    } else {
+        b = new_op(body, count, OpConvertSToF, n);
+        b->ops[b->nops++] = id;
+        ids[n].comp = ids[id].comp;
+    }
+    ids[id].asFloat = n;
+    return n;
+}
+
+/* Defines id as !src: a flipped test, or De Morgan over and/or. */
+static void negate_bool(IdInfo *ids, Shader *sh, uint32_t id, uint32_t type, uint32_t src)
+{
+    ids[id].kind = ID_VALUE;
+    ids[id].valType = type;
+    ids[id].boolKind = ids[src].boolKind;
+    ids[id].boolA = ids[src].boolA;
+    ids[id].boolB = ids[src].boolB;
+    ids[id].boolZero = ids[src].boolZero;
+    ids[id].boolInv = !ids[src].boolInv;
+    if (ids[src].boolKind == BOOL_AND || ids[src].boolKind == BOOL_OR) {
+        ids[id].boolKind = ids[src].boolKind == BOOL_AND ? BOOL_OR : BOOL_AND;
+        ids[id].boolA = new_id(sh);
+        ids[id].boolB = new_id(sh);
+        negate_bool(ids, sh, ids[id].boolA, type, ids[src].boolA);
+        negate_bool(ids, sh, ids[id].boolB, type, ids[src].boolB);
+    }
+}
+
+/* Appends the values a bool's tests read to b->ops, in the order emit_cond reads them. */
+static void collect_leaves(const IdInfo *ids, uint32_t cond, BodyOp *b)
+{
+    switch (ids[cond].boolKind) {
+    case BOOL_CMP: case BOOL_FLOAT:
+        if (b->nops + 2 > MAX_OPERANDS)
+            fail("condition has too many comparisons (max %d); split it into nested ifs",
+                 (MAX_OPERANDS - 2) / 2);
+        b->ops[b->nops++] = ids[cond].boolA;
+        if (ids[cond].boolKind == BOOL_CMP)
+            b->ops[b->nops++] = ids[cond].boolB;
+        break;
+    case BOOL_AND: case BOOL_OR:
+        collect_leaves(ids, ids[cond].boolA, b);
+        collect_leaves(ids, ids[cond].boolB, b);
+        break;
+    default:
+        fail("vertex shader tests a bool that is not a comparison (a true/false constant, or a "
+             "bool chosen by ?:), which this version of ps2vk-shaderc does not compile");
+    }
 }
 
 /* Defines value id (a float or vecN of `size` fields) as the given fields: a
@@ -696,6 +939,158 @@ static void define_map(IdInfo *ids, Shader *sh, uint32_t op, uint32_t id, uint32
         b->fieldComp[j] = fl[j].comp;
     }
     ids[id].mapOp = sh->bodyCount;
+}
+
+static uint32_t canon(const IdInfo *ids, const Shader *sh, uint32_t id);
+
+/* Maps are found by body index: recompute after the body is rebuilt. */
+static void renumber_maps(IdInfo *ids, Shader *sh)
+{
+    for (int i = 0; i < sh->bodyCount; i++)
+        if (is_map_op(sh->body[i].op))
+            ids[sh->body[i].result].mapOp = i + 1;
+}
+
+/*
+ * Replaces the phis and the stores to outputs by moves: each predecessor copies
+ * its value into the phi's register right before it branches, and an output
+ * stored on several paths gets a register of its own that every store moves
+ * into (an output stored once stays a plain value). A bool source becomes a
+ * float (0 = false) and an int source the float VU1 counts with.
+ */
+static void rebuild_phis(IdInfo *ids, Shader *sh)
+{
+    static BodyOp out[MAX_BODY];
+    uint32_t *outValue[OUT_COUNT] = { &sh->positionValue, &sh->colorValue, &sh->texcoordValue };
+    uint32_t synth[OUT_COUNT] = { 0 }, label = 0;
+    int n = 0, stores[OUT_COUNT] = { 0 };
+
+    for (int i = 0; i < sh->bodyCount; i++)
+        if (sh->body[i].op == OpStore)
+            stores[sh->body[i].outVar]++;
+
+    for (int i = 0; i < sh->bodyCount; i++) {
+        BodyOp *b = &sh->body[i];
+
+        g_line = b->line;
+        if (b->op == OpLabel) {
+            label = b->result;
+        } else if (b->op == OpStore) {
+            uint32_t val = b->ops[0];
+            int o = b->outVar;
+            if (stores[o] == 1) {
+                *outValue[o] = val;
+                continue;
+            }
+            if (!synth[o]) {
+                synth[o] = new_id(sh);
+                ids[synth[o]].kind = ID_VALUE;
+                ids[synth[o]].valType = ids[val].valType;
+                *outValue[o] = synth[o];
+            }
+            b = new_op(out, &n, OpPhiMove, synth[o]);
+            b->ops[b->nops++] = val;
+            continue;
+        } else if (is_branch_op(b->op)) {
+            for (int p = 0; p < sh->phiCount; p++) {
+                const Phi *ph = &sh->phis[p];
+                for (int k = 0; k < ph->count; k++) {
+                    uint32_t src = ph->vals[k];
+                    BodyOp *m;
+                    if (ph->preds[k] != label)
+                        continue;
+                    if (ph->isBool) {
+                        if (ids[src].boolKind == BOOL_FLOAT) {
+                            src = ids[src].boolA;
+                        } else {
+                            uint32_t fl = new_id(sh);
+                            ids[fl].kind = ID_VALUE;
+                            ids[fl].valType = sh->floatType;
+                            m = new_op(out, &n, OpBoolToFloat, fl);
+                            m->cond = src;
+                            collect_leaves(ids, src, m);
+                            src = fl;
+                        }
+                    } else if (ph->isInt) {
+                        src = int_operand(ids, sh, src, out, &n);
+                    }
+                    if (ids[src].kind != ID_VALUE && !(ids[src].kind == ID_CONST && ids[src].compCount))
+                        fail("corrupt SPIR-V: a phi of something other than a value");
+                    m = new_op(out, &n, OpPhiMove, ph->id);
+                    m->ops[m->nops++] = src;
+                }
+            }
+        }
+        if (n == MAX_BODY)
+            fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+        out[n++] = *b;
+    }
+    g_line = 0;
+    memcpy(sh->body, out, (size_t)n * sizeof(out[0]));
+    sh->bodyCount = n;
+    renumber_maps(ids, sh);
+}
+
+/*
+ * A push constant or uniform qword is loaded (one LQ) in every block that reads
+ * it, right before the first read there, and its register is given back after
+ * the last read in that block: a reload is cheaper than a register held across
+ * a branch or a loop. The reads are repointed at the block's loaded value.
+ */
+static void place_const_loads(IdInfo *ids, Shader *sh)
+{
+    static BodyOp out[MAX_BODY];
+    uint32_t loaded[CONST_QWORDS];   /* in the current block: value id holding qword q, 0 if none */
+    uint32_t *outputs[3] = { &sh->positionValue, &sh->colorValue, &sh->texcoordValue };
+    int n = 0;
+
+    memset(loaded, 0, sizeof(loaded));
+    for (int i = 0; i <= sh->bodyCount; i++) {
+        BodyOp *b = i < sh->bodyCount ? &sh->body[i] : NULL;
+        int nops = b ? b->nops : 3;
+
+        if (b && b->op == OpLabel)
+            memset(loaded, 0, sizeof(loaded));
+        for (int j = 0; j < nops && !(b && b->dead); j++) {
+            uint32_t *op = b ? &b->ops[j] : outputs[j], c, a;
+            int q;
+            c = *op ? canon(ids, sh, *op) : 0;
+            if (c < sh->constBase || c >= sh->constBase + CONST_QWORDS)
+                continue;
+            q = (int)(c - sh->constBase);
+            if (!loaded[q]) {
+                BodyOp *l;
+                loaded[q] = new_id(sh);
+                ids[loaded[q]].kind = ID_VALUE;
+                ids[loaded[q]].valType = sh->floatType;
+                if (n == MAX_BODY)
+                    fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+                l = &out[n++];
+                memset(l, 0, sizeof(*l));
+                l->op = OpConstLoad;
+                l->result = loaded[q];
+                l->target = (uint32_t)q;
+            }
+            if (ids[*op].comp == 0) {
+                *op = loaded[q];
+                continue;
+            }
+            a = new_id(sh);   /* pc.v.w: the loaded qword's field */
+            ids[a].kind = ID_VALUE;
+            ids[a].valType = ids[*op].valType;
+            ids[a].comp = ids[*op].comp;
+            ids[a].aliasOf = loaded[q];
+            *op = a;
+        }
+        if (b) {
+            if (n == MAX_BODY)
+                fail("vertex shader is too long (max %d instructions)", MAX_BODY);
+            out[n++] = *b;
+        }
+    }
+    memcpy(sh->body, out, (size_t)n * sizeof(out[0]));
+    sh->bodyCount = n;
+    renumber_maps(ids, sh);
 }
 
 static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
@@ -780,9 +1175,15 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             break;
         case OpTypeFloat:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_FLOAT; ids[w[1]].width = w[2];
+            if (w[2] == 32 && !sh->floatType)
+                sh->floatType = w[1];
             break;
         case OpTypeInt:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_INT; ids[w[1]].width = w[2];
+            ids[w[1]].storage = w[3];   /* signedness */
+            break;
+        case OpTypeBool:
+            ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_BOOL;
             break;
         case OpTypeVector:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_VECTOR;
@@ -809,7 +1210,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_SAMPLER;
             break;
         case OpTypeImage: case OpTypeSampler:
-        case OpTypeVoid: case OpTypeBool: case OpTypeRuntimeArray:
+        case OpTypeVoid: case OpTypeRuntimeArray:
         case OpTypeFunction:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_OTHER;
             break;
@@ -818,6 +1219,11 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             ids[w[2]].valType = w[1];
             if (is_float(ids, w[1])) {
                 ids[w[2]].comps[0] = w[3];
+                ids[w[2]].compCount = 1;
+            } else if (is_int(ids, w[1])) {
+                /* Also the float VU1 counts and compares with. */
+                float v = ids[w[1]].storage ? (float)(int32_t)w[3] : (float)w[3];
+                memcpy(&ids[w[2]].comps[0], &v, sizeof(v));
                 ids[w[2]].compCount = 1;
             }
             break;
@@ -884,6 +1290,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 
     if (sh->execModel != ExecVertex && sh->execModel != ExecFragment)
         fail("only vertex and fragment shaders are supported");
+    if (!sh->floatType)
+        fail("shader has no float type");
     if (functions != 1)
         fail("shader has %d functions after spirv-opt inlined its calls; a recursive function "
              "cannot be inlined", functions);
@@ -1041,9 +1449,150 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             inFunction = 1;
         } else if (inFunction) {
             switch (op) {
-            case OpLabel: case OpReturn: case OpLine: case OpNoLine: case OpNop:
-            case OpFunctionEnd:
+            case OpLine: case OpNoLine: case OpNop: case OpFunctionEnd:
+            case OpSelectionMerge: case OpLoopMerge: case OpUnreachable:
                 break;
+            case OpLabel:
+                new_op(sh->body, &sh->bodyCount, OpLabel, w[1]);
+                sh->lastLabel = w[1];
+                break;
+            case OpReturn:
+                sh->returns++;
+                break;
+            case OpBranch: {
+                BodyOp *b = new_op(sh->body, &sh->bodyCount, OpBranch, 0);
+                b->target = w[1];
+                break;
+            }
+            case OpBranchConditional: {
+                BodyOp *b;
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                b = new_op(sh->body, &sh->bodyCount, OpBranchConditional, 0);
+                b->cond = w[1];
+                b->target = w[2];
+                b->target2 = w[3];
+                collect_leaves(ids, w[1], b);
+                break;
+            }
+            case OpPhi: {
+                /* The value becomes a register every predecessor writes before
+                 * branching here (rebuild_phis). */
+                uint32_t id = w[2], type = w[1];
+                Phi *p;
+                int size = type_size(ids, type);
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                if (sh->phiCount == MAX_PHIS)
+                    fail("vertex shader has more than %d values chosen by branches", MAX_PHIS);
+                if (!size && ids[type].type != T_BOOL)
+                    fail("vertex shader keeps a %s across a branch or loop; only floats, ints, "
+                         "vectors and bools can be",
+                         ids[type].type == T_MATRIX ? "matrix" : "struct or array");
+                p = &sh->phis[sh->phiCount++];
+                memset(p, 0, sizeof(*p));
+                p->id = id;
+                p->isBool = ids[type].type == T_BOOL;
+                p->isInt = is_int(ids, type);
+                for (uint32_t i = 3; i + 1 < n; i += 2) {
+                    if (p->count == MAX_PHI_PREDS)
+                        fail("corrupt SPIR-V: a phi with more than %d predecessors", MAX_PHI_PREDS);
+                    p->vals[p->count] = w[i];
+                    p->preds[p->count] = w[i + 1];
+                    p->count++;
+                }
+                ids[id].kind = ID_VALUE;
+                ids[id].valType = p->isBool ? sh->floatType : type;
+                ids[id].comp = 0;
+                ids[id].intIsFloat = p->isInt;
+                if (p->isBool) {
+                    ids[id].boolKind = BOOL_FLOAT;
+                    ids[id].boolA = id;
+                }
+                break;
+            }
+            case OpIEqual: case OpINotEqual: case OpUGreaterThan: case OpSGreaterThan:
+            case OpUGreaterThanEqual: case OpSGreaterThanEqual: case OpULessThan: case OpSLessThan:
+            case OpULessThanEqual: case OpSLessThanEqual: case OpFOrdEqual: case OpFUnordEqual:
+            case OpFOrdNotEqual: case OpFUnordNotEqual: case OpFOrdLessThan: case OpFUnordLessThan:
+            case OpFOrdGreaterThan: case OpFUnordGreaterThan: case OpFOrdLessThanEqual:
+            case OpFUnordLessThanEqual: case OpFOrdGreaterThanEqual: case OpFUnordGreaterThanEqual: {
+                uint32_t id = w[2], a, c;
+                int swap, zero, inv;
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                compare_kind(op, &swap, &zero, &inv);
+                if (ids[w[1]].type != T_BOOL)
+                    fail("vertex shader compares vectors; VU1 tests one value at a time, so "
+                         "compare components one by one");
+                a = int_operand(ids, sh, w[3], sh->body, &sh->bodyCount);
+                c = int_operand(ids, sh, w[4], sh->body, &sh->bodyCount);
+                if (value_size(ids, a, stage) != 1 || value_size(ids, c, stage) != 1)
+                    fail("corrupt SPIR-V: comparison of non-scalars with a bool result");
+                ids[id].kind = ID_VALUE;
+                ids[id].valType = w[1];
+                ids[id].boolKind = BOOL_CMP;
+                ids[id].boolA = swap ? c : a;
+                ids[id].boolB = swap ? a : c;
+                ids[id].boolZero = zero;
+                ids[id].boolInv = inv;
+                break;
+            }
+            case OpLogicalAnd: case OpLogicalOr: {
+                uint32_t id = w[2];
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                if (!ids[w[3]].boolKind || !ids[w[4]].boolKind)
+                    fail("vertex shader combines bools that are not comparisons with %s",
+                         op == OpLogicalAnd ? "&&" : "||");
+                ids[id].kind = ID_VALUE;
+                ids[id].valType = w[1];
+                ids[id].boolKind = op == OpLogicalAnd ? BOOL_AND : BOOL_OR;
+                ids[id].boolA = w[3];
+                ids[id].boolB = w[4];
+                break;
+            }
+            case OpLogicalNot:
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                if (!ids[w[3]].boolKind)
+                    fail("vertex shader negates a bool that is not a comparison");
+                negate_bool(ids, sh, w[2], w[1], w[3]);
+                break;
+            case OpSelect: {
+                /* c ? a : b, as a conditional move. */
+                uint32_t id = w[2], a, c;
+                BodyOp *b;
+                int size;
+
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                if (ids[w[1]].type == T_BOOL)
+                    fail("vertex shader chooses between bools with ?:; VU1 has no bool registers, "
+                         "so choose between floats (0.0 and 1.0) or restructure the condition");
+                if (!ids[w[3]].boolKind)
+                    fail("vertex shader uses ?: on a bool that is not a comparison");
+                size = type_size(ids, w[1]);
+                if (!size)
+                    fail("vertex shader chooses a %s with ?:; only floats, ints and vectors can be",
+                         ids[w[1]].type == T_MATRIX ? "matrix" : "struct, array or bool vector");
+                a = int_operand(ids, sh, w[4], sh->body, &sh->bodyCount);
+                c = int_operand(ids, sh, w[5], sh->body, &sh->bodyCount);
+                if (value_size(ids, a, stage) != size || value_size(ids, c, stage) != size)
+                    fail("corrupt SPIR-V: OpSelect operands differ in size from the result");
+                ids[id].kind = ID_VALUE;
+                ids[id].valType = w[1];
+                ids[id].comp = size == 1 ? ids[a].comp : 0;
+                ids[id].intIsFloat = is_int(ids, w[1]);
+                b = new_op(sh->body, &sh->bodyCount, OpSelect, id);
+                b->cond = w[3];
+                b->ops[b->nops++] = a;
+                b->ops[b->nops++] = c;
+                collect_leaves(ids, w[3], b);
+                break;
+            }
             case OpLoad: {
                 uint32_t id = w[2], ptr = w[3];
                 if (ids[ptr].kind == ID_PTR && ids[ptr].dynIndex) {
@@ -1140,40 +1689,86 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[id].texel = TEXEL_SAMPLE;
                 break;
             }
-            case OpConvertSToF: {
-                /* float(gl_InstanceIndex): the batch header keeps the index as a float. */
+            case OpConvertSToF: case OpConvertUToF: {
+                /* float(i): the int is already a float to VU1 (gl_InstanceIndex comes
+                 * from the batch header as one). */
                 uint32_t id = w[2], src = w[3];
 
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
-                if (ids[src].kind != ID_VALUE || !ids[src].instanceIndex)
-                    fail("vertex shader converts an integer to float; VU1 computes with floats only, "
-                         "so only float(gl_InstanceIndex) is supported");
-                ids[id].kind = ID_VALUE;
-                ids[id].valType = w[1];
-                ids[id].fromConst = INSTANCE_QWORD;
-                ids[id].comp = 2;
+                if (ids[src].kind == ID_VALUE && ids[src].instanceIndex) {
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    ids[id].fromConst = INSTANCE_QWORD;
+                    ids[id].comp = 2;
+                    break;
+                }
+                if (!is_float(ids, w[1]) || value_size(ids, src, stage) != 1)
+                    fail("corrupt SPIR-V: float() of something other than an int");
+                alias_value(ids, id, w[1], int_operand(ids, sh, src, sh->body, &sh->bodyCount));
                 break;
             }
-            case OpConvertFToS: {
-                /* int(f): only as an array or column index, where FTOI0 makes the address. */
+            case OpConvertFToS: case OpConvertFToU: {
+                /* int(f): truncated where it is counted with, or used as an array or
+                 * column index, where FTOI0 makes the address. */
                 uint32_t id = w[2], src = w[3];
 
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 if (value_size(ids, src, stage) != 1)
                     fail("corrupt SPIR-V: int() of something other than a float");
+                if (ids[src].kind == ID_CONST) {
+                    float v;
+                    memcpy(&v, &ids[src].comps[0], sizeof(v));
+                    ids[id].kind = ID_CONST;
+                    ids[id].valType = w[1];
+                    ids[id].value = (uint32_t)(int32_t)v;
+                    v = (float)(int32_t)v;
+                    memcpy(&ids[id].comps[0], &v, sizeof(v));
+                    ids[id].compCount = 1;
+                    break;
+                }
                 ids[id].kind = ID_VALUE;
                 ids[id].valType = w[1];
                 ids[id].floatIndex = src;
                 ids[id].comp = ids[src].comp;
                 break;
             }
-            case OpFAdd: case OpFSub: case OpFMul: case OpFDiv: case OpFNegate:
-            case OpVectorTimesScalar: {
-                BodyOp *b;
-                int size;
+            case OpCompositeInsert: {
+                /* v.w = x: the vector's fields with one replaced. */
+                uint32_t id = w[2], obj = w[3], src = w[4];
+                int size, k;
+                Field fl[4];
 
+                if (sh->execModel != ExecVertex)
+                    unsupported(op, stage);
+                size = value_size(ids, src, stage);
+                if (n != 6 || size < 2 || w[5] >= (uint32_t)size || value_size(ids, obj, stage) != 1)
+                    fail("vertex shader writes a component of something other than a float vector; "
+                         "only v.x .. v.w = <float> is supported so far");
+                k = (int)w[5];
+                for (int j = 0; j < size; j++)
+                    fl[j] = field_of(ids, sh, j == k ? obj : src, j == k ? 0 : j);
+                define_map(ids, sh, op, id, w[1], fl, size);
+                break;
+            }
+            case OpFAdd: case OpFSub: case OpFMul: case OpFDiv: case OpFNegate:
+            case OpVectorTimesScalar:
+            case OpIAdd: case OpISub: case OpIMul: case OpSNegate: {
+                BodyOp *b;
+                int size, isInt = op == OpIAdd || op == OpISub || op == OpIMul || op == OpSNegate;
+                uint32_t a = w[3], c = w[4];
+
+                if (isInt) {
+                    /* Counting is float arithmetic to VU1. */
+                    if (sh->execModel != ExecVertex)
+                        unsupported(op, stage);
+                    a = int_operand(ids, sh, a, sh->body, &sh->bodyCount);
+                    if (op != OpSNegate)
+                        c = int_operand(ids, sh, c, sh->body, &sh->bodyCount);
+                    op = op == OpIAdd ? OpFAdd : op == OpISub ? OpFSub : op == OpIMul ? OpFMul : OpFNegate;
+                    ids[w[2]].intIsFloat = 1;
+                }
                 if (sh->execModel == ExecFragment && op == OpFMul) {
                     /* texture(...) * vColor, either way round: GS modulate. */
                     uint32_t a = w[3], c = w[4];
@@ -1204,26 +1799,21 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[w[2]].valType = w[1];
                 size = value_size(ids, w[2], stage);
                 if (op == OpVectorTimesScalar) {
-                    if (value_size(ids, w[3], stage) != size || value_size(ids, w[4], stage) != 1)
+                    if (value_size(ids, a, stage) != size || value_size(ids, c, stage) != 1)
                         fail("corrupt SPIR-V: OpVectorTimesScalar needs a vector and a float");
-                } else if (value_size(ids, w[3], stage) != size ||
-                           (op != OpFNegate && value_size(ids, w[4], stage) != size)) {
+                } else if (value_size(ids, a, stage) != size ||
+                           (op != OpFNegate && value_size(ids, c, stage) != size)) {
                     fail("corrupt SPIR-V: %s operands differ in size", op_name(op));
                 }
                 /* A scalar result stays in the field its first operand uses; a division
                  * is copied out of Q into x. */
                 if (size == 1)
-                    ids[w[2]].comp = op == OpFDiv ? 0 : ids[w[3]].comp;
-                if (sh->bodyCount == MAX_BODY)
-                    fail("vertex shader is too long (max %d instructions)", MAX_BODY);
-                b = &sh->body[sh->bodyCount++];
-                b->op = op;
-                b->result = w[2];
-                b->ops[0] = w[3];
+                    ids[w[2]].comp = op == OpFDiv ? 0 : ids[a].comp;
+                b = new_op(sh->body, &sh->bodyCount, op, w[2]);
+                b->ops[0] = a;
                 b->nops = 1;
                 if (op != OpFNegate)
-                    b->ops[b->nops++] = w[4];
-                b->line = g_line;
+                    b->ops[b->nops++] = c;
                 break;
             }
             case OpMatrixTimesVector: {
@@ -1430,10 +2020,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                                      "only one per read is supported", kind);
                             if (ids[idx].kind != ID_VALUE ||
                                 !(ids[idx].floatIndex || ids[idx].instanceIndex ||
-                                  (ids[idx].fromConst >= 0 && ids[ids[idx].valType].type == T_INT)))
-                                fail("vertex shader indexes %ss with something other than an int "
-                                     "%s member, gl_InstanceIndex or int() of a float; VU1 has no "
-                                     "integer arithmetic to offer", kind, kind);
+                                  is_int(ids, ids[idx].valType)))
+                                fail("vertex shader indexes %ss with something other than an int; "
+                                     "VU1 addresses qwords through VI08", kind);
                             if (ids[type].type == T_ARRAY) {
                                 if (ids[type].stride % 16)
                                     fail("vertex shader indexes a %s array of %u-byte elements at run "
@@ -1554,21 +2143,30 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     sh->textureFunction = ids[val].texel == TEXEL_SAMPLE ? 1 : 0;
                     break;
                 }
-                if (ids[ptr].isPosition) {
-                    if (value_size(ids, val, stage) != 4)
-                        fail("vertex shader stores something other than a vec4 to gl_Position");
-                    sh->positionValue = val;
-                } else if (ptr && ptr == sh->colorVar) {
-                    if (value_size(ids, val, stage) != 4)
-                        fail("vertex shader stores something other than a vec4 to the color output");
-                    sh->colorValue = val;
-                } else if (ptr && ptr == sh->texcoordVar) {
-                    if (value_size(ids, val, stage) != 2)
-                        fail("vertex shader stores something other than a vec2 to the texture "
-                             "coordinate output");
-                    sh->texcoordValue = val;
-                } else {
-                    fail("%s shader writes to something other than its outputs", stage);
+                {
+                    /* Kept as an op: a second store to the same output (on another
+                     * path) turns both into moves to one register (rebuild_phis). */
+                    BodyOp *b;
+                    int out;
+                    if (ids[ptr].isPosition) {
+                        if (value_size(ids, val, stage) != 4)
+                            fail("vertex shader stores something other than a vec4 to gl_Position");
+                        out = OUT_POSITION;
+                    } else if (ptr && ptr == sh->colorVar) {
+                        if (value_size(ids, val, stage) != 4)
+                            fail("vertex shader stores something other than a vec4 to the color output");
+                        out = OUT_COLOR;
+                    } else if (ptr && ptr == sh->texcoordVar) {
+                        if (value_size(ids, val, stage) != 2)
+                            fail("vertex shader stores something other than a vec2 to the texture "
+                                 "coordinate output");
+                        out = OUT_TEXCOORD;
+                    } else {
+                        fail("%s shader writes to something other than its outputs", stage);
+                    }
+                    b = new_op(sh->body, &sh->bodyCount, OpStore, 0);
+                    b->outVar = out;
+                    b->ops[b->nops++] = val;
                 }
                 break;
             }
@@ -1579,6 +2177,13 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         pc += n;
     }
     g_line = 0;
+
+    if (sh->execModel == ExecVertex) {
+        if (sh->returns != 1)
+            fail("vertex shader returns in %d places; VU1 code has one exit, so return once at "
+                 "the end (use if/else instead of an early return)", sh->returns);
+        rebuild_phis(ids, sh);
+    }
 
     /* A map read only by other maps was folded into them: emit nothing for it. */
     {
@@ -1597,6 +2202,22 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         for (int i = 0; i < sh->bodyCount; i++)
             if (is_map_op(sh->body[i].op) && !used[sh->body[i].result])
                 sh->body[i].dead = 1;
+    }
+
+    if (sh->execModel == ExecVertex) {
+        place_const_loads(ids, sh);
+        /* A scalar 0 or 1 reads VF00 = (0, 0, 0, 1) instead of taking a register. */
+        for (uint32_t i = 0; i < sh->constBase; i++) {
+            if (ids[i].kind != ID_CONST || ids[i].compCount != 1)
+                continue;
+            if (!(ids[i].comps[0] & 0x7fffffff)) {
+                ids[i].vf00 = 1;
+                ids[i].comp = 0;
+            } else if (ids[i].comps[0] == 0x3f800000) {
+                ids[i].vf00 = 1;
+                ids[i].comp = 3;
+            }
+        }
     }
 
     if (sh->execModel == ExecVertex) {
@@ -1739,6 +2360,17 @@ static void reg_release(Regs *r, const IdInfo *ids, const Shader *sh, uint32_t i
 static int reg_of(const Regs *r, const IdInfo *ids, const Shader *sh, uint32_t id)
 {
     return r->reg[canon(ids, sh, id)];
+}
+
+/* Gives back every register whose value has been read for the last time: a
+ * phi after its loop, a value kept alive across a back edge. */
+static void reg_sweep(Regs *r, const IdInfo *ids, int at)
+{
+    for (uint32_t id = 0; id < MAX_IDS; id++)
+        if (r->reg[id] && ids[id].kind == ID_VALUE && ids[id].fromInput < 0 && r->lastUse[id] < at) {
+            r->busy[r->reg[id]] = 0;
+            r->reg[id] = 0;
+        }
 }
 
 /* Loads constant qword q (the push constants, then the uniform area) into reg. */
@@ -1971,9 +2603,82 @@ static const char *body_name(const BodyOp *b)
         snprintf(s, sizeof(s), "%s()", ext_fn(b->ext)->name);
         return s;
     }
-    if (b->op == OpDot)
-        return "dot()";
-    return op_name(b->op);
+    switch (b->op) {
+    case OpDot: return "dot()";
+    case OpSelect: return "?:";
+    case OpBoolToFloat: return "condition kept as a float";
+    case OpBranchConditional: return "if";
+    case OpPhiMove: return "value of this path";
+    case OpConvertSToF: return "int to float";
+    default: return op_name(b->op);
+    }
+}
+
+static int g_labels = 0;   /* short-circuit and ?: labels so far */
+
+/* d.dc = s.sc (size 1) or d = s over the first size fields. */
+static void emit_move(FILE *f, const char **comment, int d, int dc, int s, int sc, int size)
+{
+    static const char field[] = "xyzw";
+    char m[2] = { field[dc], 0 };
+
+    if (size > 1)
+        emit_l(f, comment, mn("move", 0, mask_n(size)), "VF%02d,VF%02d", d, s);
+    else if (dc == sc)
+        emit_l(f, comment, mn("move", 0, m), "VF%02d,VF%02d", d, s);
+    else
+        emit_u(f, comment, mn("add", field[sc], m), "VF%02d,VF00,VF%02d%c", d, s, field[sc]);
+}
+
+/*
+ * Leaves VI13 nonzero when the bool holds. A comparison subtracts into scratch
+ * register t and reads the MAC flag of its field (sign for <, zero for ==) with
+ * FMAND once the flags have settled; an inverted test subtracts the mask, so
+ * VI13 is nonzero when the flag is clear. A bool held as a float is nonzero when
+ * true. && and || short-circuit with branches. The next instruction must not
+ * test VI13 (the integer pipeline shows it the old value).
+ */
+static void emit_cond(FILE *f, const char **comment, const IdInfo *ids, const int *regs, int *cur,
+                      uint32_t cond, int t, const char *sym)
+{
+    const IdInfo *c = &ids[cond];
+    int mask, inv, label;
+
+    switch (c->boolKind) {
+    case BOOL_CMP: case BOOL_FLOAT: {
+        int a = regs[(*cur)++], ca = ids[c->boolA].comp;
+        const char *dest = &"x\0y\0z\0w"[ca * 2];
+        if (c->boolKind == BOOL_CMP) {
+            int bb = regs[(*cur)++], cb = ids[c->boolB].comp;
+            emit_bin(f, comment, "sub", dest, 1, t, a, bb, cb);
+            mask = (c->boolZero ? 0x8 : 0x80) >> ca;
+            inv = c->boolInv;
+        } else {
+            emit_u(f, comment, mn("add", 'x', dest), "VF%02d,VF%02d,VF00x", t, a);
+            mask = 0x8 >> ca;
+            inv = !c->boolInv;
+        }
+        emit_l(f, comment, "iaddiu", "VI13,VI00,0x%x", mask);
+        vu(f, "NOP", "NOP", "MAC flags land 4 cycles later");
+        vu(f, "NOP", "NOP", NULL);
+        vu(f, "NOP", "NOP", NULL);
+        emit_l(f, comment, "fmand", "VI13,VI13");
+        if (inv)
+            emit_l(f, comment, "isubiu", "VI13,VI13,0x%x", mask);
+        break;
+    }
+    case BOOL_AND: case BOOL_OR:
+        label = g_labels++;
+        emit_cond(f, comment, ids, regs, cur, c->boolA, t, sym);
+        vu(f, "NOP", "NOP", "VI13 settles");
+        emit_l(f, comment, c->boolKind == BOOL_AND ? "ibeq" : "ibne", "VI13,VI00,%s_C%d", sym, label);
+        vu(f, "NOP", "NOP", c->boolKind == BOOL_AND ? "&&: branch delay slot" : "||: branch delay slot");
+        emit_cond(f, comment, ids, regs, cur, c->boolB, t, sym);
+        fprintf(f, "%s_C%d:\n", sym, label);
+        break;
+    default:
+        fail("corrupt SPIR-V: a branch on something other than a bool");
+    }
 }
 
 /* dot() and the GLSL built-ins. d never aliases an operand, so it doubles as scratch;
@@ -2077,12 +2782,13 @@ static void emit_builtin(FILE *f, const BodyOp *b, int size, int argSize, const 
 }
 
 /* Emits body op b into register d; regs[] holds each operand's register. */
-static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, const int *regs)
+static void emit_body_op(FILE *f, const IdInfo *ids, const Shader *sh, const BodyOp *b, int d,
+                         const int *regs)
 {
     static const char field[] = "xyzw";
     int size = type_size(ids, ids[b->result].valType);
     int a = regs[0], bb = regs[1];
-    int cols = b->nops - 1, vreg = regs[cols];   /* matrix * vector */
+    int cols = b->nops - 1, vreg = cols > 0 ? regs[cols] : 0;   /* matrix * vector */
     int ca = ids[b->ops[0]].comp, cb = b->nops > 1 ? ids[b->ops[1]].comp : 0;
     int cc = b->nops > 2 ? ids[b->ops[2]].comp : 0;
     const char *dest = size == 1 ? &"x\0y\0z\0w"[ca * 2] : mask_n(size);
@@ -2153,9 +2859,39 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const BodyOp *b, int d, con
             vu(f, buf, "NOP", i ? NULL : line);
         }
         break;
-    case OpVectorShuffle: case OpCompositeConstruct: case OpCompositeExtract:
+    case OpVectorShuffle: case OpCompositeConstruct: case OpCompositeExtract: case OpCompositeInsert:
         emit_map(f, b, d, regs, size, line);
         break;
+    case OpConstLoad:
+        emit_const_load(f, sh, (int)b->target, d);
+        break;
+    case OpConvertSToF: {
+        const char *c = line;
+        emit_u(f, &c, mn("itof0", 0, dest), "VF%02d,VF%02d", d, a);
+        break;
+    }
+    case OpBoolToFloat: {
+        /* The flag bits of the test, as a float: nonzero when true. */
+        const char *c = line;
+        int cur = 0;
+        emit_cond(f, &c, ids, regs, &cur, b->cond, d, g_sym);
+        vu(f, "NOP", "NOP", "VI13 settles");
+        emit_l(f, &c, "mfir.x", "VF%02d,VI13", d);
+        emit_u(f, &c, "itof0.x", "VF%02d,VF%02d", d, d);
+        break;
+    }
+    case OpSelect: {
+        /* d = b, then d = a if the condition holds. */
+        const char *c = line;
+        int cur = 2, label = g_labels++;
+        emit_cond(f, &c, ids, regs, &cur, b->cond, d, g_sym);
+        emit_move(f, &c, d, ca, bb, cb, size);   /* also lets VI13 settle */
+        emit_l(f, &c, "ibeq", "VI13,VI00,%s_S%d", g_sym, label);
+        vu(f, "NOP", "NOP", "branch delay slot");
+        emit_move(f, &c, d, ca, a, ca, size);
+        fprintf(f, "%s_S%d:\n", g_sym, label);
+        break;
+    }
     case OpDynLoad: {
         /* VI08 = clamp(index, 0, count - 1) * stride, then the element's qword(s)
          * relative to it. */
@@ -2197,6 +2933,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     FILE *f = open_out(base, ".vsm");
     char buf[64], buf2[64];
     static Regs r;
+    static int def[MAX_IDS], labelAt[MAX_IDS], targeted[MAX_IDS];
     int i, constants = 0;
 
     g_sym = sym;
@@ -2204,15 +2941,49 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     /* Registers: inputs are fixed, constants live for the whole program,
      * temporaries and push constant/uniform qwords are freed after their last read. */
     memset(&r, 0, sizeof(r));
-    for (i = 0; i < sh->bodyCount; i++)
-        for (int j = 0; j < sh->body[i].nops && !sh->body[i].dead; j++)
-            r.lastUse[canon(ids, sh, sh->body[i].ops[j])] = i;
+    memset(def, -1, sizeof(def));
+    memset(labelAt, -1, sizeof(labelAt));
+    memset(targeted, 0, sizeof(targeted));
+    for (i = 0; i < sh->bodyCount; i++) {
+        const BodyOp *b = &sh->body[i];
+        if (b->dead)
+            continue;
+        for (int j = 0; j < b->nops; j++)
+            r.lastUse[canon(ids, sh, b->ops[j])] = i;
+        if (b->op == OpLabel)
+            labelAt[b->result] = i;
+        else if (b->result && def[b->result] < 0)
+            def[b->result] = i;
+    }
     r.lastUse[canon(ids, sh, sh->positionValue)] = MAX_BODY;
     if (sh->colorValue)
         r.lastUse[canon(ids, sh, sh->colorValue)] = MAX_BODY;
     if (sh->texcoordValue) {
         r.lastUse[canon(ids, sh, sh->texcoordValue)] = MAX_BODY;
         r.busy[PVK_VU1_TEXCOORD_REG] = 1;   /* the STQ output lives there */
+    }
+    /* A value from before a loop that the loop reads must outlive every
+     * iteration: its last read becomes the branch back to the loop's start. */
+    for (i = 0; i < sh->bodyCount; i++) {
+        const BodyOp *b = &sh->body[i];
+        if (!is_branch_op(b->op))
+            continue;
+        for (int t = 0; t < (b->op == OpBranchConditional ? 2 : 1); t++) {
+            uint32_t label = t ? b->target2 : b->target;
+            int h = labelAt[label];
+            if (h < 0)
+                fail("corrupt SPIR-V: branch to an unknown label");
+            if (h < i) {
+                for (int k = h; k <= i; k++)
+                    for (int j = 0; j < sh->body[k].nops && !sh->body[k].dead; j++) {
+                        uint32_t c = canon(ids, sh, sh->body[k].ops[j]);
+                        if (def[c] >= 0 && def[c] < h && r.lastUse[c] < i)
+                            r.lastUse[c] = i;
+                    }
+            }
+            if (!(i + 1 < sh->bodyCount && sh->body[i + 1].op == OpLabel && sh->body[i + 1].result == label))
+                targeted[label] = 1;
+        }
     }
     for (i = 0; i < MAX_IDS; i++)
         if ((ids[i].kind == ID_VALUE || ids[i].kind == ID_VAR) && ids[i].fromInput >= 0)
@@ -2276,9 +3047,18 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             use[0] = sh->texcoordValue;
         }
         for (int j = 0; j < MAX_OPERANDS; j++) {
-            uint32_t c = use[j] ? root(ids, use[j]) : 0;
-            if (!c || ids[c].kind != ID_CONST || r.reg[c])
+            uint32_t c = use[j] ? root(ids, use[j]) : 0, k;
+            if (!c || ids[c].kind != ID_CONST || r.reg[c] || ids[c].vf00)
                 continue;
+            /* a constant with the same value already has a register */
+            for (k = 0; k < sh->constBase; k++)
+                if (k != c && ids[k].kind == ID_CONST && r.reg[k] && ids[k].compCount == ids[c].compCount &&
+                    !memcmp(ids[k].comps, ids[c].comps, sizeof(uint32_t) * (size_t)ids[c].compCount))
+                    break;
+            if (k < sh->constBase) {
+                r.reg[c] = r.reg[k];
+                continue;
+            }
             if (!constants++)
                 fprintf(f, "; constants\n");
             r.reg[c] = reg_alloc(&r);
@@ -2347,24 +3127,118 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         /* Shuffles and constructors read fields they have already written if the
          * result shares an operand's register, so they and the built-ins get a
          * distinct one. */
-        int distinct = is_map_op(b->op) || b->op == OpDot || b->op == OpExtInst, d = 0;
+        int distinct = is_map_op(b->op) || b->op == OpDot || b->op == OpExtInst ||
+                       b->op == OpSelect || b->op == OpBoolToFloat, d = 0;
         int regs[MAX_OPERANDS] = { 0 };
+        char line[96];
 
         if (b->dead)
             continue;
+        reg_sweep(&r, ids, i);
+        if (b->line)
+            snprintf(line, sizeof(line), "line %u: %s", (unsigned)b->line, body_name(b));
+        else
+            snprintf(line, sizeof(line), "%s", body_name(b));
+        if (b->op == OpLabel) {
+            if (targeted[b->result])
+                fprintf(f, "%s_L%u:\n", sym, (unsigned)b->result);
+            continue;
+        }
+        if (b->op == OpBranch) {
+            if (targeted[b->target] && !(i + 1 < sh->bodyCount && sh->body[i + 1].op == OpLabel &&
+                                         sh->body[i + 1].result == b->target)) {
+                snprintf(buf, sizeof(buf), "b             %s_L%u", sym, (unsigned)b->target);
+                vu(f, "NOP", buf, NULL);
+                vu(f, "NOP", "NOP", "branch delay slot");
+            }
+            continue;
+        }
+        if (b->op == OpPhiMove) {
+            /* The moves at the end of a block, as one parallel copy: a move whose
+             * target another move still reads waits, a cycle goes through a temporary. */
+            struct { int d, dc, s, sc, size; } mv[MAX_PHIS];
+            int k = i, nm = 0, temps[MAX_PHIS], nt = 0;
+
+            for (k = i; k < sh->bodyCount && sh->body[k].op == OpPhiMove; k++) {
+                const BodyOp *m = &sh->body[k];
+                uint32_t phi = m->result;
+                reg_ensure_loaded(f, &r, ids, sh, m->ops[0]);
+                if (!r.reg[phi])
+                    r.reg[phi] = reg_alloc(&r);
+                mv[nm].d = r.reg[phi];
+                mv[nm].dc = ids[phi].comp;
+                mv[nm].s = reg_of(&r, ids, sh, m->ops[0]);
+                mv[nm].sc = ids[m->ops[0]].comp;
+                mv[nm].size = type_size(ids, ids[phi].valType);
+                nm++;
+            }
+            while (nm) {
+                int m, o;
+                const char *c = line;
+                for (m = 0; m < nm; m++) {
+                    for (o = 0; o < nm; o++)
+                        if (o != m && mv[o].s == mv[m].d)
+                            break;
+                    if (o == nm)
+                        break;
+                }
+                if (m == nm) {
+                    int t = reg_alloc(&r);
+                    temps[nt++] = t;
+                    emit_l(f, &c, "move.xyzw", "VF%02d,VF%02d", t, mv[0].s);
+                    mv[0].s = t;
+                    continue;
+                }
+                if (mv[m].d != mv[m].s || (mv[m].size == 1 && mv[m].dc != mv[m].sc))
+                    emit_move(f, &c, mv[m].d, mv[m].dc, mv[m].s, mv[m].sc, mv[m].size);
+                mv[m] = mv[--nm];
+            }
+            for (int t = 0; t < nt; t++)
+                r.busy[temps[t]] = 0;
+            for (int j = i; j < k; j++) {
+                reg_release(&r, ids, sh, sh->body[j].ops[0], j);
+                reg_release(&r, ids, sh, sh->body[j].result, j);
+            }
+            i = k - 1;
+            continue;
+        }
         for (int j = 0; j < b->nops; j++)
             reg_ensure_loaded(f, &r, ids, sh, b->ops[j]);
         for (int j = 0; j < b->nops; j++)
             regs[j] = reg_of(&r, ids, sh, b->ops[j]);
+        if (b->op == OpBranchConditional) {
+            const char *c = line;
+            int cur = 0, next = i + 1 < sh->bodyCount && sh->body[i + 1].op == OpLabel ?
+                                (int)sh->body[i + 1].result : -1;
+            d = reg_alloc(&r);
+            emit_cond(f, &c, ids, regs, &cur, b->cond, d, sym);
+            vu(f, "NOP", "NOP", "VI13 settles");
+            if (next == (int)b->target) {
+                emit_l(f, &c, "ibeq", "VI13,VI00,%s_L%u", sym, (unsigned)b->target2);
+                vu(f, "NOP", "NOP", "branch delay slot");
+            } else {
+                emit_l(f, &c, "ibne", "VI13,VI00,%s_L%u", sym, (unsigned)b->target);
+                vu(f, "NOP", "NOP", "branch delay slot");
+                if (next != (int)b->target2) {
+                    emit_l(f, &c, "b", "%s_L%u", sym, (unsigned)b->target2);
+                    vu(f, "NOP", "NOP", "branch delay slot");
+                }
+            }
+            r.busy[d] = 0;
+            for (int j = 0; j < b->nops; j++)
+                reg_release(&r, ids, sh, b->ops[j], i);
+            continue;
+        }
         if (distinct)
             d = r.reg[b->result] = reg_alloc(&r);
         for (int j = 0; j < b->nops; j++)
             reg_release(&r, ids, sh, b->ops[j], i);
         if (!distinct)
             d = r.reg[b->result] = reg_alloc(&r);
-        emit_body_op(f, ids, b, d, regs);
+        emit_body_op(f, ids, sh, b, d, regs);
         reg_release(&r, ids, sh, b->result, i);   /* never read */
     }
+    reg_sweep(&r, ids, sh->bodyCount);
     reg_ensure_loaded(f, &r, ids, sh, sh->positionValue);
     if (sh->colorValue)
         reg_ensure_loaded(f, &r, ids, sh, sh->colorValue);

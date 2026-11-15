@@ -1,0 +1,1 @@
+early_return.vert: error: vertex shader returns in 2 places; VU1 code has one exit, so return once at the end (use if/else instead of an early return)

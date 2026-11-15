@@ -1,0 +1,1 @@
+matrix_phi.vert:17: error: vertex shader keeps a matrix across a branch or loop; only floats, ints, vectors and bools can be
