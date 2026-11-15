@@ -4,6 +4,10 @@
  *   .vert --glslangValidator--> .spv --shaderc--> .vsm + .c --dvp-as--> .o + .c  (VU1 microcode + PvkShaderCode)
  *   .frag --glslangValidator--> .spv --shaderc--> .c                            (GS settings in a PvkShaderCode)
  *
+ * shaderc first runs spirv-opt (SPIRV-Tools) on its input to inline function
+ * calls and turn local variables into plain values, so the body it compiles
+ * is straight-line code over ids that live in registers.
+ *
  * This version accepts:
  *
  *   vertex:   gl_Position, an optional vec4 color output and an optional vec2
@@ -15,7 +19,9 @@
  *             picked by an int block member, gl_InstanceIndex or int() of a
  *             float, and float/vec4/matrix constants with +, -, *, / and
  *             negation, matrix * vector, swizzles (v.xyz, v.bgra), component
- *             reads (v.w), vector constructors and math built-ins
+ *             reads (v.w), vector constructors, math built-ins, local
+ *             variables (vectors, matrices, structs and arrays indexed by
+ *             constants) and calls to the shader's own functions
  *   fragment: outColor = vColor;                      (Gouraud)
  *             outColor = texture(tex, vUV);           (GS TFX decal)
  *             outColor = texture(tex, vUV) * vColor;  (GS TFX modulate)
@@ -246,6 +252,23 @@ static void unsupported(uint32_t op, const char *stage)
              "and their product are supported so far", what);
     fail("vertex shader uses %s, which this version of ps2vk-shaderc does not "
          "compile yet", what);
+}
+
+/* Inlines calls and promotes locals to values; the result goes next to the output. */
+static const char *optimize(const char *in, const char *outBase)
+{
+    static char opt[512];
+    char cmd[1200];
+
+    snprintf(opt, sizeof(opt), "%s.opt.spv", outBase);
+    snprintf(cmd, sizeof(cmd),
+             "spirv-opt --inline-entry-points-exhaustive --eliminate-dead-functions "
+             "--scalar-replacement=100 --eliminate-local-single-block "
+             "--eliminate-local-single-store --eliminate-local-multi-store "
+             "--simplify-instructions --eliminate-dead-code-aggressive -o \"%s\" \"%s\"", opt, in);
+    if (system(cmd) != 0)
+        fail("spirv-opt failed on %s (SPIRV-Tools must be installed)", in);
+    return opt;
 }
 
 static uint32_t *read_spirv(const char *path, size_t *words)
@@ -840,7 +863,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                      "uniform blocks and a sampler2D", ids[id].name ? ids[id].name : "variable");
             }
             if (inFunction && storage == ScFunction)
-                fail("local variables are not supported yet");
+                fail("local variable '%s' is still in memory after spirv-opt: VU1 keeps locals "
+                     "in registers, so index local arrays with constants and keep locals "
+                     "to vectors, matrices and structs of them",
+                     ids[id].name ? ids[id].name : "variable");
             break;
         }
         case OpFunction:
@@ -859,7 +885,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     if (sh->execModel != ExecVertex && sh->execModel != ExecFragment)
         fail("only vertex and fragment shaders are supported");
     if (functions != 1)
-        fail("shader has %d functions; calls to other functions are not supported yet", functions);
+        fail("shader has %d functions after spirv-opt inlined its calls; a recursive function "
+             "cannot be inlined", functions);
 
     /* Collect the interface variables (Input/Output OpVariables at global scope). */
     for (pc = 5; pc < words;) {
@@ -2563,7 +2590,11 @@ int main(int argc, char **argv)
     }
     symbol_name(outBase, sym, sizeof(sym));
 
-    code = read_spirv(in, &words);
+    {
+        const char *opt = optimize(in, outBase);
+        code = read_spirv(opt, &words);
+        remove(opt);
+    }
     parse(code, words, ids, &sh);
 
     if (sh.execModel == ExecVertex)

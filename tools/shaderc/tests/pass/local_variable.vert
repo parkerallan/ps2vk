@@ -1,6 +1,6 @@
 #version 450
 
-// Without spirv-opt, glslang keeps 'p' as a Function variable.
+// A local: spirv-opt turns the store and load into one value.
 layout(location = 0) in vec4 inPos;
 
 void main()

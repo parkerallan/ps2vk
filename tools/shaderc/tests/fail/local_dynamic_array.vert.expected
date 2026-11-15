@@ -1,0 +1,1 @@
+local_dynamic_array.vert: error: local variable 'local' is still in memory after spirv-opt: VU1 keeps locals in registers, so index local arrays with constants and keep locals to vectors, matrices and structs of them

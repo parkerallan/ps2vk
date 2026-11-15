@@ -36,7 +36,7 @@ Draws indexed shapes and depth-tested, back-face culled 3D geometry from GLSL ve
 Install the basics:
 
 ```bash
-sudo apt install build-essential glslang-tools
+sudo apt install build-essential glslang-tools spirv-tools
 ```
 
 Download the prebuilt ps2dev toolchain:

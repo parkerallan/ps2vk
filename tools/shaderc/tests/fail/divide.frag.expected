@@ -1,1 +1,1 @@
-divide.frag:10: error: fragment shader uses OpCompositeConstruct (a vector constructor): the GS cannot run code per pixel. Only 'outColor = <color input>;', 'outColor = texture(<sampler>, <texcoord input>);' and their product are supported so far
+divide.frag:10: error: fragment shader multiplies something other than the texture sample by the color input; the GS can only modulate the texture by the vertex color

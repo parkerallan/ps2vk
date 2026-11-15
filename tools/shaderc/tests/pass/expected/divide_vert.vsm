@@ -34,7 +34,7 @@ divide_vert_CodeStart:
          NOP                                      ilw.z         VI12,3(VI00)               ; vertices per triangle, 0 = no culling
 ; constants
          sub.xyzw      VF05,VF00,VF00             NOP                                      ; vec4 constant
-         NOP                                      loi           0x40000000                 ; 2
+         NOP                                      loi           0x3f000000                 ; 0.5
          addi.xyzw     VF05,VF05,I                NOP
 divide_vert_instance:
 ; each instance restarts the primitive with a GIF tag of its own
@@ -78,18 +78,7 @@ divide_vert_Convert:
          mul.xyzw      VF11,VF00,VF00             NOP                                      ; components the format lacks: 0, w = 1
 divide_vert_body:
 ; shader body
-         NOP                                      div           Q,VF10x,VF05x              ; line 12: OpFDiv (division)
-         NOP                                      waitq
-         addq.x        VF06,VF00,Q                NOP
-         NOP                                      div           Q,VF10y,VF05y
-         NOP                                      waitq
-         addq.y        VF06,VF00,Q                NOP
-         NOP                                      div           Q,VF10z,VF05z
-         NOP                                      waitq
-         addq.z        VF06,VF00,Q                NOP
-         NOP                                      div           Q,VF10w,VF05w
-         NOP                                      waitq
-         mulq.w        VF06,VF00,Q                NOP
+         mul.xyzw      VF06,VF10,VF05             NOP                                      ; line 12: OpFMul (multiplication)
          NOP                                      div           Q,VF11x,VF10x              ; line 13: OpFDiv (division)
          NOP                                      waitq
          addq.x        VF07,VF00,Q                NOP
