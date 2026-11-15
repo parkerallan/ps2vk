@@ -84,6 +84,8 @@ struct PvkImageView_T {
 void pvk_view_framebuffer(PvkImageView view, framebuffer_t *fb);
 /* Largest depth value a depth format stores; depth is flipped so near = this. */
 float pvk_depth_max(PvkFormat format);
+/* The VU1 context's viewport scale and offset qwords (8 floats) for a viewport and depth format. */
+void pvk_viewport_context(const PvkViewport *vp, PvkFormat depthFormat, float *ctx);
 
 struct PvkSwapchain_T {
     uint32_t          width, height;
@@ -209,6 +211,9 @@ struct PvkPipeline_T {
     uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */
     uint32_t zmsk;            /* GS ZBUF.ZMSK: 1 = no depth writes */
     u64      alpha;           /* GS ALPHA */
+    int      blendFix;        /* ALPHA.C = FIX: the blend constants' alpha */
+    uint32_t dynamic;         /* 1 << PvkDynamicState for each state set while recording */
+    PvkRect2D scissor;        /* static scissor; zero size = the attachment level */
     float    context[PVK_VU1_CONTEXT_QWORDS * 4] __attribute__((aligned(16)));
 };
 
@@ -228,6 +233,11 @@ struct PvkCommandBuffer_T {
     uint8_t     push[PVK_MAX_PUSH_CONSTANT_BYTES]; /* what VU1's push constant range holds */
     uint32_t    pushSet;      /* bytes set so far (high-water mark) */
     struct PvkPipelineLayout_T pushLayout; /* ranges of the layout they were set with */
+    uint32_t    dynamicSet;   /* 1 << PvkDynamicState for each pvkCmdSet* called */
+    PvkViewport viewport;     /* set with pvkCmdSetViewport */
+    int         viewportDirty; /* VU1's viewport transform differs from `viewport` */
+    PvkRect2D   scissor;      /* set with pvkCmdSetScissor */
+    float       blendConstants[4]; /* set with pvkCmdSetBlendConstants */
     int         recording;
     int         rendering;
     int         failed;       /* a recording error makes the buffer unusable */

@@ -96,6 +96,8 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
     cmd->indexOffset  = 0;
     cmd->pushSet      = 0;
     memset(&cmd->pushLayout, 0, sizeof(cmd->pushLayout));
+    cmd->dynamicSet   = 0;
+    cmd->viewportDirty = 0;
     cmd->rendering    = 0;
     cmd->failed       = 0;
     cmd->recording    = 1;
@@ -261,31 +263,60 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 }
 
 /* Chain qwords cmd_gs_state() uses. */
-#define PVK_GS_STATE_QWORDS 15
+#define PVK_GS_STATE_QWORDS 16
 
-/* FRAME, ZBUF, TEST and ALPHA for drawing with the bound pipeline into the current
+/* The scissor the draws use (the pipeline's, or the command buffer's when dynamic),
+ * clipped to the attachment level. Returns 0 when nothing is left. */
+static int cmd_scissor(PvkCommandBuffer cmd, const framebuffer_t *fb, PvkRect2D *out)
+{
+    const PvkPipeline p = cmd->pipeline;
+    const PvkRect2D *r = p->dynamic & (1u << PVK_DYNAMIC_STATE_SCISSOR) ? &cmd->scissor : &p->scissor;
+    int32_t x0 = 0, y0 = 0, x1 = (int32_t)fb->width, y1 = (int32_t)fb->height;
+
+    if (r->width && r->height) {
+        if (r->x > x0) x0 = r->x;
+        if (r->y > y0) y0 = r->y;
+        if (r->x + (int32_t)r->width < x1)  x1 = r->x + (int32_t)r->width;
+        if (r->y + (int32_t)r->height < y1) y1 = r->y + (int32_t)r->height;
+    }
+    out->x = x0;
+    out->y = y0;
+    out->width  = x1 > x0 ? (uint32_t)(x1 - x0) : 0;
+    out->height = y1 > y0 ? (uint32_t)(y1 - y0) : 0;
+    return out->width && out->height;
+}
+
+/* FRAME, ZBUF, TEST, ALPHA and SCISSOR for drawing with the bound pipeline into the current
  * attachments, plus TEX0, TEXA, TEX1, CLAMP and the MIPTBPs for the image and sampler
  * in the bound descriptor set when the pipeline samples one. Sent before the first draw
- * after pvkCmdBeginRendering, pvkCmdBindPipeline or pvkCmdBindDescriptorSets. */
-static void cmd_gs_state(PvkCommandBuffer cmd)
+ * after pvkCmdBeginRendering, pvkCmdBindPipeline, pvkCmdBindDescriptorSets or a dynamic
+ * scissor or blend constant change. */
+static void cmd_gs_state(PvkCommandBuffer cmd, const framebuffer_t *fb, const PvkRect2D *scissor)
 {
     const PvkImage depth = cmd->depthView ? cmd->depthView->image : NULL;
     const PvkPipeline p = cmd->pipeline;
     int textured = p->fs->textured;
     const struct PvkDescriptorSlot *slot = textured ? &cmd->sets[p->samplerSet]->slots[p->samplerSlot] : NULL;
     int mipmapped = textured && slot->view->levels > 1;
-    framebuffer_t fb;
+    u64 alpha = p->alpha;
     qword_t *q;
 
-    pvk_view_framebuffer(cmd->colorView, &fb);
+    if (p->blendFix && p->dynamic & (1u << PVK_DYNAMIC_STATE_BLEND_CONSTANTS)) {
+        float k = cmd->blendConstants[3];
+        k = k < 0.0f ? 0.0f : k > 1.0f ? 1.0f : k;
+        alpha = (alpha & ~((u64)0xFF << 32)) | ((u64)(int)(k * 128.0f + 0.5f) << 32);
+    }
+
     q = cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 11 : 9) : 4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    q = gs_ad(q, GS_SET_FRAME(fb.address >> 11, fb.width >> 6, fb.psm, 0), GS_REG_FRAME);
+    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 12 : 10) : 5, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, 0), GS_REG_FRAME);
     q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
                              depth ? p->zmsk : 1), GS_REG_ZBUF);
     /* No alpha test (Vulkan has none); depth test from the pipeline. */
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
-    q = gs_ad(q, p->alpha, GS_REG_ALPHA);
+    q = gs_ad(q, alpha, GS_REG_ALPHA);
+    q = gs_ad(q, GS_SET_SCISSOR(scissor->x, scissor->x + (int32_t)scissor->width - 1,
+                                scissor->y, scissor->y + (int32_t)scissor->height - 1), GS_REG_SCISSOR);
     if (textured) {
         const PvkImageView v = slot->view;
         const PvkImage t = v->image, c = slot->colorTable;
@@ -482,23 +513,63 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
 {
     u32 *start = (u32 *)pipeline->code;
     u32 *end   = (u32 *)pipeline->codeEnd;
+    float context[PVK_VU1_CONTEXT_QWORDS * 4];
     uint32_t i;
 
     if (!cmd_reserve(cmd, packet2_utils_get_packet_size_for_program(start, end) + 8))
         return;
 
     /* Upload the vertex shader (VIF waits for VU1 to stop first), then the
-     * per-pipeline constants. */
+     * per-pipeline constants, with the command buffer's viewport when it is dynamic. */
     packet2_vif_add_micro_program(cmd->packet, 0, start, end);
 
+    memcpy(context, pipeline->context, sizeof(context));
+    if (pipeline->dynamic & (1u << PVK_DYNAMIC_STATE_VIEWPORT) && cmd->dynamicSet & (1u << PVK_DYNAMIC_STATE_VIEWPORT)) {
+        pvk_viewport_context(&cmd->viewport, pipeline->depthFormat, context);
+        cmd->viewportDirty = 0;
+    }
     packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_CONTEXT_ADDR, 0);
     for (i = 0; i < PVK_VU1_CONTEXT_QWORDS * 4; i++)
-        packet2_add_float(cmd->packet, pipeline->context[i]);
+        packet2_add_float(cmd->packet, context[i]);
     packet2_utils_vu_close_unpack(cmd->packet);
 
     cmd->pipeline      = pipeline;
     cmd->gsStateDirty  = 1; /* its depth test and write mask */
     cmd->uniformsDirty = 1; /* its shader places the uniform blocks in VU1 memory */
+}
+
+void pvkCmdSetViewport(PvkCommandBuffer cmd, uint32_t firstViewport, uint32_t viewportCount,
+                       const PvkViewport *viewports)
+{
+    if (firstViewport != 0 || viewportCount != 1) {
+        pvk_error("pvkCmdSetViewport: viewport %u, count %u; the GS has one viewport\n", (unsigned)firstViewport,
+                  (unsigned)viewportCount);
+        cmd->failed = 1;
+        return;
+    }
+    cmd->viewport      = viewports[0];
+    cmd->dynamicSet   |= 1u << PVK_DYNAMIC_STATE_VIEWPORT;
+    cmd->viewportDirty = 1;
+}
+
+void pvkCmdSetScissor(PvkCommandBuffer cmd, uint32_t firstScissor, uint32_t scissorCount, const PvkRect2D *scissors)
+{
+    if (firstScissor != 0 || scissorCount != 1) {
+        pvk_error("pvkCmdSetScissor: scissor %u, count %u; the GS has one scissor\n", (unsigned)firstScissor,
+                  (unsigned)scissorCount);
+        cmd->failed = 1;
+        return;
+    }
+    cmd->scissor      = scissors[0];
+    cmd->dynamicSet  |= 1u << PVK_DYNAMIC_STATE_SCISSOR;
+    cmd->gsStateDirty = 1;
+}
+
+void pvkCmdSetBlendConstants(PvkCommandBuffer cmd, const float blendConstants[4])
+{
+    memcpy(cmd->blendConstants, blendConstants, sizeof(cmd->blendConstants));
+    cmd->dynamicSet  |= 1u << PVK_DYNAMIC_STATE_BLEND_CONSTANTS;
+    cmd->gsStateDirty = 1;
 }
 
 void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_t stageFlags,
@@ -669,7 +740,9 @@ static int send_uniforms(PvkCommandBuffer cmd, const char *name)
 static int draw_ready(PvkCommandBuffer cmd, const char *name)
 {
     PvkPipeline p = cmd->pipeline;
-    uint32_t b;
+    uint32_t b, missing;
+    framebuffer_t fb;
+    PvkRect2D scissor;
 
     if (!cmd->rendering || !p) {
         pvk_error("%s needs pvkCmdBeginRendering and a pipeline\n", name);
@@ -700,16 +773,46 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         return 0;
     }
 
+    missing = p->dynamic & ~cmd->dynamicSet;
+    if (!p->blendFix)
+        missing &= ~(1u << PVK_DYNAMIC_STATE_BLEND_CONSTANTS);
+    if (missing) {
+        pvk_error("%s: the pipeline's dynamic state 0x%x was not set (pvkCmdSetViewport, pvkCmdSetScissor, "
+                  "pvkCmdSetBlendConstants)\n", name, (unsigned)missing);
+        cmd->failed = 1;
+        return 0;
+    }
+
     if (!send_uniforms(cmd, name))
         return 0;
     if (p->fs->textured && !bound_set(cmd, name, p->samplerSet, p->samplerSlot, "fragment shader", p->fs->name,
                                       (uint32_t)p->fs->samplerBinding))
         return 0;
 
+    /* A running batch reads the viewport in its first instructions, so wait for
+     * VU1 before replacing it. */
+    if (p->dynamic & (1u << PVK_DYNAMIC_STATE_VIEWPORT) && cmd->viewportDirty) {
+        float context[8];
+        uint32_t i;
+
+        if (!cmd_reserve(cmd, 6))
+            return 0;
+        pvk_viewport_context(&cmd->viewport, p->depthFormat, context);
+        cmd_flush(cmd);
+        packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_CONTEXT_ADDR, 0);
+        for (i = 0; i < 8; i++)
+            packet2_add_float(cmd->packet, context[i]);
+        packet2_utils_vu_close_unpack(cmd->packet);
+        cmd->viewportDirty = 0;
+    }
+
+    pvk_view_framebuffer(cmd->colorView, &fb);
+    if (!cmd_scissor(cmd, &fb, &scissor))
+        return 0; /* nothing may be written */
     if (cmd->gsStateDirty) {
         if (!cmd_reserve(cmd, PVK_GS_STATE_QWORDS))
             return 0;
-        cmd_gs_state(cmd);
+        cmd_gs_state(cmd, &fb, &scissor);
     }
     return !p->cullAll; /* FRONT_AND_BACK: every triangle is discarded, so nothing to send */
 }

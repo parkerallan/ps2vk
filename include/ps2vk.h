@@ -788,6 +788,14 @@ typedef struct PvkVertexInputAttribute {
     uint32_t  offset;   /**< Bytes from the start of the vertex in its binding: the n-th attribute of a binding, in shader input order, is at n times the format's size. */
 } PvkVertexInputAttribute;
 
+/** @brief A rectangle in pixels. */
+typedef struct PvkRect2D {
+    int32_t  x;      /**< Left edge. */
+    int32_t  y;      /**< Top edge. */
+    uint32_t width;  /**< Width. */
+    uint32_t height; /**< Height. */
+} PvkRect2D;
+
 /** @brief Maps clip space to framebuffer pixels, as in Vulkan (y points down). */
 typedef struct PvkViewport {
     float x;        /**< Left edge in pixels. */
@@ -913,8 +921,27 @@ typedef struct PvkPipelineColorBlendAttachmentState {
 /** @brief Blend state of a pipeline, like VkPipelineColorBlendStateCreateInfo. */
 typedef struct PvkPipelineColorBlendStateCreateInfo {
     PvkPipelineColorBlendAttachmentState attachment;        /**< Blending of the single color attachment. */
-    float                                blendConstants[4]; /**< Only [3] is used, by the CONSTANT_ALPHA factors, as GS ALPHA.FIX (0..1, 1 = 128). */
+    float                                blendConstants[4]; /**< Only [3] is used, by the CONSTANT_ALPHA factors, as GS ALPHA.FIX (0..1, 1 = 128). Ignored when PVK_DYNAMIC_STATE_BLEND_CONSTANTS is dynamic. */
 } PvkPipelineColorBlendStateCreateInfo;
+
+/**
+ * @brief Pipeline state that is set while recording instead of at creation. Values match Vulkan's VkDynamicState.
+ *
+ * The three the GS can change between draws. A pipeline that lists one
+ * ignores the value in its create info; the matching pvkCmdSet*() must have
+ * been called in the command buffer before a draw with it.
+ */
+typedef enum PvkDynamicState {
+    PVK_DYNAMIC_STATE_VIEWPORT        = 0, /**< PvkGraphicsPipelineCreateInfo::viewport is set by pvkCmdSetViewport(). */
+    PVK_DYNAMIC_STATE_SCISSOR         = 1, /**< PvkGraphicsPipelineCreateInfo::scissor is set by pvkCmdSetScissor(). */
+    PVK_DYNAMIC_STATE_BLEND_CONSTANTS = 4  /**< PvkPipelineColorBlendStateCreateInfo::blendConstants is set by pvkCmdSetBlendConstants(). */
+} PvkDynamicState;
+
+/** @brief Which state a pipeline leaves dynamic, like VkPipelineDynamicStateCreateInfo. All zeros means none. */
+typedef struct PvkPipelineDynamicStateCreateInfo {
+    uint32_t               dynamicStateCount; /**< Number of entries in dynamicStates. */
+    const PvkDynamicState *dynamicStates;     /**< The states set while recording. */
+} PvkPipelineDynamicStateCreateInfo;
 
 /** @brief Parameters for pvkCreateGraphicsPipeline(). */
 typedef struct PvkGraphicsPipelineCreateInfo {
@@ -926,11 +953,13 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     uint32_t                       attributeCount; /**< Number of entries in attributes. */
     const PvkVertexInputAttribute *attributes;     /**< One per vertex shader input. */
     PvkPrimitiveTopology           topology;       /**< How the vertices of a draw are grouped into primitives. */
-    PvkViewport                    viewport;       /**< Viewport, fixed for this pipeline. */
+    PvkViewport                    viewport;       /**< Viewport, unless PVK_DYNAMIC_STATE_VIEWPORT is dynamic. */
+    PvkRect2D                      scissor;        /**< Pixels the draws may write, clipped to the attachment, unless PVK_DYNAMIC_STATE_SCISSOR is dynamic; a zero width or height means the whole attachment level (Vulkan has no such default). GS SCISSOR. */
     PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none (like VkPipelineRenderingCreateInfo). Sets the depth range the viewport maps to. */
     PvkPipelineRasterizationStateCreateInfo rasterization; /**< Back-face culling. */
     PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth test and write control. */
     PvkPipelineColorBlendStateCreateInfo   colorBlend;   /**< Blending with the color attachment. */
+    PvkPipelineDynamicStateCreateInfo      dynamicState; /**< State set while recording instead of here. */
 } PvkGraphicsPipelineCreateInfo;
 
 /**
@@ -957,8 +986,10 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  * settings, culling, depth test and blend equation. A depth test needs a
  * depthAttachmentFormat, the comparison must be one the GS can do (see
  * PvkCompareOp) and the blend factors must fit the GS equation (see
- * PvkPipelineColorBlendAttachmentState). Every vertex shader input needs an
- * attribute in a declared binding (see PvkVertexInputBinding); the pipeline
+ * PvkPipelineColorBlendAttachmentState). The states listed in dynamicState
+ * are read from the command buffer instead (see PvkDynamicState). Every
+ * vertex shader input needs an attribute in a declared binding (see
+ * PvkVertexInputBinding); the pipeline
  * keeps its own copy of the VU1 code with the integer-to-float conversion
  * each input's format needs patched in, so float inputs cost nothing, and
  * each input's load pointed at its binding's per-vertex or per-instance
@@ -1190,14 +1221,6 @@ typedef union PvkClearValue {
     PvkClearDepthStencilValue depthStencil; /**< For the depth attachment. */
 } PvkClearValue;
 
-/** @brief A rectangle in pixels. */
-typedef struct PvkRect2D {
-    int32_t  x;      /**< Left edge. */
-    int32_t  y;      /**< Top edge. */
-    uint32_t width;  /**< Width. */
-    uint32_t height; /**< Height. */
-} PvkRect2D;
-
 /** @brief An image to render into and how to start it. */
 typedef struct PvkRenderingAttachmentInfo {
     PvkImageView        imageView;  /**< A one-level view of the target: a swapchain image or a PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT image for color, a depth image for depth; NULL for no attachment. */
@@ -1277,6 +1300,49 @@ void pvkCmdEndRendering(PvkCommandBuffer cmd);
  * @param pipeline The pipeline.
  */
 void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline);
+
+/**
+ * @brief Sets the viewport for the following draws with a pipeline that has PVK_DYNAMIC_STATE_VIEWPORT, like vkCmdSetViewport.
+ *
+ * Pipelines without it keep their own viewport. The value stays set for the
+ * rest of the command buffer, across pvkCmdBindPipeline(). The first draw
+ * after a change rewrites VU1's viewport transform, after waiting for the
+ * running batch.
+ *
+ * @param cmd The command buffer.
+ * @param firstViewport Must be 0: the GS has one viewport.
+ * @param viewportCount Must be 1.
+ * @param viewports The viewport.
+ */
+void pvkCmdSetViewport(PvkCommandBuffer cmd, uint32_t firstViewport, uint32_t viewportCount,
+                       const PvkViewport *viewports);
+
+/**
+ * @brief Sets the scissor rectangle for the following draws with a pipeline that has PVK_DYNAMIC_STATE_SCISSOR, like vkCmdSetScissor.
+ *
+ * Pixels outside the rectangle are not written. It is clipped to the
+ * attachment level; a draw whose rectangle is empty after clipping draws
+ * nothing. The value stays set for the rest of the command buffer. Sent as GS
+ * SCISSOR with the draw state.
+ *
+ * @param cmd The command buffer.
+ * @param firstScissor Must be 0: the GS has one scissor.
+ * @param scissorCount Must be 1.
+ * @param scissors The rectangle in framebuffer pixels.
+ */
+void pvkCmdSetScissor(PvkCommandBuffer cmd, uint32_t firstScissor, uint32_t scissorCount, const PvkRect2D *scissors);
+
+/**
+ * @brief Sets the blend constants for the following draws with a pipeline that has PVK_DYNAMIC_STATE_BLEND_CONSTANTS, like vkCmdSetBlendConstants.
+ *
+ * Only blendConstants[3] has an effect, through the CONSTANT_ALPHA factors;
+ * the GS has no constant color. The value stays set for the rest of the
+ * command buffer. Sent as GS ALPHA.FIX with the draw state.
+ *
+ * @param cmd The command buffer.
+ * @param blendConstants RGBA, each 0..1; [3] becomes ALPHA.FIX (1 = 128).
+ */
+void pvkCmdSetBlendConstants(PvkCommandBuffer cmd, const float blendConstants[4]);
 
 /**
  * @brief Sets push constants for the following draws.

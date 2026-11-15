@@ -126,7 +126,8 @@ static PvkResult setup_blend(PvkPipeline p, const PvkGraphicsPipelineCreateInfo 
         return PVK_ERROR_FEATURE_NOT_PRESENT;
     }
     src = ssrc >= 0 ? ssrc : dsrc;
-    if (src == 2) {
+    p->blendFix = src == 2;
+    if (src == 2 && !(p->dynamic & (1u << PVK_DYNAMIC_STATE_BLEND_CONSTANTS))) {
         k = info->colorBlend.blendConstants[3];
         k = k < 0.0f ? 0.0f : k > 1.0f ? 1.0f : k;
         fix = (int)(k * 128.0f + 0.5f);
@@ -154,6 +155,40 @@ static PvkResult setup_blend(PvkPipeline p, const PvkGraphicsPipelineCreateInfo 
     pvk_error("pipeline: blend factors %d, %d with op %d do not fit the GS's (A - B) * C + D\n",
               (int)bs->srcColorBlendFactor, (int)bs->dstColorBlendFactor, (int)bs->colorBlendOp);
     return PVK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static PvkResult setup_dynamic(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info)
+{
+    uint32_t i;
+
+    for (i = 0; i < info->dynamicState.dynamicStateCount; i++) {
+        PvkDynamicState s = info->dynamicState.dynamicStates[i];
+
+        if (s != PVK_DYNAMIC_STATE_VIEWPORT && s != PVK_DYNAMIC_STATE_SCISSOR &&
+            s != PVK_DYNAMIC_STATE_BLEND_CONSTANTS) {
+            pvk_error("pipeline: dynamic state %d; only VIEWPORT, SCISSOR and BLEND_CONSTANTS change between draws\n",
+                      (int)s);
+            return PVK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        p->dynamic |= 1u << s;
+    }
+    p->scissor = info->scissor;
+    return PVK_SUCCESS;
+}
+
+void pvk_viewport_context(const PvkViewport *vp, PvkFormat depthFormat, float *ctx)
+{
+    float depthMax = pvk_depth_max(depthFormat);
+
+    /* Vulkan viewport transform, in GS primitive coordinates: x and y go from
+     * NDC [-1, 1] (y down) to pixels, z from [0, 1] to the depth format's
+     * flipped integer range. */
+    ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 0]  = vp->width * 0.5f;
+    ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 1]  = vp->height * 0.5f;
+    ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 2]  = -depthMax * (vp->maxDepth - vp->minDepth);
+    ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 0] = PVK_GS_ORIGIN + vp->x + vp->width * 0.5f;
+    ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 1] = PVK_GS_ORIGIN + vp->y + vp->height * 0.5f;
+    ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 2] = depthMax * (1.0f - vp->minDepth);
 }
 
 static PvkResult validate_shaders(const PvkShaderCode *vs, const PvkShaderCode *fs)
@@ -603,13 +638,12 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
 {
     const PvkShaderCode *vs = info->vertexShader ? info->vertexShader->code : NULL;
     const PvkShaderCode *fs = info->fragmentShader ? info->fragmentShader->code : NULL;
-    const PvkViewport *vp   = &info->viewport;
     const VertexFormat *fmt[PVK_MAX_VERTEX_INPUTS];
     uint32_t qword[PVK_MAX_VERTEX_INPUTS];
     int instance[PVK_MAX_VERTEX_INPUTS];
     PvkPipeline p;
     PvkResult res;
-    float *ctx, depthMax;
+    float *ctx;
 
     if ((res = validate_shaders(vs, fs)) != PVK_SUCCESS)
         return res;
@@ -643,23 +677,14 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     p->prim         = GS_SET_PRIM(topologies[info->topology].prim, fs->gouraud, fs->textured, 0,
                                   info->colorBlend.attachment.blendEnable ? 1 : 0, 0, 0, 0, 0);
 
-    if ((res = setup_depth(p, info)) != PVK_SUCCESS || (res = setup_blend(p, info)) != PVK_SUCCESS ||
-        (res = setup_cull(p, info)) != PVK_SUCCESS) {
+    if ((res = setup_dynamic(p, info)) != PVK_SUCCESS || (res = setup_depth(p, info)) != PVK_SUCCESS ||
+        (res = setup_blend(p, info)) != PVK_SUCCESS || (res = setup_cull(p, info)) != PVK_SUCCESS) {
         pvkDestroyPipeline(device, p);
         return res;
     }
-    depthMax = pvk_depth_max(p->depthFormat);
 
-    /* Vulkan viewport transform, in GS primitive coordinates: x and y go from
-     * NDC [-1, 1] (y down) to pixels, z from [0, 1] to the depth format's
-     * flipped integer range. */
     ctx = p->context;
-    ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 0]  = vp->width * 0.5f;
-    ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 1]  = vp->height * 0.5f;
-    ctx[PVK_VU1_CTX_VIEWPORT_SCALE * 4 + 2]  = -depthMax * (vp->maxDepth - vp->minDepth);
-    ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 0] = PVK_GS_ORIGIN + vp->x + vp->width * 0.5f;
-    ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 1] = PVK_GS_ORIGIN + vp->y + vp->height * 0.5f;
-    ctx[PVK_VU1_CTX_VIEWPORT_OFFSET * 4 + 2] = depthMax * (1.0f - vp->minDepth);
+    pvk_viewport_context(&info->viewport, p->depthFormat, ctx);
     /* Colors 0..1 to GS 0..255; GS alpha 128 means 1.0. */
     ctx[PVK_VU1_CTX_COLOR_SCALE * 4 + 0] = 255.0f;
     ctx[PVK_VU1_CTX_COLOR_SCALE * 4 + 1] = 255.0f;
