@@ -27,6 +27,17 @@ extern const PvkShaderCode tri_frag;
         }                                                                 \
     } while (0)
 
+/* The first memory type allowed by typeBits that has every flag in flags. */
+static uint32_t memory_type(PvkPhysicalDevice physicalDevice, uint32_t typeBits, uint32_t flags)
+{
+    PvkPhysicalDeviceMemoryProperties memory;
+    pvkGetPhysicalDeviceMemoryProperties(physicalDevice, &memory);
+    for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
+        if ((typeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags)
+            return i;
+    return 0;
+}
+
 /* Clip-space position (Vulkan convention: y points down), then RGBA color. */
 static const float vertices[] = {
      0.0f, -0.6f, 0.5f, 1.0f,   1.0f, 0.0f, 0.0f, 1.0f,
@@ -48,6 +59,7 @@ int main(void)
     PvkImageView views[2];
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer;
+    PvkDeviceMemory vertexMemory, indexMemory;
     PvkShaderModule vs, fs;
     PvkPipelineLayout layout;
     PvkPipeline pipeline;
@@ -74,15 +86,31 @@ int main(void)
 
     PvkBufferCreateInfo bufferInfo = { .size = sizeof(vertices) };
     CHECK(pvkCreateBuffer(device, &bufferInfo, &vertexBuffer));
-    CHECK(pvkMapMemory(device, vertexBuffer, &mapped));
+    PvkMemoryRequirements vertexBufferReq;
+    pvkGetBufferMemoryRequirements(device, vertexBuffer, &vertexBufferReq);
+    PvkMemoryAllocateInfo vertexMemoryInfo = {
+        .allocationSize  = vertexBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, vertexBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &vertexMemoryInfo, &vertexMemory));
+    CHECK(pvkBindBufferMemory(device, vertexBuffer, vertexMemory, 0));
+    CHECK(pvkMapMemory(device, vertexMemory, 0, sizeof(vertices), &mapped));
     memcpy(mapped, vertices, sizeof(vertices));
-    pvkUnmapMemory(device, vertexBuffer);
+    pvkUnmapMemory(device, vertexMemory);
 
     PvkBufferCreateInfo indexInfo = { .size = sizeof(indices) };
     CHECK(pvkCreateBuffer(device, &indexInfo, &indexBuffer));
-    CHECK(pvkMapMemory(device, indexBuffer, &mapped));
+    PvkMemoryRequirements indexBufferReq;
+    pvkGetBufferMemoryRequirements(device, indexBuffer, &indexBufferReq);
+    PvkMemoryAllocateInfo indexMemoryInfo = {
+        .allocationSize  = indexBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, indexBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &indexMemoryInfo, &indexMemory));
+    CHECK(pvkBindBufferMemory(device, indexBuffer, indexMemory, 0));
+    CHECK(pvkMapMemory(device, indexMemory, 0, sizeof(indices), &mapped));
     memcpy(mapped, indices, sizeof(indices));
-    pvkUnmapMemory(device, indexBuffer);
+    pvkUnmapMemory(device, indexMemory);
 
     PvkShaderModuleCreateInfo vsInfo = { .code = &tri_vert };
     PvkShaderModuleCreateInfo fsInfo = { .code = &tri_frag };

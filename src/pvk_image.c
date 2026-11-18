@@ -76,9 +76,12 @@ static uint32_t texture_blocks(uint32_t width, uint32_t height, PvkFormat format
     return lastPage * 32 + last + 1;
 }
 
-static int alloc_blocks(uint32_t blocks)
+/* Pages a framebuffer or depth buffer covers: GS pages are 64x32 for 32-bit formats, 64x64 for 16-bit. */
+uint32_t pvk_page_words(uint32_t width, uint32_t height, PvkFormat format)
 {
-    return graph_vram_allocate(64, (int)blocks, GS_PSM_32, GRAPH_ALIGN_BLOCK);
+    uint32_t bits = pvk_format_bits(format);
+    uint32_t ph = format == PVK_FORMAT_Z16 || bits == 16 ? 64 : 32;
+    return ((width + 63) / 64) * ((height + ph - 1) / ph) * 2048;
 }
 
 /* TBW is in 64-texel units; 8- and 4-bit rows are at least a 128-texel page. */
@@ -133,7 +136,7 @@ void pvk_view_framebuffer(PvkImageView view, framebuffer_t *fb)
 PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkImage *image)
 {
     PvkImage img;
-    int psm, address;
+    int psm;
     int depth = info->format == PVK_FORMAT_Z32 || info->format == PVK_FORMAT_Z24 || info->format == PVK_FORMAT_Z16;
     int table = info->height == 1 && (info->format == PVK_FORMAT_CT32 || info->format == PVK_FORMAT_CT16);
     uint32_t levels = depth || table || !info->mipLevels ? 1 : info->mipLevels, l;
@@ -192,26 +195,9 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     if (!img)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
 
-    /* FRAME and ZBUF addresses are in 8 KB pages, TEX0 and CBP addresses in 256-byte blocks. */
-    if (depth || target)
-        address = graph_vram_allocate((int)info->width, (int)info->height, psm, GRAPH_ALIGN_PAGE);
-    else if (table)
-        address = alloc_blocks(texture_blocks(info->width == 256 ? 16 : 8, info->width == 256 ? 16 : 2,
-                                              info->format, 64));
-    else
-        address = alloc_blocks(texture_blocks(info->width, info->height, info->format,
-                                              buffer_width(info->width, info->format)));
-    if (address < 0) {
-        pvk_error("out of GS memory for a %ux%u %s image\n", (unsigned)info->width,
-                  (unsigned)info->height, depth ? "depth" : table ? "color table" : "texture");
-        free(img);
-        return PVK_ERROR_OUT_OF_DEVICE_MEMORY;
-    }
-
     img->format     = info->format;
     img->usage      = usage;
     img->colorTable = table;
-    img->fb.address = address;
     img->fb.width   = info->width;
     img->fb.height  = info->height;
     img->fb.psm     = psm;
@@ -219,19 +205,18 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
     img->levels     = levels;
     pvk_image_texture_params(img);
 
-    /* Each further level is its own block-aligned texture, half the size. */
-    for (l = 1; l < levels; l++) {
+    /* FRAME and ZBUF addresses are in 8 KB pages, TEX0 and CBP addresses in 256-byte blocks.
+     * Each level is its own texture, half the size of the one before. */
+    img->alignWords = depth || target ? 2048 : 64;
+    for (l = 0; l < levels; l++) {
         uint32_t w = info->width >> l, h = info->height >> l;
-        address = target ? graph_vram_allocate((int)w, (int)h, psm, GRAPH_ALIGN_PAGE)
-                         : alloc_blocks(texture_blocks(w, h, info->format, buffer_width(w, info->format)));
-        if (address < 0) {
-            pvk_error("out of GS memory for level %u of a %ux%u texture\n", (unsigned)l, (unsigned)info->width,
-                      (unsigned)info->height);
-            free(img);
-            return PVK_ERROR_OUT_OF_DEVICE_MEMORY;
-        }
-        img->levelAddress[l] = (uint32_t)address;
-        img->levelTbw[l]     = buffer_width(w, info->format) / 64;
+        if (depth || target)
+            img->levelWords[l] = pvk_page_words(w, h, info->format);
+        else if (table)
+            img->levelWords[l] = 64 * texture_blocks(w == 256 ? 16 : 8, w == 256 ? 16 : 2, info->format, 64);
+        else
+            img->levelWords[l] = 64 * texture_blocks(w, h, info->format, buffer_width(w, info->format));
+        img->levelTbw[l] = buffer_width(w, info->format) / 64;
     }
 
     *image = img;
@@ -240,9 +225,55 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
 
 void pvkDestroyImage(PvkDevice device, PvkImage image)
 {
-    /* graph_vram_free only rewinds the allocator, so the VRAM stays taken. */
     (void)device;
     free(image);
+}
+
+/* Words from level 0's start to the end of the last level, each level aligned. */
+static uint32_t image_words(PvkImage image)
+{
+    uint32_t l, words = 0;
+
+    for (l = 0; l < image->levels; l++)
+        words = ((words + image->alignWords - 1) & ~(image->alignWords - 1)) + image->levelWords[l];
+    return words;
+}
+
+void pvkGetImageMemoryRequirements(PvkDevice device, PvkImage image, PvkMemoryRequirements *requirements)
+{
+    (void)device;
+    requirements->size           = (size_t)image_words(image) * 4;
+    requirements->alignment      = (size_t)image->alignWords * 4;
+    requirements->memoryTypeBits = 1u << 1;
+}
+
+PvkResult pvkBindImageMemory(PvkDevice device, PvkImage image, PvkDeviceMemory memory, size_t offset)
+{
+    uint32_t l, address;
+
+    (void)device;
+    if (image->bound) {
+        pvk_error("pvkBindImageMemory: the image is bound already\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (memory->typeIndex != 1 || offset % ((size_t)image->alignWords * 4) || offset > memory->size ||
+        (size_t)image_words(image) * 4 > memory->size - offset) {
+        pvk_error("pvkBindImageMemory: needs type 1 (GS VRAM) memory, an offset that is a multiple of %u and "
+                  "%u bytes from it (%u-byte allocation, offset %u)\n", (unsigned)image->alignWords * 4,
+                  (unsigned)image_words(image) * 4, (unsigned)memory->size, (unsigned)offset);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+
+    address = memory->vram + (uint32_t)(offset / 4);
+    for (l = 0; l < image->levels; l++) {
+        address = (address + image->alignWords - 1) & ~(image->alignWords - 1);
+        image->levelAddress[l] = address;
+        address += image->levelWords[l];
+    }
+    image->fb.address = image->levelAddress[0];
+    image->memory     = memory;
+    image->bound      = 1;
+    return PVK_SUCCESS;
 }
 
 PvkResult pvkCreateImageView(PvkDevice device, const PvkImageViewCreateInfo *info, PvkImageView *view)
@@ -254,6 +285,10 @@ PvkResult pvkCreateImageView(PvkDevice device, const PvkImageViewCreateInfo *inf
 
     if (!info->image || (info->format != PVK_FORMAT_UNDEFINED && info->format != info->image->format)) {
         pvk_error("pvkCreateImageView: needs an image, and format must be its format or PVK_FORMAT_UNDEFINED\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (!info->image->bound) {
+        pvk_error("pvkCreateImageView: bind the image's memory first (pvkBindImageMemory)\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
     levels = info->levelCount == PVK_REMAINING_MIP_LEVELS && info->baseMipLevel < info->image->levels

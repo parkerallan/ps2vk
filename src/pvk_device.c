@@ -83,6 +83,11 @@ void pvkGetPhysicalDeviceFeatures(PvkPhysicalDevice physicalDevice, PvkPhysicalD
 void pvkGetPhysicalDeviceMemoryProperties(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceMemoryProperties *properties)
 {
     (void)physicalDevice;
+    properties->memoryTypeCount = 2;
+    properties->memoryTypes[0].propertyFlags = PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | PVK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    properties->memoryTypes[0].heapIndex     = 0;
+    properties->memoryTypes[1].propertyFlags = PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    properties->memoryTypes[1].heapIndex     = 1;
     properties->memoryHeapCount = 2;
     properties->memoryHeaps[0].size  = 32u << 20;
     properties->memoryHeaps[0].flags = 0;

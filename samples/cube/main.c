@@ -32,6 +32,17 @@ extern const PvkShaderCode cube_frag;
         }                                                                 \
     } while (0)
 
+/* The first memory type allowed by typeBits that has every flag in flags. */
+static uint32_t memory_type(PvkPhysicalDevice physicalDevice, uint32_t typeBits, uint32_t flags)
+{
+    PvkPhysicalDeviceMemoryProperties memory;
+    pvkGetPhysicalDeviceMemoryProperties(physicalDevice, &memory);
+    for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
+        if ((typeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags)
+            return i;
+    return 0;
+}
+
 /* Vertex binding 0: positions as R16G16B16_SNORM (32767 = 1.0, 6 bytes each);
  * binding 1: texture coordinates as R16G16_UNORM (65535 = 1.0, 4 bytes). The
  * shader sees both as vec4s, w = 1. */
@@ -207,6 +218,7 @@ int main(void)
     PvkSampler sampler;
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer, textureBuffer, paletteBuffer;
+    PvkDeviceMemory depthMemory, textureMemory, tableMemory, vertexMemory, indexMemory, textureBufferMemory, paletteBufferMemory;
     PvkShaderModule vs, fs;
     PvkDescriptorSetLayout setLayout;
     PvkDescriptorPool descriptorPool;
@@ -245,13 +257,37 @@ int main(void)
         CHECK(pvkCreateImageView(device, &viewInfo, &views[i]));
     }
 
-    /* VRAM is handed out in order: framebuffers, depth buffer, the T8 texture, then its CT16 color table. */
+    /* The depth buffer, the T8 texture and its CT16 color table, each in VRAM of its own. */
     PvkImageCreateInfo depthInfo = { .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_Z24 };
     CHECK(pvkCreateImage(device, &depthInfo, &depth));
+    PvkMemoryRequirements depthReq;
+    pvkGetImageMemoryRequirements(device, depth, &depthReq);
+    PvkMemoryAllocateInfo depthMemoryInfo = {
+        .allocationSize  = depthReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, depthReq.memoryTypeBits, PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &depthMemoryInfo, &depthMemory));
+    CHECK(pvkBindImageMemory(device, depth, depthMemory, 0));
     PvkImageCreateInfo textureInfo = { .width = pic.width, .height = pic.height, .format = PVK_FORMAT_T8 };
     CHECK(pvkCreateImage(device, &textureInfo, &texture));
+    PvkMemoryRequirements textureReq;
+    pvkGetImageMemoryRequirements(device, texture, &textureReq);
+    PvkMemoryAllocateInfo textureMemoryInfo = {
+        .allocationSize  = textureReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, textureReq.memoryTypeBits, PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &textureMemoryInfo, &textureMemory));
+    CHECK(pvkBindImageMemory(device, texture, textureMemory, 0));
     PvkImageCreateInfo tableInfo = { .width = 256, .height = 1, .format = PVK_FORMAT_CT16 };
     CHECK(pvkCreateImage(device, &tableInfo, &colorTable));
+    PvkMemoryRequirements colorTableReq;
+    pvkGetImageMemoryRequirements(device, colorTable, &colorTableReq);
+    PvkMemoryAllocateInfo tableMemoryInfo = {
+        .allocationSize  = colorTableReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, colorTableReq.memoryTypeBits, PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &tableMemoryInfo, &tableMemory));
+    CHECK(pvkBindImageMemory(device, colorTable, tableMemory, 0));
     PvkImageViewCreateInfo depthViewInfo = { .image = depth, .levelCount = 1 };
     CHECK(pvkCreateImageView(device, &depthViewInfo, &depthView));
     PvkImageViewCreateInfo textureViewInfo = { .image = texture, .levelCount = 1 };
@@ -263,33 +299,65 @@ int main(void)
     };
     CHECK(pvkCreateSampler(device, &samplerInfo, &sampler));
 
-    /* One buffer, the positions first and the texture coordinates after them
+    /* One vertex buffer, the positions first and the texture coordinates after them
      * (sizeof(positions) is a multiple of 16, as a binding offset must be). */
     PvkBufferCreateInfo bufferInfo = { .size = sizeof(positions) + sizeof(uvs) };
     CHECK(pvkCreateBuffer(device, &bufferInfo, &vertexBuffer));
-    CHECK(pvkMapMemory(device, vertexBuffer, &mapped));
+    PvkMemoryRequirements vertexBufferReq;
+    pvkGetBufferMemoryRequirements(device, vertexBuffer, &vertexBufferReq);
+    PvkMemoryAllocateInfo vertexMemoryInfo = {
+        .allocationSize  = vertexBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, vertexBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &vertexMemoryInfo, &vertexMemory));
+    CHECK(pvkBindBufferMemory(device, vertexBuffer, vertexMemory, 0));
+    CHECK(pvkMapMemory(device, vertexMemory, 0, bufferInfo.size, &mapped));
     memcpy(mapped, positions, sizeof(positions));
     memcpy((uint8_t *)mapped + sizeof(positions), uvs, sizeof(uvs));
-    pvkUnmapMemory(device, vertexBuffer);
+    pvkUnmapMemory(device, vertexMemory);
 
     PvkBufferCreateInfo indexInfo = { .size = sizeof(indices) };
     CHECK(pvkCreateBuffer(device, &indexInfo, &indexBuffer));
-    CHECK(pvkMapMemory(device, indexBuffer, &mapped));
+    PvkMemoryRequirements indexBufferReq;
+    pvkGetBufferMemoryRequirements(device, indexBuffer, &indexBufferReq);
+    PvkMemoryAllocateInfo indexMemoryInfo = {
+        .allocationSize  = indexBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, indexBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &indexMemoryInfo, &indexMemory));
+    CHECK(pvkBindBufferMemory(device, indexBuffer, indexMemory, 0));
+    CHECK(pvkMapMemory(device, indexMemory, 0, sizeof(indices), &mapped));
     memcpy(mapped, indices, sizeof(indices));
-    pvkUnmapMemory(device, indexBuffer);
+    pvkUnmapMemory(device, indexMemory);
 
     /* Staging buffers, as in Vulkan: the T8 indices, then the CT16 color table. */
     PvkBufferCreateInfo textureBufferInfo = { .size = (size_t)pic.width * pic.height };
     CHECK(pvkCreateBuffer(device, &textureBufferInfo, &textureBuffer));
-    CHECK(pvkMapMemory(device, textureBuffer, &mapped));
+    PvkMemoryRequirements textureBufferReq;
+    pvkGetBufferMemoryRequirements(device, textureBuffer, &textureBufferReq);
+    PvkMemoryAllocateInfo textureBufferMemoryInfo = {
+        .allocationSize  = textureBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, textureBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &textureBufferMemoryInfo, &textureBufferMemory));
+    CHECK(pvkBindBufferMemory(device, textureBuffer, textureBufferMemory, 0));
+    CHECK(pvkMapMemory(device, textureBufferMemory, 0, textureBufferInfo.size, &mapped));
     memcpy(mapped, pic.indices, textureBufferInfo.size);
-    pvkUnmapMemory(device, textureBuffer);
+    pvkUnmapMemory(device, textureBufferMemory);
     free(pic.indices);
     PvkBufferCreateInfo paletteBufferInfo = { .size = sizeof(pic.palette) };
     CHECK(pvkCreateBuffer(device, &paletteBufferInfo, &paletteBuffer));
-    CHECK(pvkMapMemory(device, paletteBuffer, &mapped));
+    PvkMemoryRequirements paletteBufferReq;
+    pvkGetBufferMemoryRequirements(device, paletteBuffer, &paletteBufferReq);
+    PvkMemoryAllocateInfo paletteBufferMemoryInfo = {
+        .allocationSize  = paletteBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, paletteBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &paletteBufferMemoryInfo, &paletteBufferMemory));
+    CHECK(pvkBindBufferMemory(device, paletteBuffer, paletteBufferMemory, 0));
+    CHECK(pvkMapMemory(device, paletteBufferMemory, 0, sizeof(pic.palette), &mapped));
     memcpy(mapped, pic.palette, sizeof(pic.palette));
-    pvkUnmapMemory(device, paletteBuffer);
+    pvkUnmapMemory(device, paletteBufferMemory);
 
     PvkShaderModuleCreateInfo vsInfo = { .code = &cube_vert };
     PvkShaderModuleCreateInfo fsInfo = { .code = &cube_frag };

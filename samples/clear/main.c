@@ -51,6 +51,9 @@ int main(void)
     for (uint32_t i = 0; i < memory.memoryHeapCount; i++)
         printf("clear: heap %u: %u KB%s\n", (unsigned)i, (unsigned)(memory.memoryHeaps[i].size >> 10),
                memory.memoryHeaps[i].flags & PVK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " (GS VRAM)" : "");
+    for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
+        printf("clear: memory type %u: heap %u, flags 0x%x\n", (unsigned)i, (unsigned)memory.memoryTypes[i].heapIndex,
+               (unsigned)memory.memoryTypes[i].propertyFlags);
     CHECK(pvkCreateDevice(physicalDevice, NULL, &device));
     pvkGetDeviceQueue(device, &queue);
 

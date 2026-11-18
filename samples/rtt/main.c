@@ -28,6 +28,17 @@ extern const PvkShaderCode texture_frag;
         }                                                                 \
     } while (0)
 
+/* The first memory type allowed by typeBits that has every flag in flags. */
+static uint32_t memory_type(PvkPhysicalDevice physicalDevice, uint32_t typeBits, uint32_t flags)
+{
+    PvkPhysicalDeviceMemoryProperties memory;
+    pvkGetPhysicalDeviceMemoryProperties(physicalDevice, &memory);
+    for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
+        if ((typeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags)
+            return i;
+    return 0;
+}
+
 /* One vertex: position, face color and texture coordinate (xy used), each a vec4. */
 typedef struct {
     float pos[4];
@@ -153,6 +164,7 @@ int main(void)
     PvkSampler sampler;
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer;
+    PvkDeviceMemory depthMemory, targetMemory, targetDepthMemory, vertexMemory, indexMemory;
     PvkShaderModule vs, colorFs, textureFs;
     PvkDescriptorSetLayout setLayout;
     PvkDescriptorPool descriptorPool;
@@ -185,18 +197,42 @@ int main(void)
         CHECK(pvkCreateImageView(device, &viewInfo, &views[i]));
     }
 
-    /* VRAM in order: framebuffers, the screen's depth buffer, then the render
-     * target and its own (narrower) depth buffer. The target is rendered into
-     * and sampled, so it asks for both usages. */
+    /* The screen's depth buffer, then the render target and its own (narrower)
+     * depth buffer, each in VRAM of its own. The target is rendered into and
+     * sampled, so it asks for both usages. */
     PvkImageCreateInfo depthInfo = { .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_Z24 };
     CHECK(pvkCreateImage(device, &depthInfo, &depth));
+    PvkMemoryRequirements depthReq;
+    pvkGetImageMemoryRequirements(device, depth, &depthReq);
+    PvkMemoryAllocateInfo depthMemoryInfo = {
+        .allocationSize  = depthReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, depthReq.memoryTypeBits, PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &depthMemoryInfo, &depthMemory));
+    CHECK(pvkBindImageMemory(device, depth, depthMemory, 0));
     PvkImageCreateInfo targetInfo = {
         .width = TARGET_SIZE, .height = TARGET_SIZE, .format = PVK_FORMAT_CT32,
         .usage = PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | PVK_IMAGE_USAGE_SAMPLED_BIT,
     };
     CHECK(pvkCreateImage(device, &targetInfo, &target));
+    PvkMemoryRequirements targetReq;
+    pvkGetImageMemoryRequirements(device, target, &targetReq);
+    PvkMemoryAllocateInfo targetMemoryInfo = {
+        .allocationSize  = targetReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, targetReq.memoryTypeBits, PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &targetMemoryInfo, &targetMemory));
+    CHECK(pvkBindImageMemory(device, target, targetMemory, 0));
     PvkImageCreateInfo targetDepthInfo = { .width = TARGET_SIZE, .height = TARGET_SIZE, .format = PVK_FORMAT_Z16 };
     CHECK(pvkCreateImage(device, &targetDepthInfo, &targetDepth));
+    PvkMemoryRequirements targetDepthReq;
+    pvkGetImageMemoryRequirements(device, targetDepth, &targetDepthReq);
+    PvkMemoryAllocateInfo targetDepthMemoryInfo = {
+        .allocationSize  = targetDepthReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, targetDepthReq.memoryTypeBits, PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &targetDepthMemoryInfo, &targetDepthMemory));
+    CHECK(pvkBindImageMemory(device, targetDepth, targetDepthMemory, 0));
     PvkImageViewCreateInfo depthViewInfo = { .image = depth, .levelCount = 1 };
     CHECK(pvkCreateImageView(device, &depthViewInfo, &depthView));
     PvkImageViewCreateInfo targetViewInfo = { .image = target, .levelCount = 1 };
@@ -212,15 +248,31 @@ int main(void)
 
     PvkBufferCreateInfo bufferInfo = { .size = sizeof(vertices) };
     CHECK(pvkCreateBuffer(device, &bufferInfo, &vertexBuffer));
-    CHECK(pvkMapMemory(device, vertexBuffer, &mapped));
+    PvkMemoryRequirements vertexBufferReq;
+    pvkGetBufferMemoryRequirements(device, vertexBuffer, &vertexBufferReq);
+    PvkMemoryAllocateInfo vertexMemoryInfo = {
+        .allocationSize  = vertexBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, vertexBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &vertexMemoryInfo, &vertexMemory));
+    CHECK(pvkBindBufferMemory(device, vertexBuffer, vertexMemory, 0));
+    CHECK(pvkMapMemory(device, vertexMemory, 0, sizeof(vertices), &mapped));
     memcpy(mapped, vertices, sizeof(vertices));
-    pvkUnmapMemory(device, vertexBuffer);
+    pvkUnmapMemory(device, vertexMemory);
 
     PvkBufferCreateInfo indexInfo = { .size = sizeof(indices) };
     CHECK(pvkCreateBuffer(device, &indexInfo, &indexBuffer));
-    CHECK(pvkMapMemory(device, indexBuffer, &mapped));
+    PvkMemoryRequirements indexBufferReq;
+    pvkGetBufferMemoryRequirements(device, indexBuffer, &indexBufferReq);
+    PvkMemoryAllocateInfo indexMemoryInfo = {
+        .allocationSize  = indexBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, indexBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &indexMemoryInfo, &indexMemory));
+    CHECK(pvkBindBufferMemory(device, indexBuffer, indexMemory, 0));
+    CHECK(pvkMapMemory(device, indexMemory, 0, sizeof(indices), &mapped));
     memcpy(mapped, indices, sizeof(indices));
-    pvkUnmapMemory(device, indexBuffer);
+    pvkUnmapMemory(device, indexMemory);
 
     PvkShaderModuleCreateInfo vsInfo = { .code = &rtt_vert };
     PvkShaderModuleCreateInfo colorFsInfo = { .code = &color_frag };

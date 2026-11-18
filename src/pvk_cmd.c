@@ -429,6 +429,11 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
         cmd->failed = 1;
         return;
     }
+    if (!buffer->data || !image->bound) {
+        pvk_error("pvkCmdCopyBufferToImage: the buffer and the image need memory bound\n");
+        cmd->failed = 1;
+        return;
+    }
     if (cmd->rendering) {
         pvk_error("pvkCmdCopyBufferToImage must be called outside pvkCmdBeginRendering/pvkCmdEndRendering\n");
         cmd->failed = 1;
@@ -636,8 +641,8 @@ void pvkCmdBindVertexBuffers(PvkCommandBuffer cmd, uint32_t firstBinding, uint32
         return;
     }
     for (i = 0; i < bindingCount; i++) {
-        if (!buffers[i] || (offsets[i] & 15)) {
-            pvk_error("pvkCmdBindVertexBuffers: binding %u needs a buffer and an offset that is a multiple of 16\n",
+        if (!buffers[i] || !buffers[i]->data || (offsets[i] & 15)) {
+            pvk_error("pvkCmdBindVertexBuffers: binding %u needs a buffer with memory bound and an offset that is a multiple of 16\n",
                       (unsigned)(firstBinding + i));
             cmd->failed = 1;
             return;
@@ -654,8 +659,8 @@ void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset
         cmd->failed = 1;
         return;
     }
-    if (offset & 1) {
-        pvk_error("index buffer offset must be a multiple of 2\n");
+    if (!buffer || !buffer->data || (offset & 1)) {
+        pvk_error("pvkCmdBindIndexBuffer: needs a buffer with memory bound and an offset that is a multiple of 2\n");
         cmd->failed = 1;
         return;
     }

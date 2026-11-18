@@ -32,6 +32,17 @@ extern const PvkShaderCode rain_frag;
         }                                                                 \
     } while (0)
 
+/* The first memory type allowed by typeBits that has every flag in flags. */
+static uint32_t memory_type(PvkPhysicalDevice physicalDevice, uint32_t typeBits, uint32_t flags)
+{
+    PvkPhysicalDeviceMemoryProperties memory;
+    pvkGetPhysicalDeviceMemoryProperties(physicalDevice, &memory);
+    for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
+        if ((typeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags)
+            return i;
+    return 0;
+}
+
 /* Clip-space position (Vulkan convention: y points down), then RGBA color. */
 typedef struct Vertex {
     float pos[4];
@@ -271,6 +282,7 @@ int main(void)
     PvkImageView views[2];
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer;
+    PvkDeviceMemory vertexMemory;
     PvkShaderModule vs, fs;
     PvkPipelineLayout layout;
     PvkPipeline skyPipe, starPipe, moonPipe, ripplePipe, rainPipe, splashPipe;
@@ -299,6 +311,14 @@ int main(void)
 
     PvkBufferCreateInfo bufferInfo = { .size = TOTAL_VERTS * sizeof(Vertex) };
     CHECK(pvkCreateBuffer(device, &bufferInfo, &vertexBuffer));
+    PvkMemoryRequirements vertexBufferReq;
+    pvkGetBufferMemoryRequirements(device, vertexBuffer, &vertexBufferReq);
+    PvkMemoryAllocateInfo vertexMemoryInfo = {
+        .allocationSize  = vertexBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, vertexBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &vertexMemoryInfo, &vertexMemory));
+    CHECK(pvkBindBufferMemory(device, vertexBuffer, vertexMemory, 0));
 
     PvkShaderModuleCreateInfo vsInfo = { .code = &rain_vert };
     PvkShaderModuleCreateInfo fsInfo = { .code = &rain_frag };
@@ -344,9 +364,9 @@ int main(void)
 
         step_scene();
         /* The previous frame's fence has been waited on, so the buffer is free. */
-        CHECK(pvkMapMemory(device, vertexBuffer, &mapped));
+        CHECK(pvkMapMemory(device, vertexMemory, 0, bufferInfo.size, &mapped));
         write_scene((Vertex *)mapped, frame);
-        pvkUnmapMemory(device, vertexBuffer);
+        pvkUnmapMemory(device, vertexMemory);
 
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 

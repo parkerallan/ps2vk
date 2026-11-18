@@ -30,6 +30,17 @@ extern const PvkShaderCode lighting_frag;
         }                                                                 \
     } while (0)
 
+/* The first memory type allowed by typeBits that has every flag in flags. */
+static uint32_t memory_type(PvkPhysicalDevice physicalDevice, uint32_t typeBits, uint32_t flags)
+{
+    PvkPhysicalDeviceMemoryProperties memory;
+    pvkGetPhysicalDeviceMemoryProperties(physicalDevice, &memory);
+    for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
+        if ((typeBits & (1u << i)) && (memory.memoryTypes[i].propertyFlags & flags) == flags)
+            return i;
+    return 0;
+}
+
 /* One vertex: position and normal, each a vec4. */
 typedef struct {
     float pos[4];
@@ -170,6 +181,7 @@ int main(void)
     PvkSampler rampSampler;
     uint32_t imageCount = 2;
     PvkBuffer vertexBuffer, indexBuffer, cameraBuffer, lightBuffer, rampBuffer;
+    PvkDeviceMemory depthMemory, rampMemory, vertexMemory, indexMemory, cameraMemory, lightMemory, rampBufferMemory;
     PvkShaderModule vs, fs;
     PvkDescriptorSetLayout setLayout;
     PvkDescriptorPool descriptorPool;
@@ -204,11 +216,26 @@ int main(void)
         CHECK(pvkCreateImageView(device, &viewInfo, &views[i]));
     }
 
-    /* VRAM is handed out in order: framebuffers, then the depth buffer, then the ramp. */
     PvkImageCreateInfo depthInfo = { .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_Z24 };
     CHECK(pvkCreateImage(device, &depthInfo, &depth));
+    PvkMemoryRequirements depthReq;
+    pvkGetImageMemoryRequirements(device, depth, &depthReq);
+    PvkMemoryAllocateInfo depthMemoryInfo = {
+        .allocationSize  = depthReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, depthReq.memoryTypeBits, PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &depthMemoryInfo, &depthMemory));
+    CHECK(pvkBindImageMemory(device, depth, depthMemory, 0));
     PvkImageCreateInfo rampInfo = { .width = RAMP_WIDTH, .height = RAMP_HEIGHT, .format = PVK_FORMAT_CT32 };
     CHECK(pvkCreateImage(device, &rampInfo, &ramp));
+    PvkMemoryRequirements rampReq;
+    pvkGetImageMemoryRequirements(device, ramp, &rampReq);
+    PvkMemoryAllocateInfo rampMemoryInfo = {
+        .allocationSize  = rampReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, rampReq.memoryTypeBits, PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &rampMemoryInfo, &rampMemory));
+    CHECK(pvkBindImageMemory(device, ramp, rampMemory, 0));
     PvkImageViewCreateInfo depthViewInfo = { .image = depth, .levelCount = 1 };
     CHECK(pvkCreateImageView(device, &depthViewInfo, &depthView));
     PvkImageViewCreateInfo rampViewInfo = { .image = ramp, .levelCount = 1 };
@@ -223,30 +250,62 @@ int main(void)
 
     PvkBufferCreateInfo bufferInfo = { .size = sizeof(vertices) };
     CHECK(pvkCreateBuffer(device, &bufferInfo, &vertexBuffer));
-    CHECK(pvkMapMemory(device, vertexBuffer, &mapped));
+    PvkMemoryRequirements vertexBufferReq;
+    pvkGetBufferMemoryRequirements(device, vertexBuffer, &vertexBufferReq);
+    PvkMemoryAllocateInfo vertexMemoryInfo = {
+        .allocationSize  = vertexBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, vertexBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &vertexMemoryInfo, &vertexMemory));
+    CHECK(pvkBindBufferMemory(device, vertexBuffer, vertexMemory, 0));
+    CHECK(pvkMapMemory(device, vertexMemory, 0, sizeof(vertices), &mapped));
     memcpy(mapped, vertices, sizeof(vertices));
-    pvkUnmapMemory(device, vertexBuffer);
+    pvkUnmapMemory(device, vertexMemory);
 
     PvkBufferCreateInfo indexInfo = { .size = sizeof(indices) };
     CHECK(pvkCreateBuffer(device, &indexInfo, &indexBuffer));
-    CHECK(pvkMapMemory(device, indexBuffer, &mapped));
+    PvkMemoryRequirements indexBufferReq;
+    pvkGetBufferMemoryRequirements(device, indexBuffer, &indexBufferReq);
+    PvkMemoryAllocateInfo indexMemoryInfo = {
+        .allocationSize  = indexBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, indexBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &indexMemoryInfo, &indexMemory));
+    CHECK(pvkBindBufferMemory(device, indexBuffer, indexMemory, 0));
+    CHECK(pvkMapMemory(device, indexMemory, 0, sizeof(indices), &mapped));
     memcpy(mapped, indices, sizeof(indices));
-    pvkUnmapMemory(device, indexBuffer);
+    pvkUnmapMemory(device, indexMemory);
 
     /* The camera is written once; the light stays mapped and is rewritten
      * every frame before the draw is recorded. */
     PvkBufferCreateInfo cameraInfo = { .size = sizeof(Camera) };
     CHECK(pvkCreateBuffer(device, &cameraInfo, &cameraBuffer));
-    CHECK(pvkMapMemory(device, cameraBuffer, &mapped));
+    PvkMemoryRequirements cameraBufferReq;
+    pvkGetBufferMemoryRequirements(device, cameraBuffer, &cameraBufferReq);
+    PvkMemoryAllocateInfo cameraMemoryInfo = {
+        .allocationSize  = cameraBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, cameraBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &cameraMemoryInfo, &cameraMemory));
+    CHECK(pvkBindBufferMemory(device, cameraBuffer, cameraMemory, 0));
+    CHECK(pvkMapMemory(device, cameraMemory, 0, sizeof(Camera), &mapped));
     camera = mapped;
     mat_perspective(proj, 60.0f * 3.14159265f / 180.0f, 4.0f / 3.0f, 0.5f, 10.0f); /* the display is 4:3 */
     mat_translate(view, 0.0f, 0.0f, -3.5f);
     mat_mul(camera->viewProj, proj, view);
-    pvkUnmapMemory(device, cameraBuffer);
+    pvkUnmapMemory(device, cameraMemory);
 
     PvkBufferCreateInfo lightInfo = { .size = sizeof(Light) };
     CHECK(pvkCreateBuffer(device, &lightInfo, &lightBuffer));
-    CHECK(pvkMapMemory(device, lightBuffer, &mapped));
+    PvkMemoryRequirements lightBufferReq;
+    pvkGetBufferMemoryRequirements(device, lightBuffer, &lightBufferReq);
+    PvkMemoryAllocateInfo lightMemoryInfo = {
+        .allocationSize  = lightBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, lightBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &lightMemoryInfo, &lightMemory));
+    CHECK(pvkBindBufferMemory(device, lightBuffer, lightMemory, 0));
+    CHECK(pvkMapMemory(device, lightMemory, 0, sizeof(Light), &mapped));
     light = mapped;
     memset(light, 0, sizeof(*light));
     light->color[0] = 1.0f; light->color[1] = 0.95f; light->color[2] = 0.85f; light->color[3] = 1.0f;
@@ -254,9 +313,17 @@ int main(void)
     /* The ramp's pixels: a staging buffer, uploaded once below. */
     PvkBufferCreateInfo rampBufferInfo = { .size = RAMP_WIDTH * RAMP_HEIGHT * 4 };
     CHECK(pvkCreateBuffer(device, &rampBufferInfo, &rampBuffer));
-    CHECK(pvkMapMemory(device, rampBuffer, &mapped));
+    PvkMemoryRequirements rampBufferReq;
+    pvkGetBufferMemoryRequirements(device, rampBuffer, &rampBufferReq);
+    PvkMemoryAllocateInfo rampBufferMemoryInfo = {
+        .allocationSize  = rampBufferReq.size,
+        .memoryTypeIndex = memory_type(physicalDevice, rampBufferReq.memoryTypeBits, PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+    };
+    CHECK(pvkAllocateMemory(device, &rampBufferMemoryInfo, &rampBufferMemory));
+    CHECK(pvkBindBufferMemory(device, rampBuffer, rampBufferMemory, 0));
+    CHECK(pvkMapMemory(device, rampBufferMemory, 0, rampBufferInfo.size, &mapped));
     build_ramp(mapped);
-    pvkUnmapMemory(device, rampBuffer);
+    pvkUnmapMemory(device, rampBufferMemory);
 
     PvkShaderModuleCreateInfo vsInfo = { .code = &lighting_vert };
     PvkShaderModuleCreateInfo fsInfo = { .code = &lighting_frag };

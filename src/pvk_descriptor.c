@@ -215,8 +215,8 @@ void pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const PvkWri
             const PvkDescriptorBufferInfo *b = w->bufferInfo;
             size_t range;
 
-            if (!b || !b->buffer) {
-                pvk_error("pvkUpdateDescriptorSets: write %u needs bufferInfo with a buffer; skipped\n",
+            if (!b || !b->buffer || !b->buffer->data) {
+                pvk_error("pvkUpdateDescriptorSets: write %u needs bufferInfo with a buffer that has memory bound; skipped\n",
                           (unsigned)i);
                 continue;
             }
@@ -242,9 +242,9 @@ void pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const PvkWri
         {
             const PvkImage img = view->image, c = w->imageInfo->colorTable;
             int indexed = img->format == PVK_FORMAT_T8 || img->format == PVK_FORMAT_T4;
-            if (indexed ? !c || !c->colorTable || (img->format == PVK_FORMAT_T8 && c->fb.width != 256) : c != NULL) {
-                pvk_error("pvkUpdateDescriptorSets: write %u: a PVK_FORMAT_T8 image needs a 256-entry colorTable, "
-                          "a PVK_FORMAT_T4 image a 16- or 256-entry one, other formats none; skipped\n", (unsigned)i);
+            if (indexed ? !c || !c->colorTable || !c->bound || (img->format == PVK_FORMAT_T8 && c->fb.width != 256) : c != NULL) {
+                pvk_error("pvkUpdateDescriptorSets: write %u: a PVK_FORMAT_T8 image needs a 256-entry colorTable with "
+                          "memory bound, a PVK_FORMAT_T4 image a 16- or 256-entry one, other formats none; skipped\n", (unsigned)i);
                 continue;
             }
             w->dstSet->slots[slot].colorTable = c;

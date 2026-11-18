@@ -256,13 +256,33 @@ typedef struct PvkMemoryHeap {
 /** @brief Most heaps pvkGetPhysicalDeviceMemoryProperties() lists. */
 #define PVK_MAX_MEMORY_HEAPS 2
 
+/** @brief How memory of a type behaves, like VkMemoryPropertyFlagBits (same values). */
+typedef enum PvkMemoryPropertyFlagBits {
+    PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT  = 1, /**< GS VRAM: the GS reads and writes it, the CPU can't map it. */
+    PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT  = 2, /**< pvkMapMemory() works on it. */
+    PVK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 4  /**< Mapped writes need no flush: the data cache is written back at pvkQueueSubmit(). */
+} PvkMemoryPropertyFlagBits;
+
+/** @brief One kind of memory an allocation can be, like VkMemoryType. */
+typedef struct PvkMemoryType {
+    uint32_t propertyFlags; /**< PvkMemoryPropertyFlagBits. */
+    uint32_t heapIndex;     /**< The heap it comes from. */
+} PvkMemoryType;
+
+/** @brief Most memory types pvkGetPhysicalDeviceMemoryProperties() lists. */
+#define PVK_MAX_MEMORY_TYPES 2
+
 /**
  * @brief The device's memory, like VkPhysicalDeviceMemoryProperties.
  *
- * Heap 0 is EE main RAM (buffers), heap 1 is GS VRAM (images), both whole.
- * Memory types, which Vulkan lists here too, come with pvkAllocateMemory().
+ * Heap 0 is EE main RAM, heap 1 is GS VRAM, both whole. Type 0 is heap 0,
+ * host visible and coherent: buffers live there. Type 1 is heap 1, device
+ * local: images live there. PvkMemoryRequirements::memoryTypeBits names the
+ * type a resource takes.
  */
 typedef struct PvkPhysicalDeviceMemoryProperties {
+    uint32_t      memoryTypeCount;                   /**< Types listed. */
+    PvkMemoryType memoryTypes[PVK_MAX_MEMORY_TYPES]; /**< The types. */
     uint32_t      memoryHeapCount;                   /**< Heaps listed. */
     PvkMemoryHeap memoryHeaps[PVK_MAX_MEMORY_HEAPS]; /**< The heaps. */
 } PvkPhysicalDeviceMemoryProperties;
@@ -310,7 +330,7 @@ void      pvkGetPhysicalDeviceProperties(PvkPhysicalDevice physicalDevice, PvkPh
 void      pvkGetPhysicalDeviceFeatures(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceFeatures *features);
 
 /**
- * @brief Reports the memory heaps.
+ * @brief Reports the memory types and heaps.
  * @param physicalDevice The physical device.
  * @param[out] properties Filled in.
  */
@@ -344,6 +364,102 @@ void      pvkGetDeviceQueue(PvkDevice device, PvkQueue *queue);
  * @return PVK_SUCCESS.
  */
 PvkResult pvkDeviceWaitIdle(PvkDevice device);
+
+/** @} */
+
+/* ======================================================================== */
+/**
+ * @defgroup memory Device memory
+ * @brief Blocks of EE RAM or GS VRAM that buffers and images are placed in.
+ *
+ * As in Vulkan, a buffer or image is created empty and then bound to a part
+ * of a PvkDeviceMemory allocation at an offset. One allocation holds as many
+ * resources as fit, so an application lays its memory out itself: a frame's
+ * buffers back to back in one EE RAM block, the depth buffer and textures
+ * packed into the VRAM left after the framebuffers, or two resources used at
+ * different times on the same bytes. pvkGetBufferMemoryRequirements() and
+ * pvkGetImageMemoryRequirements() say how much a resource needs, at what
+ * alignment and from which memory type.
+ *
+ * | Type | Heap | Memory | Alignment of an allocation | Resources |
+ * | --- | --- | --- | --- | --- |
+ * | 0 | 0 | EE main RAM, host visible and coherent | 64 bytes | Buffers |
+ * | 1 | 1 | GS VRAM, device local | 8 KB (a GS page) | Images |
+ *
+ * VRAM offsets are bytes; the GS addresses words, 256-byte blocks (textures)
+ * and 8 KB pages (framebuffers, depth buffers), which the requirements'
+ * alignment reflects. The swapchain's framebuffers take VRAM of their own
+ * when it is created, before any allocation; pvkGetPhysicalDeviceMemoryProperties()
+ * reports the whole heap.
+ * @{
+ */
+
+/** @brief A block of EE RAM or GS VRAM, like VkDeviceMemory. */
+typedef struct PvkDeviceMemory_T  *PvkDeviceMemory;
+
+/** @brief The rest of a buffer or allocation, as a range or mapping size. */
+#define PVK_WHOLE_SIZE (~(size_t)0)
+
+/** @brief What a resource needs from an allocation, like VkMemoryRequirements. */
+typedef struct PvkMemoryRequirements {
+    size_t   size;           /**< Bytes the resource takes from its bind offset on. */
+    size_t   alignment;      /**< The bind offset is a multiple of this. */
+    uint32_t memoryTypeBits; /**< Bit i set: memory type i may hold it. */
+} PvkMemoryRequirements;
+
+/** @brief Parameters for pvkAllocateMemory(), like VkMemoryAllocateInfo. */
+typedef struct PvkMemoryAllocateInfo {
+    size_t   allocationSize;  /**< Bytes to allocate; VRAM is taken in whole 8 KB pages. */
+    uint32_t memoryTypeIndex; /**< Index into PvkPhysicalDeviceMemoryProperties::memoryTypes. */
+} PvkMemoryAllocateInfo;
+
+/**
+ * @brief Allocates a block of memory from a heap.
+ *
+ * Type 0 memory is EE RAM from the C heap, 64-byte aligned. Type 1 memory is
+ * GS VRAM, page aligned, taken from the part of VRAM the swapchain does not
+ * use; it comes back to the heap with pvkFreeMemory(). Resources are placed
+ * in it with pvkBindBufferMemory() and pvkBindImageMemory().
+ *
+ * @param device The device.
+ * @param info Size and memory type.
+ * @param[out] memory The new allocation.
+ * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED for a type the device lacks
+ *         or a zero size, PVK_ERROR_OUT_OF_DEVICE_MEMORY when the heap has no
+ *         room, or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ */
+PvkResult pvkAllocateMemory(PvkDevice device, const PvkMemoryAllocateInfo *info, PvkDeviceMemory *memory);
+
+/**
+ * @brief Frees an allocation. The resources bound to it must not be used again, and no submission may still read it.
+ * @param device The device.
+ * @param memory Allocation to free; NULL does nothing.
+ */
+void      pvkFreeMemory(PvkDevice device, PvkDeviceMemory memory);
+
+/**
+ * @brief Gets a CPU pointer into a host visible allocation, like vkMapMemory.
+ *
+ * Writes need no flushing: the data cache is written back at pvkQueueSubmit().
+ * Only type 0 (EE RAM) memory can be mapped; a submission may read the
+ * memory while it is mapped, so the pointer is good until pvkFreeMemory().
+ *
+ * @param device The device.
+ * @param memory The allocation.
+ * @param offset First byte mapped.
+ * @param size Bytes mapped from offset on, or PVK_WHOLE_SIZE for the rest; 0 is an error.
+ * @param[out] data Pointer to the memory at offset.
+ * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED for device local memory or
+ *         a range outside the allocation.
+ */
+PvkResult pvkMapMemory(PvkDevice device, PvkDeviceMemory memory, size_t offset, size_t size, void **data);
+
+/**
+ * @brief Ends CPU access to an allocation. Currently does nothing.
+ * @param device The device.
+ * @param memory The allocation.
+ */
+void      pvkUnmapMemory(PvkDevice device, PvkDeviceMemory memory);
 
 /** @} */
 
@@ -409,7 +525,7 @@ typedef struct PvkImageCreateInfo {
 } PvkImageCreateInfo;
 
 /**
- * @brief Allocates an image in GS VRAM.
+ * @brief Creates an image: a texture, color table, render target or depth buffer, to be placed in GS VRAM.
  *
  * A color format image at least 8 texels on each side is a texture: fill
  * each of its mip levels with pvkCmdCopyBufferToImage() and sample it
@@ -424,8 +540,8 @@ typedef struct PvkImageCreateInfo {
  * serve several textures and a texture can switch tables; a 256-entry table
  * also serves a PVK_FORMAT_T4 texture, which reads its first 16 entries.
  * Depth formats make depth buffers. Framebuffers come from the swapchain.
- * GS VRAM is handed out in creation order and never reclaimed, so create
- * images once, after the swapchain.
+ * The image has no VRAM until pvkBindImageMemory() places it in a type 1
+ * allocation; views of it and sets that hold it come after that.
  *
  * @param device The device.
  * @param info Image parameters.
@@ -437,11 +553,43 @@ typedef struct PvkImageCreateInfo {
 PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkImage *image);
 
 /**
- * @brief Destroys an image created with pvkCreateImage(). Its VRAM stays allocated.
+ * @brief Destroys an image created with pvkCreateImage(). Its VRAM stays with the allocation it was bound to.
  * @param device The device.
  * @param image Image to destroy.
  */
 void      pvkDestroyImage(PvkDevice device, PvkImage image);
+
+/**
+ * @brief Reports the VRAM an image needs, like vkGetImageMemoryRequirements.
+ *
+ * Each mip level is its own GS texture, so size covers every level laid out
+ * in order, each at the image's alignment: 8 KB pages for a depth buffer or
+ * color attachment (GS FRAME and ZBUF address pages), 256-byte blocks for a
+ * texture or color table (GS TEX0 and CBP address blocks). A texture takes
+ * every block its rows touch in the GS's swizzled layout. memoryTypeBits is
+ * type 1.
+ *
+ * @param device The device.
+ * @param image The image.
+ * @param[out] requirements Filled in.
+ */
+void      pvkGetImageMemoryRequirements(PvkDevice device, PvkImage image, PvkMemoryRequirements *requirements);
+
+/**
+ * @brief Places an image in a type 1 (GS VRAM) allocation, like vkBindImageMemory.
+ *
+ * Level 0 starts at offset; the other levels follow at the alignment
+ * pvkGetImageMemoryRequirements() reports. An image is bound once.
+ *
+ * @param device The device.
+ * @param image The image, not yet bound.
+ * @param memory A type 1 allocation.
+ * @param offset Byte offset in the allocation, a multiple of the image's alignment.
+ * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED when the image is bound
+ *         already, the memory is not VRAM, the offset is misaligned or the image
+ *         does not fit.
+ */
+PvkResult pvkBindImageMemory(PvkDevice device, PvkImage image, PvkDeviceMemory memory, size_t offset);
 
 /** @brief Every level from baseMipLevel on, as the levelCount of a PvkImageViewCreateInfo. */
 #define PVK_REMAINING_MIP_LEVELS (~0u)
@@ -669,11 +817,11 @@ PvkResult pvkQueuePresent(PvkQueue queue, PvkSwapchain swapchain, uint32_t image
 /* ======================================================================== */
 /**
  * @defgroup buffers Buffers
- * @brief Memory in EE main RAM that the graphics hardware reads, such as vertex data.
+ * @brief Ranges of EE main RAM that the graphics hardware reads, such as vertex data.
  * @{
  */
 
-/** @brief A block of EE main RAM that DMA reads directly, e.g. vertex data. */
+/** @brief A range of EE main RAM that DMA reads directly, e.g. vertex data; bound to type 0 memory. */
 typedef struct PvkBuffer_T        *PvkBuffer;
 
 /** @brief Parameters for pvkCreateBuffer(). */
@@ -682,7 +830,7 @@ typedef struct PvkBufferCreateInfo {
 } PvkBufferCreateInfo;
 
 /**
- * @brief Allocates a buffer in EE main RAM, 64-byte aligned.
+ * @brief Creates a buffer. It has no memory until pvkBindBufferMemory() places it in a type 0 allocation.
  * @param device The device.
  * @param info Buffer parameters.
  * @param[out] buffer The new buffer.
@@ -691,30 +839,36 @@ typedef struct PvkBufferCreateInfo {
 PvkResult pvkCreateBuffer(PvkDevice device, const PvkBufferCreateInfo *info, PvkBuffer *buffer);
 
 /**
- * @brief Frees a buffer. It must not be in use by a submission.
+ * @brief Destroys a buffer. Its memory stays with the allocation it was bound to.
  * @param device The device.
- * @param buffer Buffer to free.
+ * @param buffer Buffer to destroy.
  */
 void      pvkDestroyBuffer(PvkDevice device, PvkBuffer buffer);
 
 /**
- * @brief Gets a CPU pointer to the buffer's memory.
+ * @brief Reports the memory a buffer needs, like vkGetBufferMemoryRequirements.
  *
- * Writes don't need flushing: the CPU cache is written back at pvkQueueSubmit().
+ * size is the buffer's size rounded up to 16 plus 48 bytes: a vertex binding
+ * is read in whole 16-byte units, up to 48 bytes past its last vertex.
+ * alignment is 64 (a cache line; the DMA reads qwords), memoryTypeBits is type 0.
  *
  * @param device The device.
  * @param buffer The buffer.
- * @param[out] data Pointer to the buffer's memory.
- * @return PVK_SUCCESS.
+ * @param[out] requirements Filled in.
  */
-PvkResult pvkMapMemory(PvkDevice device, PvkBuffer buffer, void **data);
+void      pvkGetBufferMemoryRequirements(PvkDevice device, PvkBuffer buffer, PvkMemoryRequirements *requirements);
 
 /**
- * @brief Ends CPU access to the buffer. Currently does nothing.
+ * @brief Places a buffer in a type 0 (EE RAM) allocation, like vkBindBufferMemory. A buffer is bound once.
  * @param device The device.
- * @param buffer The buffer.
+ * @param buffer The buffer, not yet bound.
+ * @param memory A type 0 allocation.
+ * @param offset Byte offset in the allocation, a multiple of 64.
+ * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED when the buffer is bound
+ *         already, the memory is VRAM, the offset is misaligned or the buffer
+ *         does not fit.
  */
-void      pvkUnmapMemory(PvkDevice device, PvkBuffer buffer);
+PvkResult pvkBindBufferMemory(PvkDevice device, PvkBuffer buffer, PvkDeviceMemory memory, size_t offset);
 
 /** @} */
 
@@ -1287,9 +1441,6 @@ typedef struct PvkDescriptorImageInfo {
     PvkImageView imageView;  /**< A view of an image with PVK_IMAGE_USAGE_SAMPLED_BIT: a texture, a render target or a swapchain image. Its base level is what texture coordinates 0 to 1 cover. */
     PvkImage     colorTable; /**< For a PVK_FORMAT_T8 or PVK_FORMAT_T4 image, the color table its indices read (256 entries, or 16 for T4); NULL for other formats. */
 } PvkDescriptorImageInfo;
-
-/** @brief The rest of a buffer, as the range of a PvkDescriptorBufferInfo. */
-#define PVK_WHOLE_SIZE (~(size_t)0)
 
 /** @brief The part of a buffer a uniform buffer binding reads, like VkDescriptorBufferInfo. */
 typedef struct PvkDescriptorBufferInfo {

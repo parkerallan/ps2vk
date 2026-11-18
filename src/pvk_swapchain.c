@@ -43,8 +43,6 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
     PvkSwapchain sc;
     uint32_t i;
 
-    (void)device;
-
     if (info->format != PVK_FORMAT_CT32) {
         pvk_error("swapchain format must be PVK_FORMAT_CT32\n");
         return PVK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -64,14 +62,17 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
 
     for (i = 0; i < sc->imageCount; i++) {
         framebuffer_t *fb = &sc->images[i].fb;
-        int address = graph_vram_allocate(sc->width, sc->height, GS_PSM_32, GRAPH_ALIGN_PAGE);
+        uint32_t address;
 
-        if (address < 0) {
+        if (!pvk_vram_alloc(device, pvk_page_words(sc->width, sc->height, PVK_FORMAT_CT32), &address)) {
             pvk_error("out of GS memory for swapchain image %u\n", (unsigned)i);
+            while (i--)
+                pvk_vram_free(device, sc->images[i].fb.address);
             free(sc);
             return PVK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
         sc->images[i].format = PVK_FORMAT_CT32;
+        sc->images[i].bound  = 1;
         sc->images[i].usage  = PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | PVK_IMAGE_USAGE_SAMPLED_BIT;
         fb->address = address;
         fb->width   = sc->width;
@@ -85,7 +86,7 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
     {
         PvkResult res = set_display_mode(sc, info->displayMode);
         if (res != PVK_SUCCESS) {
-            free(sc);
+            pvkDestroySwapchain(device, sc);
             return res;
         }
     }
@@ -99,7 +100,12 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
 
 void pvkDestroySwapchain(PvkDevice device, PvkSwapchain swapchain)
 {
-    (void)device;
+    uint32_t i;
+
+    if (!swapchain)
+        return;
+    for (i = 0; i < swapchain->imageCount; i++)
+        pvk_vram_free(device, swapchain->images[i].fb.address);
     free(swapchain);
 }
 

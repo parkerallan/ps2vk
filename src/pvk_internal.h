@@ -52,9 +52,30 @@ struct PvkQueue_T {
 
 void pvk_queue_wait_idle(PvkQueue queue);
 
+#define PVK_MAX_VRAM_ALLOCATIONS 64
+
+/* A taken range of GS VRAM, in 32-bit words (the GS's address unit). */
+struct PvkVramRange {
+    uint32_t start, words;
+};
+
 struct PvkDevice_T {
     struct PvkQueue_T queue;
     PvkPhysicalDeviceFeatures features;
+    uint32_t vramCount;       /* taken VRAM ranges, sorted by start: swapchain framebuffers and type 1 allocations */
+    struct PvkVramRange vram[PVK_MAX_VRAM_ALLOCATIONS];
+};
+
+/* Takes `words` words of VRAM (a multiple of a page) at the first fit; 0 when none. */
+int  pvk_vram_alloc(PvkDevice device, uint32_t words, uint32_t *address);
+void pvk_vram_free(PvkDevice device, uint32_t address);
+
+/* One allocation: EE RAM (type 0, `data`) or GS VRAM (type 1, `vram` word address). */
+struct PvkDeviceMemory_T {
+    uint32_t typeIndex;
+    size_t   size;
+    void    *data;
+    uint32_t vram;
 };
 
 /* Color images keep libdraw's framebuffer_t (the swapchain presents from it);
@@ -65,6 +86,10 @@ struct PvkImage_T {
     PvkFormat     format;
     uint32_t      usage;      /* PvkImageUsageFlagBits */
     int           colorTable; /* a palette of fb.width entries at TEX0.CBP */
+    PvkDeviceMemory memory;   /* bound with pvkBindImageMemory; NULL for a swapchain image */
+    int           bound;      /* has VRAM: bound, or a swapchain image */
+    uint32_t      alignWords; /* VRAM alignment of each level: a page for attachments, a block otherwise */
+    uint32_t      levelWords[PVK_MAX_MIP_LEVELS]; /* VRAM words each level takes */
     framebuffer_t fb;         /* level 0 */
     uint32_t      tbw;        /* GS TEX0.TBW / BITBLTBUF.DBW: buffer width in 64-texel units */
     uint32_t      tw, th;     /* GS TEX0.TW/TH: log2 of the width and height */
@@ -78,6 +103,8 @@ int pvk_gs_psm(PvkFormat format);
 /* Bits per texel of a color format, 0 otherwise. */
 uint32_t pvk_format_bits(PvkFormat format);
 int pvk_is_color_format(PvkFormat format);
+/* VRAM words a width x height framebuffer or depth buffer of that format takes, in whole pages. */
+uint32_t pvk_page_words(uint32_t width, uint32_t height, PvkFormat format);
 /* Fills tbw/tw/th from fb.width and fb.height, and level 0's entries. */
 void pvk_image_texture_params(PvkImage image);
 
@@ -104,7 +131,8 @@ struct PvkSwapchain_T {
 };
 
 struct PvkBuffer_T {
-    void  *data;     /* 64-byte aligned EE RAM, read by DMA */
+    PvkDeviceMemory memory; /* bound with pvkBindBufferMemory, NULL until then */
+    void  *data;     /* 64-byte aligned EE RAM, read by DMA; NULL until bound */
     size_t size;
 };
 
