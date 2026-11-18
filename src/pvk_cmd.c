@@ -1,4 +1,5 @@
 /* Command buffers: recorded as a VIF1 DMA chain, sent as-is on submit. */
+#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -12,9 +13,9 @@ static int cmd_reserve(PvkCommandBuffer cmd, uint32_t qwords)
 {
     if (cmd->failed)
         return 0;
-    if (packet2_get_qw_count(cmd->packet) + qwords + 2 > cmd->packet->max_qwords_count) {
-        pvk_error("command buffer full (%u qwords); create it with a larger maxQwords\n",
-                  (unsigned)cmd->packet->max_qwords_count);
+    if (packet2_get_qw_count(&cmd->packet) + qwords + 2 > cmd->packet.max_qwords_count) {
+        pvk_error("command pool full (%u qwords); create it with a larger maxQwords\n",
+                  (unsigned)cmd->pool->qwords);
         cmd->failed = 1;
         return 0;
     }
@@ -24,19 +25,19 @@ static int cmd_reserve(PvkCommandBuffer cmd, uint32_t qwords)
 /* A CNT tag carrying only a VIF FLUSH: wait for VU1 and the GS paths to go idle. */
 static void cmd_flush(PvkCommandBuffer cmd)
 {
-    packet2_chain_open_cnt(cmd->packet, 0, 0, 0);
-    packet2_vif_flush(cmd->packet, 0);
-    packet2_vif_nop(cmd->packet, 0);
-    packet2_chain_close_tag(cmd->packet);
+    packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+    packet2_vif_flush(&cmd->packet, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_chain_close_tag(&cmd->packet);
 }
 
 /* Open a VIF DIRECT (PATH2) block; GS packets are written at the returned pointer. */
 static qword_t *cmd_open_direct(PvkCommandBuffer cmd)
 {
-    packet2_chain_open_cnt(cmd->packet, 0, 0, 0);
-    packet2_vif_flush(cmd->packet, 0);
-    packet2_vif_open_direct(cmd->packet, 0);
-    return cmd->packet->next;
+    packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+    packet2_vif_flush(&cmd->packet, 0);
+    packet2_vif_open_direct(&cmd->packet, 0);
+    return cmd->packet.next;
 }
 
 static void cmd_close_direct(PvkCommandBuffer cmd, qword_t *end)
@@ -47,43 +48,165 @@ static void cmd_close_direct(PvkCommandBuffer cmd, qword_t *end)
     end->dw[1] = 0;
     end++;
 
-    packet2_update(cmd->packet, end);
-    packet2_vif_close_direct_auto(cmd->packet);
-    packet2_chain_close_tag(cmd->packet);
+    packet2_update(&cmd->packet, end);
+    packet2_vif_close_direct_auto(&cmd->packet);
+    packet2_chain_close_tag(&cmd->packet);
 }
 
-PvkResult pvkCreateCommandBuffer(PvkDevice device, const PvkCommandBufferCreateInfo *info, PvkCommandBuffer *cmd)
+PvkResult pvkCreateCommandPool(PvkDevice device, const PvkCommandPoolCreateInfo *info, PvkCommandPool *pool)
 {
-    PvkCommandBuffer cb;
+    PvkCommandPool p;
+    uint32_t flags  = info ? info->flags : 0;
     uint32_t qwords = info && info->maxQwords ? info->maxQwords : PVK_DEFAULT_CMD_QWORDS;
 
-    cb = calloc(1, sizeof(struct PvkCommandBuffer_T));
-    if (!cb)
-        return PVK_ERROR_OUT_OF_HOST_MEMORY;
-
-    cb->device = device;
-    cb->packet = packet2_create(qwords, P2_TYPE_NORMAL, P2_MODE_CHAIN, 1);
-    if (!cb->packet) {
-        free(cb);
-        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    if (flags & ~(PVK_COMMAND_POOL_CREATE_TRANSIENT_BIT | PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)) {
+        pvk_error("command pool: unknown flags 0x%x\n", (unsigned)flags);
+        return PVK_ERROR_VALIDATION_FAILED;
     }
 
-    *cmd = cb;
+    p = calloc(1, sizeof(struct PvkCommandPool_T));
+    if (!p)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    p->block = memalign(64, (size_t)qwords * 16);
+    if (!p->block) {
+        free(p);
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    p->device = device;
+    p->flags  = flags;
+    p->qwords = qwords;
+
+    *pool = p;
     return PVK_SUCCESS;
 }
 
-void pvkDestroyCommandBuffer(PvkDevice device, PvkCommandBuffer cmd)
+void pvkDestroyCommandPool(PvkDevice device, PvkCommandPool pool)
 {
-    (void)device;
-    if (!cmd)
+    PvkCommandBuffer cmd, next;
+
+    if (!pool)
         return;
-    packet2_free(cmd->packet);
-    free(cmd);
+    pvk_queue_wait_idle(&device->queue);
+    for (cmd = pool->buffers; cmd; cmd = next) {
+        next = cmd->next;
+        free(cmd);
+    }
+    free(pool->block);
+    free(pool);
+}
+
+PvkResult pvkResetCommandPool(PvkDevice device, PvkCommandPool pool, uint32_t flags)
+{
+    PvkCommandBuffer cmd;
+
+    (void)flags;
+    if (pool->recording) {
+        pvk_error("pvkResetCommandPool: a command buffer of the pool is recording\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    pvk_queue_wait_idle(&device->queue);
+    for (cmd = pool->buffers; cmd; cmd = cmd->next)
+        cmd->size = 0;
+    pool->used = 0;
+    return PVK_SUCCESS;
+}
+
+PvkResult pvkAllocateCommandBuffers(PvkDevice device, const PvkCommandBufferAllocateInfo *info, PvkCommandBuffer *cmds)
+{
+    PvkCommandPool pool = info->commandPool;
+    uint32_t i;
+
+    if (info->level != PVK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+        pvk_error("pvkAllocateCommandBuffers: level %d; only PVK_COMMAND_BUFFER_LEVEL_PRIMARY exists\n", (int)info->level);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+
+    for (i = 0; i < info->commandBufferCount; i++) {
+        PvkCommandBuffer cb = calloc(1, sizeof(struct PvkCommandBuffer_T));
+        if (!cb) {
+            pvkFreeCommandBuffers(device, pool, i, cmds);
+            return PVK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        cb->device = device;
+        cb->pool   = pool;
+        cb->next   = pool->buffers;
+        pool->buffers = cb;
+        cmds[i] = cb;
+    }
+    return PVK_SUCCESS;
+}
+
+void pvkFreeCommandBuffers(PvkDevice device, PvkCommandPool pool, uint32_t count, const PvkCommandBuffer *cmds)
+{
+    PvkCommandBuffer *link;
+    uint32_t i;
+
+    (void)device;
+    for (i = 0; i < count; i++) {
+        PvkCommandBuffer cmd = cmds[i];
+        if (!cmd)
+            continue;
+        if (pool->recording == cmd) {
+            pool->recording = NULL;
+            pool->used = cmd->start;
+        } else if (cmd->size && cmd->start + cmd->size == pool->used) {
+            pool->used = cmd->start;
+        }
+        for (link = &pool->buffers; *link; link = &(*link)->next) {
+            if (*link == cmd) {
+                *link = cmd->next;
+                break;
+            }
+        }
+        free(cmd);
+    }
 }
 
 PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
 {
-    packet2_reset(cmd->packet, 0);
+    PvkCommandPool pool = cmd->pool;
+    uint32_t room;
+
+    if (cmd->recording) {
+        pvk_error("pvkBeginCommandBuffer: already recording\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (pool->recording) {
+        pvk_error("pvkBeginCommandBuffer: another command buffer of the pool is recording\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (cmd->size) {
+        if (!(pool->flags & PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)) {
+            pvk_error("pvkBeginCommandBuffer: recorded before; reset the pool, or create it with "
+                      "PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT\n");
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        pvk_queue_wait_idle(&cmd->device->queue);
+        if (cmd->start + cmd->size == pool->used)
+            pool->used = cmd->start;
+        cmd->size = 0;
+    }
+
+    /* The chain grows into whatever is free above the stack, a packet2_t's u16 at most. */
+    room = pool->qwords - pool->used;
+    if (room > 0xffff)
+        room = 0xffff;
+    if (room == 0) {
+        pvk_error("pvkBeginCommandBuffer: command pool full (%u qwords); reset it, or create it with a larger maxQwords\n",
+                  (unsigned)pool->qwords);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    cmd->start = pool->used;
+    cmd->packet.max_qwords_count   = room;
+    cmd->packet.type               = P2_TYPE_NORMAL;
+    cmd->packet.mode               = P2_MODE_CHAIN;
+    cmd->packet.tte                = 1;
+    cmd->packet.base               = pool->block + cmd->start;
+    cmd->packet.next               = cmd->packet.base;
+    cmd->packet.tag_opened_at      = NULL;
+    cmd->packet.vif_code_opened_at = NULL;
+    pool->recording = cmd;
+
     cmd->pipeline     = NULL;
     cmd->colorView    = NULL;
     cmd->depthView    = NULL;
@@ -118,8 +241,13 @@ PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd)
         q = cmd_open_direct(cmd);
         q = draw_finish(q);
         cmd_close_direct(cmd, q);
-        packet2_utils_vu_add_end_tag(cmd->packet);
+        packet2_utils_vu_add_end_tag(&cmd->packet);
     }
+
+    /* Keep what was recorded; the rest of the block is free again. */
+    cmd->size = packet2_get_qw_count(&cmd->packet);
+    cmd->pool->used = cmd->start + cmd->size;
+    cmd->pool->recording = NULL;
 
     cmd->recording = 0;
     return cmd->failed ? PVK_ERROR_VALIDATION_FAILED : PVK_SUCCESS;
@@ -487,24 +615,24 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
     q = gs_ad(q, GS_SET_TRXPOS(0, 0, r->x, r->y, 0), GS_REG_TRXPOS);
     q = gs_ad(q, GS_SET_TRXREG(r->width, r->height), GS_REG_TRXREG);
     q = gs_ad(q, GS_SET_TRXDIR(0), GS_REG_TRXDIR); /* host to local */
-    packet2_update(cmd->packet, q);
-    packet2_vif_close_direct_auto(cmd->packet);
-    packet2_chain_close_tag(cmd->packet);
+    packet2_update(&cmd->packet, q);
+    packet2_vif_close_direct_auto(&cmd->packet);
+    packet2_chain_close_tag(&cmd->packet);
 
     while (sent < qwords) {
         uint32_t chunk = qwords - sent < PVK_IMAGE_CHUNK_QWORDS ? qwords - sent : PVK_IMAGE_CHUNK_QWORDS;
         int last = sent + chunk == qwords;
 
-        packet2_chain_open_cnt(cmd->packet, 0, 0, 0);
-        packet2_vif_nop(cmd->packet, 0);
-        packet2_vif_open_direct(cmd->packet, 0);
-        packet2_add_2x_s64(cmd->packet, GIF_SET_TAG(chunk, last, 0, 0, GIF_FLG_IMAGE, 0), 0);
-        packet2_vif_close_direct_auto(cmd->packet);
-        packet2_chain_close_tag(cmd->packet);
+        packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+        packet2_vif_nop(&cmd->packet, 0);
+        packet2_vif_open_direct(&cmd->packet, 0);
+        packet2_add_2x_s64(&cmd->packet, GIF_SET_TAG(chunk, last, 0, 0, GIF_FLG_IMAGE, 0), 0);
+        packet2_vif_close_direct_auto(&cmd->packet);
+        packet2_chain_close_tag(&cmd->packet);
 
-        packet2_chain_ref(cmd->packet, src + (size_t)sent * 16, chunk, 0, 0, 0);
-        packet2_vif_nop(cmd->packet, 0);
-        packet2_add_u32(cmd->packet, MAKE_VIF_CODE(chunk, 0, P2_VIF_DIRECT, 0));
+        packet2_chain_ref(&cmd->packet, src + (size_t)sent * 16, chunk, 0, 0, 0);
+        packet2_vif_nop(&cmd->packet, 0);
+        packet2_add_u32(&cmd->packet, MAKE_VIF_CODE(chunk, 0, P2_VIF_DIRECT, 0));
         sent += chunk;
     }
 }
@@ -526,17 +654,17 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
 
     /* Upload the vertex shader (VIF waits for VU1 to stop first), then the
      * per-pipeline constants, with the command buffer's viewport when it is dynamic. */
-    packet2_vif_add_micro_program(cmd->packet, 0, start, end);
+    packet2_vif_add_micro_program(&cmd->packet, 0, start, end);
 
     memcpy(context, pipeline->context, sizeof(context));
     if (pipeline->dynamic & (1u << PVK_DYNAMIC_STATE_VIEWPORT) && cmd->dynamicSet & (1u << PVK_DYNAMIC_STATE_VIEWPORT)) {
         pvk_viewport_context(&cmd->viewport, pipeline->depthFormat, context);
         cmd->viewportDirty = 0;
     }
-    packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_CONTEXT_ADDR, 0);
+    packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_CONTEXT_ADDR, 0);
     for (i = 0; i < PVK_VU1_CONTEXT_QWORDS * 4; i++)
-        packet2_add_float(cmd->packet, context[i]);
-    packet2_utils_vu_close_unpack(cmd->packet);
+        packet2_add_float(&cmd->packet, context[i]);
+    packet2_utils_vu_close_unpack(&cmd->packet);
 
     cmd->pipeline      = pipeline;
     cmd->gsStateDirty  = 1; /* its depth test and write mask */
@@ -621,12 +749,12 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_
     /* A running batch loads its push constants in its first instructions,
      * so wait for VU1 to finish before overwriting them. */
     cmd_flush(cmd);
-    packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_PUSH_ADDR + first, 0);
+    packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_PUSH_ADDR + first, 0);
     words = (const uint32_t *)(cmd->push + first * 16);
     for (q = first; q <= last; q++)
         for (i = 0; i < 4; i++)
-            packet2_add_u32(cmd->packet, *words++);
-    packet2_utils_vu_close_unpack(cmd->packet);
+            packet2_add_u32(&cmd->packet, *words++);
+    packet2_utils_vu_close_unpack(&cmd->packet);
 }
 
 void pvkCmdBindVertexBuffers(PvkCommandBuffer cmd, uint32_t firstBinding, uint32_t bindingCount,
@@ -730,7 +858,7 @@ static int send_uniforms(PvkCommandBuffer cmd, const char *name)
     cmd_flush(cmd);
     for (i = 0; i < vs->uniformBlockCount; i++) {
         const PvkShaderUniformBlock *u = &vs->uniformBlocks[i];
-        packet2_utils_vu_add_unpack_data(cmd->packet, PVK_VU1_UNIFORM_ADDR + u->qword,
+        packet2_utils_vu_add_unpack_data(&cmd->packet, PVK_VU1_UNIFORM_ADDR + u->qword,
                                          (uint8_t *)slots[i]->buffer->data + slots[i]->offset,
                                          (u->bytes + 15) / 16, 0);
     }
@@ -805,10 +933,10 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
             return 0;
         pvk_viewport_context(&cmd->viewport, p->depthFormat, context);
         cmd_flush(cmd);
-        packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_CONTEXT_ADDR, 0);
+        packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_CONTEXT_ADDR, 0);
         for (i = 0; i < 8; i++)
-            packet2_add_float(cmd->packet, context[i]);
-        packet2_utils_vu_close_unpack(cmd->packet);
+            packet2_add_float(&cmd->packet, context[i]);
+        packet2_utils_vu_close_unpack(&cmd->packet);
         cmd->viewportDirty = 0;
     }
 
@@ -939,23 +1067,23 @@ static void batch_begin(PvkCommandBuffer cmd, uint32_t count, uint32_t indexOffs
              : GIF_REG_RGBAQ | (GIF_REG_XYZ2 << 4);
 
     cmd_flush(cmd);
-    packet2_utils_vu_open_unpack(cmd->packet, PVK_VU1_INPUT_ADDR, 0);
-    packet2_add_2x_s64(cmd->packet,
+    packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_INPUT_ADDR, 0);
+    packet2_add_2x_s64(&cmd->packet,
                        GIF_SET_TAG(count, 1, 1, p->prim | (fst ? PVK_PRIM_FST : 0), GIF_FLG_PACKED, p->outputQwords),
                        regs);
-    packet2_add_u32(cmd->packet, count);
-    packet2_add_u32(cmd->packet, indexOffset);
-    packet2_add_float(cmd->packet, sign);
-    packet2_add_u32(cmd->packet, fst);
-    packet2_add_u32(cmd->packet, firstQword);
-    packet2_add_float(cmd->packet, sign);
-    packet2_add_u32(cmd->packet, instances);
-    packet2_add_u32(cmd->packet, instanceQword);
-    packet2_add_u32(cmd->packet, p->vertexQwords);
-    packet2_add_u32(cmd->packet, p->instanceQwords);
-    packet2_add_float(cmd->packet, (float)firstInstance);
-    packet2_add_u32(cmd->packet, 0);
-    packet2_utils_vu_close_unpack(cmd->packet);
+    packet2_add_u32(&cmd->packet, count);
+    packet2_add_u32(&cmd->packet, indexOffset);
+    packet2_add_float(&cmd->packet, sign);
+    packet2_add_u32(&cmd->packet, fst);
+    packet2_add_u32(&cmd->packet, firstQword);
+    packet2_add_float(&cmd->packet, sign);
+    packet2_add_u32(&cmd->packet, instances);
+    packet2_add_u32(&cmd->packet, instanceQword);
+    packet2_add_u32(&cmd->packet, p->vertexQwords);
+    packet2_add_u32(&cmd->packet, p->instanceQwords);
+    packet2_add_float(&cmd->packet, (float)firstInstance);
+    packet2_add_u32(&cmd->packet, 0);
+    packet2_utils_vu_close_unpack(&cmd->packet);
 }
 
 /* VU1 address of the vertex block. */
@@ -993,13 +1121,13 @@ static void batch_ref(PvkCommandBuffer cmd, uint32_t b, uint32_t first, uint32_t
     while (count) {
         uint32_t n = count < vb->chunk ? count : vb->chunk;
 
-        packet2_chain_ref(cmd->packet, src, n * vb->stride / 16, 0, 0, 0);
+        packet2_chain_ref(&cmd->packet, src, n * vb->stride / 16, 0, 0, 0);
         if (vb->count == qwords)
-            packet2_vif_stcycl(cmd->packet, 0, 0x0101, 0);
+            packet2_vif_stcycl(&cmd->packet, 0, 0x0101, 0);
         else
-            packet2_vif_stcycl(cmd->packet, vb->count, qwords, 0);
-        packet2_vif_open_unpack(cmd->packet, vb->mode, block_addr(p, b, base, pos), 0, 0, vb->usn, 0);
-        packet2_vif_close_unpack_manual(cmd->packet, n * vb->count);
+            packet2_vif_stcycl(&cmd->packet, vb->count, qwords, 0);
+        packet2_vif_open_unpack(&cmd->packet, vb->mode, block_addr(p, b, base, pos), 0, 0, vb->usn, 0);
+        packet2_vif_close_unpack_manual(&cmd->packet, n * vb->count);
         src   += (size_t)n * vb->stride;
         pos   += n;
         count -= n;
@@ -1020,18 +1148,18 @@ static void batch_one(PvkCommandBuffer cmd, uint32_t b, uint32_t vertex, uint32_
         batch_ref(cmd, b, vertex, 1, base, pos);
         return;
     }
-    packet2_chain_open_cnt(cmd->packet, 0, 0, 0);
-    packet2_vif_stcycl(cmd->packet, 0, 0x0101, 0);
-    packet2_vif_open_unpack(cmd->packet, vb->mode, block_addr(p, b, base, pos), 0, 0, vb->usn, 0);
+    packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+    packet2_vif_stcycl(&cmd->packet, 0, 0x0101, 0);
+    packet2_vif_open_unpack(&cmd->packet, vb->mode, block_addr(p, b, base, pos), 0, 0, vb->usn, 0);
     for (i = 0; i < vb->stride; i += 4) {
         uint32_t word = 0;
         memcpy(&word, src + i, vb->stride - i < 4 ? vb->stride - i : 4);
-        packet2_add_u32(cmd->packet, word);
+        packet2_add_u32(&cmd->packet, word);
     }
-    while ((u32)cmd->packet->next & 15)
-        packet2_add_u32(cmd->packet, 0); /* VIF NOPs up to the qword boundary */
-    packet2_vif_close_unpack_manual(cmd->packet, vb->count);
-    packet2_chain_close_tag(cmd->packet);
+    while ((u32)cmd->packet.next & 15)
+        packet2_add_u32(&cmd->packet, 0); /* VIF NOPs up to the qword boundary */
+    packet2_vif_close_unpack_manual(&cmd->packet, vb->count);
+    packet2_chain_close_tag(&cmd->packet);
 }
 
 /* The elements [first, first + count) of every binding of one rate, `first`
@@ -1084,7 +1212,7 @@ static void batch_end(PvkCommandBuffer cmd, uint32_t firstInstance, uint32_t ins
 {
     batch_range(cmd, 1, firstInstance, instances, PVK_VU1_INPUT_ADDR + at,
                 firstInstance % cmd->pipeline->instanceAlign);
-    packet2_utils_vu_add_start_program(cmd->packet, 0);
+    packet2_utils_vu_add_start_program(&cmd->packet, 0);
 }
 
 /* Index `i` of a batch's list: the carried ones come before the draw's. */
@@ -1101,19 +1229,19 @@ static void batch_indices(PvkCommandBuffer cmd, uint32_t dest, const uint16_t *p
 {
     uint32_t i, total = preCount + count, qwords = cmd->pipeline->vertexQwords;
 
-    packet2_chain_open_cnt(cmd->packet, 0, 0, 0);
-    packet2_vif_stcycl(cmd->packet, 0, 0x0101, 0);
-    packet2_vif_open_unpack(cmd->packet, P2_UNPACK_S_16, dest, 0, 0, 1, 0);
+    packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+    packet2_vif_stcycl(&cmd->packet, 0, 0x0101, 0);
+    packet2_vif_open_unpack(&cmd->packet, P2_UNPACK_S_16, dest, 0, 0, 1, 0);
     for (i = 0; i < total; i += 2) {
         uint32_t word = (batch_index(pre, preCount, idx, i) - base) * qwords;
         if (i + 1 < total)
             word |= ((batch_index(pre, preCount, idx, i + 1) - base) * qwords) << 16;
-        packet2_add_u32(cmd->packet, word);
+        packet2_add_u32(&cmd->packet, word);
     }
-    while ((u32)cmd->packet->next & 15)
-        packet2_add_u32(cmd->packet, 0); /* VIF NOPs up to the qword boundary */
-    packet2_vif_close_unpack_manual(cmd->packet, total);
-    packet2_chain_close_tag(cmd->packet);
+    while ((u32)cmd->packet.next & 15)
+        packet2_add_u32(&cmd->packet, 0); /* VIF NOPs up to the qword boundary */
+    packet2_vif_close_unpack_manual(&cmd->packet, total);
+    packet2_chain_close_tag(&cmd->packet);
 }
 
 void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,

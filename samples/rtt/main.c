@@ -171,6 +171,7 @@ int main(void)
     PvkDescriptorSet descriptorSet;
     PvkPipelineLayout layout;
     PvkPipeline innerPipeline, outerPipeline;
+    PvkCommandPool commandPool;
     PvkCommandBuffer cmd;
     PvkFence fence;
     void *mapped;
@@ -341,7 +342,12 @@ int main(void)
     pipelineInfo.depthAttachmentFormat = PVK_FORMAT_Z24;
     CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &outerPipeline));
 
-    CHECK(pvkCreateCommandBuffer(device, NULL, &cmd));
+    PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0 };
+    CHECK(pvkCreateCommandPool(device, &commandPoolInfo, &commandPool));
+    PvkCommandBufferAllocateInfo cmdInfo = {
+        .commandPool = commandPool, .level = PVK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
+    };
+    CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
 
     /* The target is square; the display is 4:3 whatever the pixel count. */
@@ -359,6 +365,7 @@ int main(void)
 
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
+        CHECK(pvkResetCommandPool(device, commandPool, 0));
         CHECK(pvkBeginCommandBuffer(cmd));
 
         /* Pass 1: the inner cube into the texture. */

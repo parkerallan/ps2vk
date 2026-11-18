@@ -31,6 +31,10 @@ PvkResult pvkQueueSubmit(PvkQueue queue, PvkCommandBuffer cmd, PvkFence fence)
         pvk_error("pvkQueueSubmit: command buffer had recording errors\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
+    if (!cmd->size) {
+        pvk_error("pvkQueueSubmit: command buffer holds no recording\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
 
     pvk_queue_wait_idle(queue);
 
@@ -42,7 +46,7 @@ PvkResult pvkQueueSubmit(PvkQueue queue, PvkCommandBuffer cmd, PvkFence fence)
     queue->busy  = 1;
 
     /* Writes back the data cache (vertex buffers included) before sending. */
-    dma_channel_send_packet2(cmd->packet, DMA_CHANNEL_VIF1, 1);
+    dma_channel_send_packet2(&cmd->packet, DMA_CHANNEL_VIF1, 1);
     return PVK_SUCCESS;
 }
 

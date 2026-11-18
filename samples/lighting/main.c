@@ -188,6 +188,7 @@ int main(void)
     PvkDescriptorSet descriptorSet;
     PvkPipelineLayout layout;
     PvkPipeline pipeline;
+    PvkCommandPool commandPool;
     PvkCommandBuffer cmd;
     PvkFence fence;
     void *mapped;
@@ -395,7 +396,12 @@ int main(void)
     };
     CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &pipeline));
 
-    CHECK(pvkCreateCommandBuffer(device, NULL, &cmd));
+    PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0 };
+    CHECK(pvkCreateCommandPool(device, &commandPoolInfo, &commandPool));
+    PvkCommandBufferAllocateInfo cmdInfo = {
+        .commandPool = commandPool, .level = PVK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
+    };
+    CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
 
     /* Upload the ramp once, outside rendering, and wait for it. */
@@ -425,6 +431,7 @@ int main(void)
 
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
+        CHECK(pvkResetCommandPool(device, commandPool, 0));
         CHECK(pvkBeginCommandBuffer(cmd));
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },

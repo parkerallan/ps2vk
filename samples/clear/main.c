@@ -32,6 +32,7 @@ int main(void)
     PvkImage images[2];
     PvkImageView views[2];
     uint32_t imageCount = 2;
+    PvkCommandPool commandPool;
     PvkCommandBuffer cmd;
     PvkFence fence;
     uint32_t frame = 0;
@@ -66,7 +67,12 @@ int main(void)
         PvkImageViewCreateInfo viewInfo = { .image = images[i], .levelCount = 1 };
         CHECK(pvkCreateImageView(device, &viewInfo, &views[i]));
     }
-    CHECK(pvkCreateCommandBuffer(device, NULL, &cmd));
+    PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0 };
+    CHECK(pvkCreateCommandPool(device, &commandPoolInfo, &commandPool));
+    PvkCommandBufferAllocateInfo cmdInfo = {
+        .commandPool = commandPool, .level = PVK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
+    };
+    CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
 
     printf("clear: running\n");
@@ -77,6 +83,7 @@ int main(void)
 
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
+        CHECK(pvkResetCommandPool(device, commandPool, 0));
         CHECK(pvkBeginCommandBuffer(cmd));
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },

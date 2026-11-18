@@ -286,6 +286,7 @@ int main(void)
     PvkShaderModule vs, fs;
     PvkPipelineLayout layout;
     PvkPipeline skyPipe, starPipe, moonPipe, ripplePipe, rainPipe, splashPipe;
+    PvkCommandPool commandPool;
     PvkCommandBuffer cmd;
     PvkFence fence;
     void *mapped;
@@ -353,7 +354,12 @@ int main(void)
     CHECK(make_pipeline(device, &pipelineInfo, PVK_PRIMITIVE_TOPOLOGY_LINE_LIST,      BLEND_ADD,   &rainPipe));
     CHECK(make_pipeline(device, &pipelineInfo, PVK_PRIMITIVE_TOPOLOGY_SPRITE_LIST,    BLEND_ADD,   &splashPipe));
 
-    CHECK(pvkCreateCommandBuffer(device, NULL, &cmd));
+    PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0 };
+    CHECK(pvkCreateCommandPool(device, &commandPoolInfo, &commandPool));
+    PvkCommandBufferAllocateInfo cmdInfo = {
+        .commandPool = commandPool, .level = PVK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
+    };
+    CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
 
     printf("rain: running\n");
@@ -370,6 +376,7 @@ int main(void)
 
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
+        CHECK(pvkResetCommandPool(device, commandPool, 0));
         CHECK(pvkBeginCommandBuffer(cmd));
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },

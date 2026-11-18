@@ -3,8 +3,8 @@
  * @brief ps2vk - a Vulkan-like graphics API for the PlayStation 2.
  *
  *
- * Names follow Vulkan where the concept is the same; the "pvk" prefix is a
- * placeholder.
+ * Functions conceptually follow Vulkan, but instead use the "pvk" prefix.
+ *
  */
 #ifndef PS2VK_H
 #define PS2VK_H
@@ -23,7 +23,7 @@ extern "C" {
  * @{
  */
 
-/** @brief Result codes. Values match Vulkan's where the meaning is the same. */
+/** @brief Result codes. */
 typedef enum PvkResult {
     PVK_SUCCESS                        = 0,           /**< The call succeeded. */
     PVK_INCOMPLETE                     = 5,           /**< The array given was too small for every result. */
@@ -39,7 +39,7 @@ typedef enum PvkResult {
 /**
  * @brief Data formats for vertex attributes and images.
  *
- * Vertex attribute formats are Vulkan's: a vec4 of floats, or 1 to 4
+ * Vertex attribute formats are a vec4 of floats, or 1 to 4
  * components of 32-bit floats, 16-bit or 8-bit integers (see
  * PvkVertexInputBinding for how they are laid out). The shader always sees a
  * vec4: missing components read 0, a missing w reads 1; UNORM/SNORM integers
@@ -71,14 +71,14 @@ typedef enum PvkResult {
 typedef enum PvkFormat {
     PVK_FORMAT_UNDEFINED = 0,       /**< No format. */
     PVK_FORMAT_R32G32B32A32_SFLOAT, /**< Vertex attribute: 4 floats. */
-    PVK_FORMAT_CT32,                /**< GS PSMCT32 color image (RGBA, 8 bits each; like VK_FORMAT_R8G8B8A8_UNORM, alpha 0x80 is opaque). */
-    PVK_FORMAT_CT24,                /**< GS PSMCT24 texture or color table (RGB, 8 bits each, 3 bytes per texel; like VK_FORMAT_R8G8B8_UNORM). Reads as opaque. */
-    PVK_FORMAT_CT16,                /**< GS PSMCT16 texture or color table (16 bits per texel: R in bits 0-4, G 5-9, B 10-14, alpha bit 15; like VK_FORMAT_A1R5G5B5_UNORM_PACK16). */
+    PVK_FORMAT_CT32,                /**< GS PSMCT32 color image (RGBA, 8 bits each; alpha 0x80 is opaque). */
+    PVK_FORMAT_CT24,                /**< GS PSMCT24 texture or color table (RGB, 8 bits each, 3 bytes per texel). Reads as opaque. */
+    PVK_FORMAT_CT16,                /**< GS PSMCT16 texture or color table (16 bits per texel: R in bits 0-4, G 5-9, B 10-14, alpha bit 15). */
     PVK_FORMAT_T8,                  /**< GS PSMT8 texture: one byte per texel, an index into a 256-entry color table (PS2 only). */
     PVK_FORMAT_T4,                  /**< GS PSMT4 texture: 4 bits per texel, two per byte with the first in the low bits, an index into a 16-entry color table (PS2 only). */
-    PVK_FORMAT_Z32,                 /**< GS PSMZ32 depth image (like VK_FORMAT_D32). */
-    PVK_FORMAT_Z24,                 /**< GS PSMZ24 depth image (like VK_FORMAT_X8_D24). */
-    PVK_FORMAT_Z16,                 /**< GS PSMZ16 depth image (like VK_FORMAT_D16). */
+    PVK_FORMAT_Z32,                 /**< GS PSMZ32 depth image. */
+    PVK_FORMAT_Z24,                 /**< GS PSMZ24 depth image. */
+    PVK_FORMAT_Z16,                 /**< GS PSMZ16 depth image. */
     PVK_FORMAT_R32G32B32_SFLOAT,    /**< Vertex attribute: 3 floats (VIF UNPACK V3-32). */
     PVK_FORMAT_R32G32_SFLOAT,       /**< Vertex attribute: 2 floats (V2-32). */
     PVK_FORMAT_R32_SFLOAT,          /**< Vertex attribute: 1 float (S-32). */
@@ -127,7 +127,7 @@ typedef enum PvkFormat {
 
 /** @brief The connection to ps2vk. */
 typedef struct PvkInstance_T      *PvkInstance;
-/** @brief The graphics hardware as it can be queried before a device exists, like VkPhysicalDevice. The instance has exactly one. */
+/** @brief The graphics hardware as it can be queried before a device exists. The instance has exactly one. */
 typedef struct PvkPhysicalDevice_T *PvkPhysicalDevice;
 /** @brief The PS2 graphics hardware (EE DMA, VU1, GS). There is only one. */
 typedef struct PvkDevice_T        *PvkDevice;
@@ -139,28 +139,25 @@ typedef struct PvkInstanceCreateInfo {
     const char *applicationName; /**< Application name (informational). */
 } PvkInstanceCreateInfo;
 
-/** @brief What kind of device a physical device is. Values match Vulkan's VkPhysicalDeviceType. */
+/** @brief What kind of device a physical device is. */
 typedef enum PvkPhysicalDeviceType {
     PVK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU = 1 /**< The GS shares the console with the EE. */
 } PvkPhysicalDeviceType;
 
-/** @brief Length of PvkPhysicalDeviceProperties::deviceName, like VK_MAX_PHYSICAL_DEVICE_NAME_SIZE. */
+/** @brief Length of PvkPhysicalDeviceProperties::deviceName. */
 #define PVK_MAX_PHYSICAL_DEVICE_NAME_SIZE 256
 
 /**
- * @brief Most mip levels a texture can have. Not a Vulkan limit: Vulkan
- * derives it from maxImageDimension2D, the GS caps it at 7 (TEX1.MXL is 3
+ * @brief Most mip levels a texture can have: the GS caps it at 7 (TEX1.MXL is 3
  * bits) whatever the size.
  */
 #define PVK_MAX_MIP_LEVELS 7
 
 /**
- * @brief What the hardware can do, like VkPhysicalDeviceLimits.
+ * @brief What the hardware can do.
  *
- * The fields with Vulkan's names mean what they mean in Vulkan, with the
- * PS2's values. The library checks against the same values, so a creation
- * call that stays within them does not fail for size. The fields marked PS2
- * only have no Vulkan counterpart.
+ * The library checks against these same values, so a creation call that
+ * stays within them does not fail for size.
  *
  * | Limit | Value | Where it comes from |
  * | --- | --- | --- |
@@ -212,7 +209,7 @@ typedef struct PvkPhysicalDeviceLimits {
     uint32_t subPixelPrecisionBits;               /**< Fraction bits of a rasterized position. */
 } PvkPhysicalDeviceLimits;
 
-/** @brief Who and what the physical device is, like VkPhysicalDeviceProperties. */
+/** @brief Who and what the physical device is. */
 typedef struct PvkPhysicalDeviceProperties {
     uint32_t              apiVersion;    /**< The ps2vk API version, PVK_API_VERSION_1_0. */
     uint32_t              driverVersion; /**< The library version. */
@@ -223,11 +220,11 @@ typedef struct PvkPhysicalDeviceProperties {
     PvkPhysicalDeviceLimits limits;      /**< What it can do. */
 } PvkPhysicalDeviceProperties;
 
-/** @brief The API version pvkGetPhysicalDeviceProperties() reports: major 1, minor 0, patch 0 in Vulkan's packing. */
+/** @brief The API version pvkGetPhysicalDeviceProperties() reports: major 1, minor 0, patch 0, packed as major << 22 | minor << 12 | patch. */
 #define PVK_API_VERSION_1_0 (1u << 22)
 
 /**
- * @brief Optional device behaviour an application turns on, like VkPhysicalDeviceFeatures.
+ * @brief Optional device behaviour an application turns on.
  *
  * pvkGetPhysicalDeviceFeatures() says which the hardware supports; every
  * feature is off unless the application enables it in PvkDeviceCreateInfo,
@@ -236,18 +233,18 @@ typedef struct PvkPhysicalDeviceProperties {
  * into a block array (see PvkShaderUniformBlock) is clamped to the array, so
  * an index past the end reads the last element; the PS2 pays 3 to 4 VU1
  * instructions per indexed read for it. Off, such a read takes whatever VU1
- * memory follows the array, undefined as in Vulkan.
+ * memory follows the array, undefined.
  */
 typedef struct PvkPhysicalDeviceFeatures {
     uint32_t robustBufferAccess; /**< Nonzero: run-time indices into block arrays are clamped. */
 } PvkPhysicalDeviceFeatures;
 
-/** @brief Properties of a memory heap, like VkMemoryHeapFlagBits. */
+/** @brief Properties of a memory heap. */
 typedef enum PvkMemoryHeapFlagBits {
     PVK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 1 /**< GS VRAM: only the GS reads and writes it. */
 } PvkMemoryHeapFlagBits;
 
-/** @brief One pool of memory, like VkMemoryHeap. */
+/** @brief One pool of memory. */
 typedef struct PvkMemoryHeap {
     size_t   size;  /**< Bytes in the heap. */
     uint32_t flags; /**< PvkMemoryHeapFlagBits. */
@@ -256,14 +253,14 @@ typedef struct PvkMemoryHeap {
 /** @brief Most heaps pvkGetPhysicalDeviceMemoryProperties() lists. */
 #define PVK_MAX_MEMORY_HEAPS 2
 
-/** @brief How memory of a type behaves, like VkMemoryPropertyFlagBits (same values). */
+/** @brief How memory of a type behaves. */
 typedef enum PvkMemoryPropertyFlagBits {
     PVK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT  = 1, /**< GS VRAM: the GS reads and writes it, the CPU can't map it. */
     PVK_MEMORY_PROPERTY_HOST_VISIBLE_BIT  = 2, /**< pvkMapMemory() works on it. */
     PVK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 4  /**< Mapped writes need no flush: the data cache is written back at pvkQueueSubmit(). */
 } PvkMemoryPropertyFlagBits;
 
-/** @brief One kind of memory an allocation can be, like VkMemoryType. */
+/** @brief One kind of memory an allocation can be. */
 typedef struct PvkMemoryType {
     uint32_t propertyFlags; /**< PvkMemoryPropertyFlagBits. */
     uint32_t heapIndex;     /**< The heap it comes from. */
@@ -273,7 +270,7 @@ typedef struct PvkMemoryType {
 #define PVK_MAX_MEMORY_TYPES 2
 
 /**
- * @brief The device's memory, like VkPhysicalDeviceMemoryProperties.
+ * @brief The device's memory.
  *
  * Heap 0 is EE main RAM, heap 1 is GS VRAM, both whole. Type 0 is heap 0,
  * host visible and coherent: buffers live there. Type 1 is heap 1, device
@@ -289,7 +286,7 @@ typedef struct PvkPhysicalDeviceMemoryProperties {
 
 /** @brief Parameters for pvkCreateDevice(). May be NULL. */
 typedef struct PvkDeviceCreateInfo {
-    const PvkPhysicalDeviceFeatures *enabledFeatures; /**< Features to turn on, or NULL for none, like VkDeviceCreateInfo::pEnabledFeatures. */
+    const PvkPhysicalDeviceFeatures *enabledFeatures; /**< Features to turn on, or NULL for none. */
 } PvkDeviceCreateInfo;
 
 /**
@@ -372,7 +369,7 @@ PvkResult pvkDeviceWaitIdle(PvkDevice device);
  * @defgroup memory Device memory
  * @brief Blocks of EE RAM or GS VRAM that buffers and images are placed in.
  *
- * As in Vulkan, a buffer or image is created empty and then bound to a part
+ * A buffer or image is created empty and then bound to a part
  * of a PvkDeviceMemory allocation at an offset. One allocation holds as many
  * resources as fit, so an application lays its memory out itself: a frame's
  * buffers back to back in one EE RAM block, the depth buffer and textures
@@ -394,20 +391,20 @@ PvkResult pvkDeviceWaitIdle(PvkDevice device);
  * @{
  */
 
-/** @brief A block of EE RAM or GS VRAM, like VkDeviceMemory. */
+/** @brief A block of EE RAM or GS VRAM. */
 typedef struct PvkDeviceMemory_T  *PvkDeviceMemory;
 
 /** @brief The rest of a buffer or allocation, as a range or mapping size. */
 #define PVK_WHOLE_SIZE (~(size_t)0)
 
-/** @brief What a resource needs from an allocation, like VkMemoryRequirements. */
+/** @brief What a resource needs from an allocation. */
 typedef struct PvkMemoryRequirements {
     size_t   size;           /**< Bytes the resource takes from its bind offset on. */
     size_t   alignment;      /**< The bind offset is a multiple of this. */
     uint32_t memoryTypeBits; /**< Bit i set: memory type i may hold it. */
 } PvkMemoryRequirements;
 
-/** @brief Parameters for pvkAllocateMemory(), like VkMemoryAllocateInfo. */
+/** @brief Parameters for pvkAllocateMemory(). */
 typedef struct PvkMemoryAllocateInfo {
     size_t   allocationSize;  /**< Bytes to allocate; VRAM is taken in whole 8 KB pages. */
     uint32_t memoryTypeIndex; /**< Index into PvkPhysicalDeviceMemoryProperties::memoryTypes. */
@@ -438,7 +435,7 @@ PvkResult pvkAllocateMemory(PvkDevice device, const PvkMemoryAllocateInfo *info,
 void      pvkFreeMemory(PvkDevice device, PvkDeviceMemory memory);
 
 /**
- * @brief Gets a CPU pointer into a host visible allocation, like vkMapMemory.
+ * @brief Gets a CPU pointer into a host visible allocation.
  *
  * Writes need no flushing: the data cache is written back at pvkQueueSubmit().
  * Only type 0 (EE RAM) memory can be mapped; a submission may read the
@@ -498,7 +495,7 @@ void      pvkUnmapMemory(PvkDevice device, PvkDeviceMemory memory);
  * Such an image gets page-aligned VRAM (FRAME addresses in 8 KB pages, where
  * a plain texture only needs 256-byte blocks) and must be at least 64 wide,
  * the unit of FRAME.FBW. Everything that reads or renders an image goes
- * through a PvkImageView, as in Vulkan; a view picks the mip levels used.
+ * through a PvkImageView; a view picks the mip levels used.
  * @{
  */
 
@@ -507,7 +504,7 @@ typedef struct PvkImage_T         *PvkImage;
 /** @brief A way of using an image: the levels a texture is sampled through, or the one level rendered into. */
 typedef struct PvkImageView_T     *PvkImageView;
 
-/** @brief What an image is used for. Values match Vulkan's VkImageUsageFlagBits. */
+/** @brief What an image is used for. */
 typedef enum PvkImageUsageFlagBits {
     PVK_IMAGE_USAGE_TRANSFER_DST_BIT             = 0x02, /**< Filled by pvkCmdCopyBufferToImage(): a texture or color table. */
     PVK_IMAGE_USAGE_SAMPLED_BIT                  = 0x04, /**< Read through a combined image sampler binding: GS TEX0. */
@@ -560,7 +557,7 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
 void      pvkDestroyImage(PvkDevice device, PvkImage image);
 
 /**
- * @brief Reports the VRAM an image needs, like vkGetImageMemoryRequirements.
+ * @brief Reports the VRAM an image needs.
  *
  * Each mip level is its own GS texture, so size covers every level laid out
  * in order, each at the image's alignment: 8 KB pages for a depth buffer or
@@ -576,7 +573,7 @@ void      pvkDestroyImage(PvkDevice device, PvkImage image);
 void      pvkGetImageMemoryRequirements(PvkDevice device, PvkImage image, PvkMemoryRequirements *requirements);
 
 /**
- * @brief Places an image in a type 1 (GS VRAM) allocation, like vkBindImageMemory.
+ * @brief Places an image in a type 1 (GS VRAM) allocation.
  *
  * Level 0 starts at offset; the other levels follow at the alignment
  * pvkGetImageMemoryRequirements() reports. An image is bound once.
@@ -594,7 +591,7 @@ PvkResult pvkBindImageMemory(PvkDevice device, PvkImage image, PvkDeviceMemory m
 /** @brief Every level from baseMipLevel on, as the levelCount of a PvkImageViewCreateInfo. */
 #define PVK_REMAINING_MIP_LEVELS (~0u)
 
-/** @brief Parameters for pvkCreateImageView(), like VkImageViewCreateInfo. */
+/** @brief Parameters for pvkCreateImageView(). */
 typedef struct PvkImageViewCreateInfo {
     PvkImage  image;        /**< The image viewed. */
     PvkFormat format;       /**< The image's format, or PVK_FORMAT_UNDEFINED for it; the GS reads VRAM in the format it was written in. */
@@ -655,7 +652,7 @@ void      pvkDestroyImageView(PvkDevice device, PvkImageView view);
  * rather than 0 to 1, for sprite sheets and text. Draws with such a sampler
  * set GS PRIM.FST and store a UV register (12.4 fixed point) in place of
  * ST and Q: VU1 skips the divide by w, so the texture is not perspective
- * correct. As in Vulkan the sampler must then clamp to edge on both axes,
+ * correct. The sampler must then clamp to edge on both axes,
  * use one filter for both magFilter and minFilter, nearest mipmapping and
  * maxLod 0.
  * @{
@@ -664,22 +661,22 @@ void      pvkDestroyImageView(PvkDevice device, PvkImageView view);
 /** @brief Rules for reading a texture, created with pvkCreateSampler(). */
 typedef struct PvkSampler_T *PvkSampler;
 
-/** @brief Texel filtering. Values match Vulkan's VkFilter. */
+/** @brief Texel filtering. */
 typedef enum PvkFilter {
     PVK_FILTER_NEAREST = 0, /**< The nearest texel. GS MMAG/MMIN = NEAREST. */
     PVK_FILTER_LINEAR  = 1  /**< The 4 surrounding texels blended (bilinear). GS MMAG/MMIN = LINEAR. */
 } PvkFilter;
 
-/** @brief Mipmap selection. Values match Vulkan's VkSamplerMipmapMode. */
+/** @brief Mipmap selection. */
 typedef enum PvkSamplerMipmapMode {
     PVK_SAMPLER_MIPMAP_MODE_NEAREST = 0, /**< Pick one level. GS MMIN = *_MIPMAP_NEAREST. */
     PVK_SAMPLER_MIPMAP_MODE_LINEAR  = 1  /**< Blend two levels (trilinear with PVK_FILTER_LINEAR). GS MMIN = *_MIPMAP_LINEAR. */
 } PvkSamplerMipmapMode;
 
-/** @brief A maxLod that never clamps: every level of the image is used, like VK_LOD_CLAMP_NONE. */
+/** @brief A maxLod that never clamps: every level of the image is used. */
 #define PVK_LOD_CLAMP_NONE 1000.0f
 
-/** @brief What a coordinate outside 0 to 1 reads. Values match Vulkan's VkSamplerAddressMode. */
+/** @brief What a coordinate outside 0 to 1 reads. */
 typedef enum PvkSamplerAddressMode {
     PVK_SAMPLER_ADDRESS_MODE_REPEAT               = 0, /**< Tile the texture. GS WMS/WMT = REPEAT. */
     PVK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT      = 1, /**< Not supported. */
@@ -688,7 +685,7 @@ typedef enum PvkSamplerAddressMode {
     PVK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE = 4  /**< Not supported. */
 } PvkSamplerAddressMode;
 
-/** @brief Parameters for pvkCreateSampler(), like VkSamplerCreateInfo. All zeros is nearest filtering, repeat, the base level only. */
+/** @brief Parameters for pvkCreateSampler(). All zeros is nearest filtering, repeat, the base level only. */
 typedef struct PvkSamplerCreateInfo {
     PvkFilter             magFilter;    /**< Filter when a texel covers more than a pixel (zoomed in). GS TEX1.MMAG. */
     PvkFilter             minFilter;    /**< Filter when a pixel covers more than a texel (zoomed out). GS TEX1.MMIN. */
@@ -710,7 +707,7 @@ typedef struct PvkSamplerCreateInfo {
  *         lacks or a minLod other than 0, PVK_ERROR_VALIDATION_FAILED for a
  *         value outside the enums, a mipLodBias outside TEX1.K's range or
  *         unnormalizedCoordinates with filters, mipmapping, maxLod or address
- *         modes Vulkan forbids with it, or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ *         modes not allowed with it, or PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
 PvkResult pvkCreateSampler(PvkDevice device, const PvkSamplerCreateInfo *info, PvkSampler *sampler);
 
@@ -846,7 +843,7 @@ PvkResult pvkCreateBuffer(PvkDevice device, const PvkBufferCreateInfo *info, Pvk
 void      pvkDestroyBuffer(PvkDevice device, PvkBuffer buffer);
 
 /**
- * @brief Reports the memory a buffer needs, like vkGetBufferMemoryRequirements.
+ * @brief Reports the memory a buffer needs.
  *
  * size is the buffer's size rounded up to 16 plus 48 bytes: a vertex binding
  * is read in whole 16-byte units, up to 48 bytes past its last vertex.
@@ -859,7 +856,7 @@ void      pvkDestroyBuffer(PvkDevice device, PvkBuffer buffer);
 void      pvkGetBufferMemoryRequirements(PvkDevice device, PvkBuffer buffer, PvkMemoryRequirements *requirements);
 
 /**
- * @brief Places a buffer in a type 0 (EE RAM) allocation, like vkBindBufferMemory. A buffer is bound once.
+ * @brief Places a buffer in a type 0 (EE RAM) allocation. A buffer is bound once.
  * @param device The device.
  * @param buffer The buffer, not yet bound.
  * @param memory A type 0 allocation.
@@ -895,7 +892,7 @@ typedef enum PvkShaderStage {
 } PvkShaderStage;
 
 /**
- * @brief How vertices are grouped into primitives, like VkPrimitiveTopology.
+ * @brief How vertices are grouped into primitives.
  *
  * Each value is a GS primitive type, so the GS assembles the shapes itself.
  * A draw is split into VU1 batches; a strip or fan batch repeats the vertices
@@ -920,10 +917,10 @@ typedef enum PvkPrimitiveTopology {
 /** @brief Most vertex buffer bindings a pipeline can declare and a command buffer can bind. */
 #define PVK_MAX_VERTEX_BINDINGS 8
 
-/** @brief Size of the push constant range, in bytes (Vulkan's minimum). */
+/** @brief Size of the push constant range, in bytes. */
 #define PVK_MAX_PUSH_CONSTANT_BYTES 128
 
-/** @brief Most descriptor sets a pipeline layout can have and a command buffer can bind (Vulkan's minimum). */
+/** @brief Most descriptor sets a pipeline layout can have and a command buffer can bind. */
 #define PVK_MAX_DESCRIPTOR_SETS 4
 
 /** @brief Most uniform blocks one vertex shader can declare. */
@@ -999,7 +996,7 @@ typedef struct PvkShaderModuleCreateInfo {
     const PvkShaderCode *code; /**< Shader generated by tools/shaderc. */
 } PvkShaderModuleCreateInfo;
 
-/** @brief Part of the push constant range that one or more shader stages read, like VkPushConstantRange. */
+/** @brief Part of the push constant range that one or more shader stages read. */
 typedef struct PvkPushConstantRange {
     uint32_t stageFlags; /**< PvkShaderStage values ORed together. Only the vertex stage can read push constants on the PS2. */
     uint32_t offset;     /**< First byte of the range; a multiple of 4. */
@@ -1047,14 +1044,14 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
  */
 void      pvkDestroyPipelineLayout(PvkDevice device, PvkPipelineLayout layout);
 
-/** @brief How often a vertex buffer binding advances. Values match Vulkan's VkVertexInputRate. */
+/** @brief How often a vertex buffer binding advances. */
 typedef enum PvkVertexInputRate {
     PVK_VERTEX_INPUT_RATE_VERTEX   = 0, /**< One element per vertex. */
     PVK_VERTEX_INPUT_RATE_INSTANCE = 1  /**< One element per instance of the draw: every vertex of an instance reads the same values. */
 } PvkVertexInputRate;
 
 /**
- * @brief A vertex buffer binding: one stream of vertices, like VkVertexInputBindingDescription.
+ * @brief A vertex buffer binding: one stream of vertices.
  *
  * The VIF expands each binding into VU1 memory with one UNPACK format, so a
  * binding is a tightly packed array in one format: its attributes share the
@@ -1069,7 +1066,7 @@ typedef enum PvkVertexInputRate {
  * instance of a draw instead of per vertex: the draw's instanceCount and
  * firstInstance pick which, and VU1 reads the element once per instance while
  * it runs the vertices again. gl_InstanceIndex is firstInstance plus the
- * instance's number, as in Vulkan; VU1 keeps it as a float, so a shader reads
+ * instance's number; VU1 keeps it as a float, so a shader reads
  * it only as float(gl_InstanceIndex).
  */
 typedef struct PvkVertexInputBinding {
@@ -1078,7 +1075,7 @@ typedef struct PvkVertexInputBinding {
     PvkVertexInputRate inputRate; /**< Per vertex or per instance. */
 } PvkVertexInputBinding;
 
-/** @brief One vertex attribute, like VkVertexInputAttributeDescription. */
+/** @brief One vertex attribute. */
 typedef struct PvkVertexInputAttribute {
     uint32_t  location; /**< Shader input location it feeds. */
     uint32_t  binding;  /**< The PvkVertexInputBinding it is read from. */
@@ -1094,7 +1091,7 @@ typedef struct PvkRect2D {
     uint32_t height; /**< Height. */
 } PvkRect2D;
 
-/** @brief Maps clip space to framebuffer pixels, as in Vulkan (y points down). */
+/** @brief Maps clip space to framebuffer pixels (y points down). */
 typedef struct PvkViewport {
     float x;        /**< Left edge in pixels. */
     float y;        /**< Top edge in pixels. */
@@ -1105,7 +1102,7 @@ typedef struct PvkViewport {
 } PvkViewport;
 
 /**
- * @brief Depth comparisons. Values match Vulkan's VkCompareOp.
+ * @brief Depth comparisons.
  *
  * The GS only compares with >= and >, so ps2vk stores depth flipped (near is
  * large) and supports the comparisons that map onto that: LESS,
@@ -1123,7 +1120,7 @@ typedef enum PvkCompareOp {
 } PvkCompareOp;
 
 /**
- * @brief Depth test and write control, like VkPipelineDepthStencilStateCreateInfo.
+ * @brief Depth test and write control.
  *
  * All zeros means no depth test and no depth writes, which is what a pipeline
  * without a depth attachment needs. There is no stencil buffer on the GS.
@@ -1134,7 +1131,7 @@ typedef struct PvkPipelineDepthStencilStateCreateInfo {
     PvkCompareOp depthCompareOp;   /**< Comparison when the test is on. */
 } PvkPipelineDepthStencilStateCreateInfo;
 
-/** @brief Which triangles a pipeline discards. Values match Vulkan's VkCullModeFlagBits. */
+/** @brief Which triangles a pipeline discards. */
 typedef enum PvkCullMode {
     PVK_CULL_MODE_NONE           = 0, /**< Draw every triangle. */
     PVK_CULL_MODE_FRONT_BIT      = 1, /**< Discard front-facing triangles. */
@@ -1142,14 +1139,14 @@ typedef enum PvkCullMode {
     PVK_CULL_MODE_FRONT_AND_BACK = 3  /**< Discard all triangles: the draw is skipped. */
 } PvkCullMode;
 
-/** @brief Which winding is front-facing, like VkFrontFace, in framebuffer space (y down). */
+/** @brief Which winding is front-facing, in framebuffer space (y down). */
 typedef enum PvkFrontFace {
     PVK_FRONT_FACE_COUNTER_CLOCKWISE = 0, /**< Positive signed area is front-facing. */
     PVK_FRONT_FACE_CLOCKWISE         = 1  /**< Negative signed area is front-facing. */
 } PvkFrontFace;
 
 /**
- * @brief Culling, like VkPipelineRasterizationStateCreateInfo.
+ * @brief Culling.
  *
  * All zeros means no culling and counter-clockwise front faces. Only triangle
  * topologies cull; points, lines and sprites ignore it. The GS cannot cull, so
@@ -1164,7 +1161,7 @@ typedef struct PvkPipelineRasterizationStateCreateInfo {
 } PvkPipelineRasterizationStateCreateInfo;
 
 /**
- * @brief Blend factors. Values match Vulkan's VkBlendFactor.
+ * @brief Blend factors.
  *
  * The GS blends as (A - B) * C + D, where A, B and D are the source color,
  * the destination color or zero and C is the source alpha, the destination
@@ -1189,7 +1186,7 @@ typedef enum PvkBlendFactor {
     PVK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA = 13  /**< 1 - blendConstants[3]. */
 } PvkBlendFactor;
 
-/** @brief Blend operations. Values match Vulkan's VkBlendOp. */
+/** @brief Blend operations. */
 typedef enum PvkBlendOp {
     PVK_BLEND_OP_ADD              = 0, /**< src * srcFactor + dst * dstFactor. */
     PVK_BLEND_OP_SUBTRACT         = 1, /**< src * srcFactor - dst * dstFactor. */
@@ -1199,7 +1196,7 @@ typedef enum PvkBlendOp {
 } PvkBlendOp;
 
 /**
- * @brief Blending of the color attachment, like VkPipelineColorBlendAttachmentState.
+ * @brief Blending of the color attachment.
  *
  * The equation src * srcColorBlendFactor (op) dst * dstColorBlendFactor is
  * rewritten into the GS's (A - B) * C + D at pipeline creation; combinations
@@ -1216,14 +1213,14 @@ typedef struct PvkPipelineColorBlendAttachmentState {
     PvkBlendOp     colorBlendOp;        /**< How the two products combine. */
 } PvkPipelineColorBlendAttachmentState;
 
-/** @brief Blend state of a pipeline, like VkPipelineColorBlendStateCreateInfo. */
+/** @brief Blend state of a pipeline. */
 typedef struct PvkPipelineColorBlendStateCreateInfo {
     PvkPipelineColorBlendAttachmentState attachment;        /**< Blending of the single color attachment. */
     float                                blendConstants[4]; /**< Only [3] is used, by the CONSTANT_ALPHA factors, as GS ALPHA.FIX (0..1, 1 = 128). Ignored when PVK_DYNAMIC_STATE_BLEND_CONSTANTS is dynamic. */
 } PvkPipelineColorBlendStateCreateInfo;
 
 /**
- * @brief Pipeline state that is set while recording instead of at creation. Values match Vulkan's VkDynamicState.
+ * @brief Pipeline state that is set while recording instead of at creation.
  *
  * The three the GS can change between draws. A pipeline that lists one
  * ignores the value in its create info; the matching pvkCmdSet*() must have
@@ -1235,7 +1232,7 @@ typedef enum PvkDynamicState {
     PVK_DYNAMIC_STATE_BLEND_CONSTANTS = 4  /**< PvkPipelineColorBlendStateCreateInfo::blendConstants is set by pvkCmdSetBlendConstants(). */
 } PvkDynamicState;
 
-/** @brief Which state a pipeline leaves dynamic, like VkPipelineDynamicStateCreateInfo. All zeros means none. */
+/** @brief Which state a pipeline leaves dynamic. All zeros means none. */
 typedef struct PvkPipelineDynamicStateCreateInfo {
     uint32_t               dynamicStateCount; /**< Number of entries in dynamicStates. */
     const PvkDynamicState *dynamicStates;     /**< The states set while recording. */
@@ -1252,8 +1249,8 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     const PvkVertexInputAttribute *attributes;     /**< One per vertex shader input. */
     PvkPrimitiveTopology           topology;       /**< How the vertices of a draw are grouped into primitives. */
     PvkViewport                    viewport;       /**< Viewport, unless PVK_DYNAMIC_STATE_VIEWPORT is dynamic. */
-    PvkRect2D                      scissor;        /**< Pixels the draws may write, clipped to the attachment, unless PVK_DYNAMIC_STATE_SCISSOR is dynamic; a zero width or height means the whole attachment level (Vulkan has no such default). GS SCISSOR. */
-    PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none (like VkPipelineRenderingCreateInfo). Sets the depth range the viewport maps to. */
+    PvkRect2D                      scissor;        /**< Pixels the draws may write, clipped to the attachment, unless PVK_DYNAMIC_STATE_SCISSOR is dynamic; a zero width or height means the whole attachment level. GS SCISSOR. */
+    PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none. Sets the depth range the viewport maps to. */
     PvkPipelineRasterizationStateCreateInfo rasterization; /**< Back-face culling. */
     PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth test and write control. */
     PvkPipelineColorBlendStateCreateInfo   colorBlend;   /**< Blending with the color attachment. */
@@ -1332,7 +1329,7 @@ typedef struct PvkDescriptorPool_T      *PvkDescriptorPool;
 /** @brief A set of resources, filled in with pvkUpdateDescriptorSets(). */
 typedef struct PvkDescriptorSet_T       *PvkDescriptorSet;
 
-/** @brief What a descriptor binding holds. Values match Vulkan's VkDescriptorType. */
+/** @brief What a descriptor binding holds. */
 typedef enum PvkDescriptorType {
     PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = 1, /**< An image view (and its color table) a sampler2D reads: GS TEX0. */
     PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER         = 6  /**< Part of a PvkBuffer a vertex shader's uniform block reads: VIF UNPACK into VU1 memory. */
@@ -1341,7 +1338,7 @@ typedef enum PvkDescriptorType {
 /** @brief Most bindings in one descriptor set layout. */
 #define PVK_MAX_DESCRIPTOR_BINDINGS 8
 
-/** @brief One binding of a descriptor set layout, like VkDescriptorSetLayoutBinding. */
+/** @brief One binding of a descriptor set layout. */
 typedef struct PvkDescriptorSetLayoutBinding {
     uint32_t          binding;         /**< The binding number the shader's layout(binding = n) names. */
     PvkDescriptorType descriptorType;  /**< What it holds. */
@@ -1377,7 +1374,7 @@ PvkResult pvkCreateDescriptorSetLayout(PvkDevice device, const PvkDescriptorSetL
  */
 void      pvkDestroyDescriptorSetLayout(PvkDevice device, PvkDescriptorSetLayout layout);
 
-/** @brief How many descriptors of one type a pool holds, like VkDescriptorPoolSize. */
+/** @brief How many descriptors of one type a pool holds. */
 typedef struct PvkDescriptorPoolSize {
     PvkDescriptorType type;            /**< The descriptor type. */
     uint32_t          descriptorCount; /**< Descriptors of that type the pool can hand out in total. */
@@ -1435,21 +1432,21 @@ typedef struct PvkDescriptorSetAllocateInfo {
  */
 PvkResult pvkAllocateDescriptorSets(PvkDevice device, const PvkDescriptorSetAllocateInfo *info, PvkDescriptorSet *sets);
 
-/** @brief The image and sampler a combined image sampler binding reads, like VkDescriptorImageInfo. */
+/** @brief The image and sampler a combined image sampler binding reads. */
 typedef struct PvkDescriptorImageInfo {
     PvkSampler   sampler;    /**< How the image is read (see @ref samplers). */
     PvkImageView imageView;  /**< A view of an image with PVK_IMAGE_USAGE_SAMPLED_BIT: a texture, a render target or a swapchain image. Its base level is what texture coordinates 0 to 1 cover. */
     PvkImage     colorTable; /**< For a PVK_FORMAT_T8 or PVK_FORMAT_T4 image, the color table its indices read (256 entries, or 16 for T4); NULL for other formats. */
 } PvkDescriptorImageInfo;
 
-/** @brief The part of a buffer a uniform buffer binding reads, like VkDescriptorBufferInfo. */
+/** @brief The part of a buffer a uniform buffer binding reads. */
 typedef struct PvkDescriptorBufferInfo {
     PvkBuffer buffer; /**< The buffer. */
     size_t    offset; /**< Byte offset of the block's first byte; a multiple of 16. */
     size_t    range;  /**< Bytes from offset the block may read, or PVK_WHOLE_SIZE; at least the shader's block size. */
 } PvkDescriptorBufferInfo;
 
-/** @brief One binding to fill in with pvkUpdateDescriptorSets(), like VkWriteDescriptorSet. */
+/** @brief One binding to fill in with pvkUpdateDescriptorSets(). */
 typedef struct PvkWriteDescriptorSet {
     PvkDescriptorSet               dstSet;         /**< The set to write. */
     uint32_t                       dstBinding;     /**< The binding number within it. */
@@ -1465,7 +1462,7 @@ typedef struct PvkWriteDescriptorSet {
  * what was bound when they were recorded, since the command buffer reads the
  * set at pvkCmdDraw() time. A uniform buffer's contents, though, are read by
  * DMA when the command buffer is submitted, so the values in the buffer at
- * submit time are what the draws see, as in Vulkan. The data is laid out as
+ * submit time are what the draws see. The data is laid out as
  * in the shader's block (std140): a mat4 is four 16-byte columns, a vec3 and
  * a float array element each take a 16-byte slot.
  *
@@ -1494,10 +1491,52 @@ typedef enum PvkAttachmentLoadOp {
     PVK_ATTACHMENT_LOAD_OP_DONT_CARE = 2  /**< Contents are undefined. */
 } PvkAttachmentLoadOp;
 
-/** @brief Parameters for pvkCreateCommandBuffer(). May be NULL. */
-typedef struct PvkCommandBufferCreateInfo {
-    uint32_t maxQwords; /**< Size of the recorded DMA chain in 16-byte qwords; 0 = 4096 (64 KB). */
-} PvkCommandBufferCreateInfo;
+/**
+ * @brief The memory command buffers are recorded into.
+ *
+ * A pool is one 64-byte-aligned block of main RAM. pvkBeginCommandBuffer()
+ * gives the command buffer the free space at the top of the block and
+ * pvkEndCommandBuffer() keeps only what was recorded, so command buffers of
+ * one pool are recorded one after another: a second pvkBeginCommandBuffer()
+ * while another of the pool's command buffers is recording fails.
+ * pvkResetCommandPool() frees every recording at once by rewinding the block;
+ * a command buffer recorded before the reset must be recorded again before it
+ * is submitted. Recording a command buffer a second time without a pool reset
+ * needs PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; its old recording's
+ * space is reused when it is the topmost, taken again from the top otherwise.
+ */
+typedef struct PvkCommandPool_T *PvkCommandPool;
+
+/** @brief Flags for PvkCommandPoolCreateInfo. */
+typedef enum PvkCommandPoolCreateFlagBits {
+    PVK_COMMAND_POOL_CREATE_TRANSIENT_BIT            = 1, /**< Command buffers are re-recorded often. Accepted, changes nothing. */
+    PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT = 2  /**< pvkBeginCommandBuffer() may be called again on a recorded command buffer without pvkResetCommandPool(). */
+} PvkCommandPoolCreateFlagBits;
+
+/** @brief Flags for pvkResetCommandPool(). */
+typedef enum PvkCommandPoolResetFlagBits {
+    PVK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT = 1 /**< Accepted, changes nothing: the block is never shrunk. */
+} PvkCommandPoolResetFlagBits;
+
+/**
+ * @brief Parameters for pvkCreateCommandPool(). No queueFamilyIndex: the device has one queue.
+ */
+typedef struct PvkCommandPoolCreateInfo {
+    uint32_t flags;     /**< PvkCommandPoolCreateFlagBits, or 0. */
+    uint32_t maxQwords; /**< Size of the block in 16-byte qwords, shared by all of the pool's recordings; 0 = 4096 (64 KB). */
+} PvkCommandPoolCreateInfo;
+
+/** @brief Kind of command buffer. */
+typedef enum PvkCommandBufferLevel {
+    PVK_COMMAND_BUFFER_LEVEL_PRIMARY = 0 /**< Submitted to a queue with pvkQueueSubmit(). */
+} PvkCommandBufferLevel;
+
+/** @brief Parameters for pvkAllocateCommandBuffers(). */
+typedef struct PvkCommandBufferAllocateInfo {
+    PvkCommandPool        commandPool;        /**< Pool the command buffers record into. */
+    PvkCommandBufferLevel level;              /**< PVK_COMMAND_BUFFER_LEVEL_PRIMARY. */
+    uint32_t              commandBufferCount; /**< Number of command buffers to allocate. */
+} PvkCommandBufferAllocateInfo;
 
 /** @brief A clear color. */
 typedef struct PvkClearColorValue {
@@ -1524,7 +1563,7 @@ typedef struct PvkRenderingAttachmentInfo {
 } PvkRenderingAttachmentInfo;
 
 /**
- * @brief Parameters for pvkCmdBeginRendering(), like Vulkan 1.3 dynamic rendering.
+ * @brief Parameters for pvkCmdBeginRendering().
  *
  * The depth attachment is optional (imageView NULL). When present it must be
  * as wide as the color attachment's level, since the GS gives both buffers one
@@ -1540,30 +1579,58 @@ typedef struct PvkRenderingInfo {
 } PvkRenderingInfo;
 
 /**
- * @brief Creates a command buffer.
+ * @brief Creates a command pool, allocating its block once.
  * @param device The device.
- * @param info Command buffer parameters, or NULL for the default size.
- * @param[out] cmd The new command buffer.
- * @return PVK_SUCCESS or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ * @param info Pool parameters, or NULL for no flags and the default size.
+ * @param[out] pool The new pool.
+ * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED or PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
-PvkResult pvkCreateCommandBuffer(PvkDevice device, const PvkCommandBufferCreateInfo *info, PvkCommandBuffer *cmd);
+PvkResult pvkCreateCommandPool(PvkDevice device, const PvkCommandPoolCreateInfo *info, PvkCommandPool *pool);
 
 /**
- * @brief Destroys a command buffer. It must not be in use by a submission.
+ * @brief Destroys a pool and every command buffer allocated from it. Waits for a submission still reading one of them.
  * @param device The device.
- * @param cmd Command buffer to destroy.
+ * @param pool Pool to destroy, or NULL.
  */
-void      pvkDestroyCommandBuffer(PvkDevice device, PvkCommandBuffer cmd);
+void      pvkDestroyCommandPool(PvkDevice device, PvkCommandPool pool);
 
 /**
- * @brief Starts recording, discarding anything recorded before.
+ * @brief Discards every recording in the pool; its command buffers stay allocated. Waits for a submission still reading one of them.
+ * @param device The device.
+ * @param pool The pool.
+ * @param flags PvkCommandPoolResetFlagBits, or 0.
+ * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if one of its command buffers is recording.
+ */
+PvkResult pvkResetCommandPool(PvkDevice device, PvkCommandPool pool, uint32_t flags);
+
+/**
+ * @brief Allocates command buffers from a pool. They hold no recording until pvkBeginCommandBuffer().
+ * @param device The device.
+ * @param info Pool, level and count.
+ * @param[out] cmds The new command buffers, info->commandBufferCount of them.
+ * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ */
+PvkResult pvkAllocateCommandBuffers(PvkDevice device, const PvkCommandBufferAllocateInfo *info, PvkCommandBuffer *cmds);
+
+/**
+ * @brief Frees command buffers back to their pool. Their space in the block comes back at the next pvkResetCommandPool().
+ * @param device The device.
+ * @param pool The pool they were allocated from.
+ * @param count Number of entries in cmds.
+ * @param cmds Command buffers to free; NULL entries are skipped. None may be in use by a submission.
+ */
+void      pvkFreeCommandBuffers(PvkDevice device, PvkCommandPool pool, uint32_t count, const PvkCommandBuffer *cmds);
+
+/**
+ * @brief Starts recording into the free space of the command buffer's pool, discarding anything recorded before.
  * @param cmd The command buffer.
- * @return PVK_SUCCESS.
+ * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if the pool is full, another of its command buffers is
+ * recording, or this one was recorded before without PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT or a pool reset.
  */
 PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd);
 
 /**
- * @brief Finishes recording.
+ * @brief Finishes recording; the space not used is given back to the pool.
  * @param cmd The command buffer.
  * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if any command failed to record.
  */
@@ -1597,7 +1664,7 @@ void pvkCmdEndRendering(PvkCommandBuffer cmd);
 void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline);
 
 /**
- * @brief Sets the viewport for the following draws with a pipeline that has PVK_DYNAMIC_STATE_VIEWPORT, like vkCmdSetViewport.
+ * @brief Sets the viewport for the following draws with a pipeline that has PVK_DYNAMIC_STATE_VIEWPORT.
  *
  * Pipelines without it keep their own viewport. The value stays set for the
  * rest of the command buffer, across pvkCmdBindPipeline(). The first draw
@@ -1613,7 +1680,7 @@ void pvkCmdSetViewport(PvkCommandBuffer cmd, uint32_t firstViewport, uint32_t vi
                        const PvkViewport *viewports);
 
 /**
- * @brief Sets the scissor rectangle for the following draws with a pipeline that has PVK_DYNAMIC_STATE_SCISSOR, like vkCmdSetScissor.
+ * @brief Sets the scissor rectangle for the following draws with a pipeline that has PVK_DYNAMIC_STATE_SCISSOR.
  *
  * Pixels outside the rectangle are not written. It is clipped to the
  * attachment level; a draw whose rectangle is empty after clipping draws
@@ -1628,7 +1695,7 @@ void pvkCmdSetViewport(PvkCommandBuffer cmd, uint32_t firstViewport, uint32_t vi
 void pvkCmdSetScissor(PvkCommandBuffer cmd, uint32_t firstScissor, uint32_t scissorCount, const PvkRect2D *scissors);
 
 /**
- * @brief Sets the blend constants for the following draws with a pipeline that has PVK_DYNAMIC_STATE_BLEND_CONSTANTS, like vkCmdSetBlendConstants.
+ * @brief Sets the blend constants for the following draws with a pipeline that has PVK_DYNAMIC_STATE_BLEND_CONSTANTS.
  *
  * Only blendConstants[3] has an effect, through the CONSTANT_ALPHA factors;
  * the GS has no constant color. The value stays set for the rest of the
@@ -1660,7 +1727,7 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_
                          uint32_t offset, uint32_t size, const void *data);
 
 /**
- * @brief Binds vertex buffers to bindings for the following draws, like vkCmdBindVertexBuffers.
+ * @brief Binds vertex buffers to bindings for the following draws.
  *
  * A draw reads binding b of its pipeline from buffers[b - firstBinding] at
  * offsets[b - firstBinding]. The vertices stream from the buffers into VU1
@@ -1699,7 +1766,7 @@ typedef enum PvkIndexType {
  */
 void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, PvkIndexType type);
 
-/** @brief A region copied by pvkCmdCopyBufferToImage() (like VkBufferImageCopy). */
+/** @brief A region copied by pvkCmdCopyBufferToImage(). */
 typedef struct PvkBufferImageCopy {
     size_t    bufferOffset; /**< Byte offset of the first pixel in the buffer; a multiple of 16. */
     uint32_t  mipLevel;     /**< Destination mip level, 0 for the base level; below the image's mipLevels. */
@@ -1748,7 +1815,7 @@ void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, ui
                               uint32_t setCount, const PvkDescriptorSet *sets);
 
 /**
- * @brief Draws vertices from the bound vertex buffers, like vkCmdDraw.
+ * @brief Draws vertices from the bound vertex buffers.
  *
  * Must be called between pvkCmdBeginRendering() and pvkCmdEndRendering(),
  * with a pipeline and its vertex buffers bound. The pipeline's
@@ -1770,7 +1837,7 @@ void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCou
                 uint32_t firstInstance);
 
 /**
- * @brief Draws vertices in the order the bound index buffer gives, like vkCmdDrawIndexed.
+ * @brief Draws vertices in the order the bound index buffer gives.
  *
  * Needs what pvkCmdDraw() needs plus an index buffer. The vertices a batch
  * refers to are sent to VU1 as one block, so index lists that stay local in
@@ -1815,7 +1882,8 @@ typedef struct PvkFenceCreateInfo {
  * @param cmd A command buffer that has finished recording.
  * @param fence Fence to signal when drawing finishes, or NULL.
  * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if the command buffer is
- *         still recording or failed to record.
+ *         still recording, failed to record, or holds no recording (never
+ *         recorded, or its pool was reset since).
  */
 PvkResult pvkQueueSubmit(PvkQueue queue, PvkCommandBuffer cmd, PvkFence fence);
 

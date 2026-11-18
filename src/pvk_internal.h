@@ -253,9 +253,24 @@ struct PvkPipeline_T {
     float    context[PVK_VU1_CONTEXT_QWORDS * 4] __attribute__((aligned(16)));
 };
 
+/* One block of EE RAM; recordings are stacked in it from the bottom. */
+struct PvkCommandPool_T {
+    PvkDevice  device;
+    uint32_t   flags;         /* PvkCommandPoolCreateFlagBits */
+    qword_t   *block;         /* 64-byte aligned */
+    uint32_t   qwords;        /* its size */
+    uint32_t   used;          /* qwords below the top of the stack */
+    PvkCommandBuffer recording; /* the command buffer open at the top, or NULL */
+    PvkCommandBuffer buffers; /* allocated from it, linked through `next` */
+};
+
 struct PvkCommandBuffer_T {
     PvkDevice   device;
-    packet2_t  *packet;       /* VIF1 DMA chain */
+    PvkCommandPool pool;
+    PvkCommandBuffer next;    /* next in pool->buffers */
+    uint32_t    start;        /* qword offset of its recording in pool->block */
+    uint32_t    size;         /* qwords recorded; 0 = holds no recording */
+    packet2_t   packet;       /* VIF1 DMA chain, inside the pool's block */
     PvkPipeline pipeline;
     PvkImageView colorView;   /* attachments of the current pvkCmdBeginRendering */
     PvkImageView depthView;   /* or NULL */
