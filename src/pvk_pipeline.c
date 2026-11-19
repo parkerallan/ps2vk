@@ -682,6 +682,9 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
         pvkDestroyPipeline(device, p);
         return res;
     }
+    /* Depth writes are ZBUF.ZMSK, set once per context by pvkCmdBeginRendering: no writes = context 2. */
+    if (p->zmsk)
+        p->prim |= PVK_PRIM_CTXT;
 
     ctx = p->context;
     pvk_viewport_context(&info->viewport, p->depthFormat, ctx);

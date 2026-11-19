@@ -1249,7 +1249,7 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     const PvkVertexInputAttribute *attributes;     /**< One per vertex shader input. */
     PvkPrimitiveTopology           topology;       /**< How the vertices of a draw are grouped into primitives. */
     PvkViewport                    viewport;       /**< Viewport, unless PVK_DYNAMIC_STATE_VIEWPORT is dynamic. */
-    PvkRect2D                      scissor;        /**< Pixels the draws may write, clipped to the attachment, unless PVK_DYNAMIC_STATE_SCISSOR is dynamic; a zero width or height means the whole attachment level. GS SCISSOR. */
+    PvkRect2D                      scissor;        /**< Pixels the draws may write, clipped to the attachment, unless PVK_DYNAMIC_STATE_SCISSOR is dynamic; a zero width or height means the whole attachment level, which a secondary command buffer recorded with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT does not know, so its draws need a real rectangle. GS SCISSOR. */
     PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none. Sets the depth range the viewport maps to. */
     PvkPipelineRasterizationStateCreateInfo rasterization; /**< Back-face culling. */
     PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth test and write control. */
@@ -1526,17 +1526,60 @@ typedef struct PvkCommandPoolCreateInfo {
     uint32_t maxQwords; /**< Size of the block in 16-byte qwords, shared by all of the pool's recordings; 0 = 4096 (64 KB). */
 } PvkCommandPoolCreateInfo;
 
-/** @brief Kind of command buffer. */
+/**
+ * @brief Level of a command buffer: primary or secondary.
+ *
+ * A primary command buffer is submitted to a queue with pvkQueueSubmit(). A
+ * secondary command buffer is never submitted; a primary runs it with
+ * pvkCmdExecuteCommands(), as many times as it likes, so work recorded once
+ * can be replayed every frame. On the PS2 the primary's DMA chain reaches the
+ * secondary's with a CALL tag and the secondary's ends in a RET tag, so
+ * nothing is copied.
+ *
+ * A secondary inherits no state from the primary: its pipeline, descriptor
+ * sets, vertex buffers and push constants are bound inside it. One recorded
+ * with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT draws into the
+ * attachments of the primary's pvkCmdBeginRendering(), knowing only their
+ * depth format from PvkCommandBufferInheritanceInfo, so its pipelines need a
+ * scissor rectangle: there is no attachment for a zero one to stand for.
+ */
 typedef enum PvkCommandBufferLevel {
-    PVK_COMMAND_BUFFER_LEVEL_PRIMARY = 0 /**< Submitted to a queue with pvkQueueSubmit(). */
+    PVK_COMMAND_BUFFER_LEVEL_PRIMARY   = 0, /**< Submitted to a queue with pvkQueueSubmit(). */
+    PVK_COMMAND_BUFFER_LEVEL_SECONDARY = 1  /**< Run from a primary command buffer with pvkCmdExecuteCommands(). */
 } PvkCommandBufferLevel;
 
 /** @brief Parameters for pvkAllocateCommandBuffers(). */
 typedef struct PvkCommandBufferAllocateInfo {
     PvkCommandPool        commandPool;        /**< Pool the command buffers record into. */
-    PvkCommandBufferLevel level;              /**< PVK_COMMAND_BUFFER_LEVEL_PRIMARY. */
+    PvkCommandBufferLevel level;              /**< Primary or secondary. */
     uint32_t              commandBufferCount; /**< Number of command buffers to allocate. */
 } PvkCommandBufferAllocateInfo;
+
+/** @brief Flags for PvkCommandBufferBeginInfo. */
+typedef enum PvkCommandBufferUsageFlagBits {
+    PVK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT      = 1, /**< The recording is submitted (or executed) once; a second use without recording again fails. */
+    PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT = 2, /**< A secondary command buffer that runs entirely inside the primary's pvkCmdBeginRendering() / pvkCmdEndRendering(). Ignored for a primary. */
+    PVK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT     = 4  /**< The command buffer may be pending more than once. Accepted, changes nothing: one submission runs at a time. */
+} PvkCommandBufferUsageFlagBits;
+
+/**
+ * @brief What a secondary command buffer inherits from the primary that runs it.
+ *
+ * No render pass, subpass, framebuffer or query fields: ps2vk renders with
+ * pvkCmdBeginRendering() alone and has no queries. The attachment formats are
+ * what a secondary recorded with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+ * knows about the images it draws into; the color format is not needed, since
+ * pipelines do not depend on it.
+ */
+typedef struct PvkCommandBufferInheritanceInfo {
+    PvkFormat depthAttachmentFormat; /**< Format of the depth attachment the primary renders with, or PVK_FORMAT_UNDEFINED for none. The pipelines bound inside must match it, as they match pvkCmdBeginRendering()'s. */
+} PvkCommandBufferInheritanceInfo;
+
+/** @brief Parameters for pvkBeginCommandBuffer(). */
+typedef struct PvkCommandBufferBeginInfo {
+    uint32_t                               flags;           /**< PvkCommandBufferUsageFlagBits ORed together; 0 turns none of them on. */
+    const PvkCommandBufferInheritanceInfo *inheritanceInfo; /**< For a secondary command buffer; ignored for a primary. */
+} PvkCommandBufferBeginInfo;
 
 /** @brief A clear color. */
 typedef struct PvkClearColorValue {
@@ -1562,6 +1605,11 @@ typedef struct PvkRenderingAttachmentInfo {
     PvkClearValue       clearValue; /**< Value used when loadOp is CLEAR. */
 } PvkRenderingAttachmentInfo;
 
+/** @brief Flags for PvkRenderingInfo. */
+typedef enum PvkRenderingFlagBits {
+    PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT = 1 /**< The drawing comes from secondary command buffers run with pvkCmdExecuteCommands(); draws recorded in the primary itself fail. */
+} PvkRenderingFlagBits;
+
 /**
  * @brief Parameters for pvkCmdBeginRendering().
  *
@@ -1573,6 +1621,7 @@ typedef struct PvkRenderingAttachmentInfo {
  * sampling draw includes a GS TEXFLUSH.
  */
 typedef struct PvkRenderingInfo {
+    uint32_t                   flags;           /**< PvkRenderingFlagBits ORed together; 0 turns none of them on, so the primary draws itself. */
     PvkRect2D                  renderArea;      /**< Area to render (and clear), in pixels of the attachment's level. */
     PvkRenderingAttachmentInfo colorAttachment; /**< The color image. */
     PvkRenderingAttachmentInfo depthAttachment; /**< The depth image, or imageView NULL for none. */
@@ -1623,18 +1672,46 @@ void      pvkFreeCommandBuffers(PvkDevice device, PvkCommandPool pool, uint32_t 
 
 /**
  * @brief Starts recording into the free space of the command buffer's pool, discarding anything recorded before.
+ *
+ * Recording a secondary command buffer again (or resetting its pool) leaves
+ * every primary that executed it unusable: pvkQueueSubmit() refuses such a
+ * primary until it is recorded again.
+ *
  * @param cmd The command buffer.
+ * @param info Usage flags and, for a secondary command buffer, what it inherits; NULL for no flags.
  * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if the pool is full, another of its command buffers is
- * recording, or this one was recorded before without PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT or a pool reset.
+ * recording, this one was recorded before without PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT or a pool
+ * reset, or a secondary command buffer has no inheritanceInfo.
  */
-PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd);
+PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBeginInfo *info);
 
 /**
  * @brief Finishes recording; the space not used is given back to the pool.
+ *
+ * A primary's chain ends with a GS FINISH and a DMA END tag, a secondary's
+ * with a DMA RET tag back to the primary that called it.
+ *
  * @param cmd The command buffer.
  * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if any command failed to record.
  */
 PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd);
+
+/**
+ * @brief Runs secondary command buffers from a primary one.
+ *
+ * Records a DMA CALL tag into each secondary's chain. Inside pvkCmdBeginRendering() /
+ * pvkCmdEndRendering() the rendering must have PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT
+ * and each secondary must have been recorded with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+ * and the attachments' depth format; outside, the secondaries must not have that bit. Afterwards the
+ * primary's bound pipeline, descriptor sets, vertex and index buffers, push constants and dynamic
+ * state are undefined, as in Vulkan: the secondary replaced the VU1 program, its memory and the GS
+ * registers, so bind them again before the primary's next draw.
+ *
+ * @param cmd A primary command buffer that is recording.
+ * @param count Number of entries in cmds.
+ * @param cmds Secondary command buffers that have finished recording, in the order they run.
+ */
+void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkCommandBuffer *cmds);
 
 /**
  * @brief Starts rendering into a color image and optionally a depth image, clearing them if requested.
@@ -1879,11 +1956,14 @@ typedef struct PvkFenceCreateInfo {
  * in flight, so this first waits for the previous one.
  *
  * @param queue The queue.
- * @param cmd A command buffer that has finished recording.
+ * @param cmd A primary command buffer that has finished recording.
  * @param fence Fence to signal when drawing finishes, or NULL.
  * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if the command buffer is
- *         still recording, failed to record, or holds no recording (never
- *         recorded, or its pool was reset since).
+ *         secondary, still recording, failed to record, holds no recording
+ *         (never recorded, or its pool was reset since), was recorded with
+ *         PVK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT and submitted before,
+ *         or executes a secondary command buffer that was recorded again or
+ *         lost its recording since.
  */
 PvkResult pvkQueueSubmit(PvkQueue queue, PvkCommandBuffer cmd, PvkFence fence);
 

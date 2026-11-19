@@ -349,6 +349,7 @@ int main(void)
     };
     CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
+    PvkCommandBufferBeginInfo beginInfo = { .flags = 0 };
 
     /* The target is square; the display is 4:3 whatever the pixel count. */
     mat_perspective(innerProj, 60.0f * 3.14159265f / 180.0f, 1.0f, 0.5f, 10.0f);
@@ -366,7 +367,7 @@ int main(void)
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
         CHECK(pvkResetCommandPool(device, commandPool, 0));
-        CHECK(pvkBeginCommandBuffer(cmd));
+        CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
 
         /* Pass 1: the inner cube into the texture. */
         PvkRenderingInfo toTexture = {

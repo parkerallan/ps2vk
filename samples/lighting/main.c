@@ -403,9 +403,10 @@ int main(void)
     };
     CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
+    PvkCommandBufferBeginInfo beginInfo = { .flags = 0 };
 
     /* Upload the ramp once, outside rendering, and wait for it. */
-    CHECK(pvkBeginCommandBuffer(cmd));
+    CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
     PvkBufferImageCopy copy = { .bufferOffset = 0, .rect = { 0, 0, RAMP_WIDTH, RAMP_HEIGHT } };
     pvkCmdCopyBufferToImage(cmd, rampBuffer, ramp, &copy);
     CHECK(pvkEndCommandBuffer(cmd));
@@ -432,7 +433,7 @@ int main(void)
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
         CHECK(pvkResetCommandPool(device, commandPool, 0));
-        CHECK(pvkBeginCommandBuffer(cmd));
+        CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },
             .colorAttachment = {

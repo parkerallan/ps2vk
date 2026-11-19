@@ -23,6 +23,12 @@ void pvk_queue_wait_idle(PvkQueue queue)
 
 PvkResult pvkQueueSubmit(PvkQueue queue, PvkCommandBuffer cmd, PvkFence fence)
 {
+    uint32_t i;
+
+    if (cmd->level != PVK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+        pvk_error("pvkQueueSubmit: a secondary command buffer runs through pvkCmdExecuteCommands\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     if (cmd->recording) {
         pvk_error("pvkQueueSubmit: command buffer is still recording\n");
         return PVK_ERROR_VALIDATION_FAILED;
@@ -35,6 +41,21 @@ PvkResult pvkQueueSubmit(PvkQueue queue, PvkCommandBuffer cmd, PvkFence fence)
         pvk_error("pvkQueueSubmit: command buffer holds no recording\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
+    if (cmd->usage & PVK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT && cmd->used) {
+        pvk_error("pvkQueueSubmit: command buffer was recorded with PVK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT "
+                  "and submitted already\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    /* The CALL tags point at the secondaries' recordings as they were. */
+    for (i = 0; i < cmd->executedCount; i++) {
+        const struct PvkExecuted *e = &cmd->executed[i];
+        if (e->cmd->generation != e->generation || !e->cmd->size) {
+            pvk_error("pvkQueueSubmit: a secondary command buffer it executes was recorded again or lost its "
+                      "recording; record the primary again\n");
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+    }
+    cmd->used = 1;
 
     pvk_queue_wait_idle(queue);
 

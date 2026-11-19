@@ -89,6 +89,7 @@ void pvkDestroyCommandPool(PvkDevice device, PvkCommandPool pool)
     pvk_queue_wait_idle(&device->queue);
     for (cmd = pool->buffers; cmd; cmd = next) {
         next = cmd->next;
+        free(cmd->executed);
         free(cmd);
     }
     free(pool->block);
@@ -116,8 +117,8 @@ PvkResult pvkAllocateCommandBuffers(PvkDevice device, const PvkCommandBufferAllo
     PvkCommandPool pool = info->commandPool;
     uint32_t i;
 
-    if (info->level != PVK_COMMAND_BUFFER_LEVEL_PRIMARY) {
-        pvk_error("pvkAllocateCommandBuffers: level %d; only PVK_COMMAND_BUFFER_LEVEL_PRIMARY exists\n", (int)info->level);
+    if (info->level != PVK_COMMAND_BUFFER_LEVEL_PRIMARY && info->level != PVK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+        pvk_error("pvkAllocateCommandBuffers: level %d is not primary or secondary\n", (int)info->level);
         return PVK_ERROR_VALIDATION_FAILED;
     }
 
@@ -129,6 +130,7 @@ PvkResult pvkAllocateCommandBuffers(PvkDevice device, const PvkCommandBufferAllo
         }
         cb->device = device;
         cb->pool   = pool;
+        cb->level  = info->level;
         cb->next   = pool->buffers;
         pool->buffers = cb;
         cmds[i] = cb;
@@ -158,14 +160,40 @@ void pvkFreeCommandBuffers(PvkDevice device, PvkCommandPool pool, uint32_t count
                 break;
             }
         }
+        free(cmd->executed);
         free(cmd);
     }
 }
 
-PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
+/* Forget the bound pipeline, sets, buffers, push constants and dynamic state:
+ * at the start of a recording, and after pvkCmdExecuteCommands. */
+static void cmd_reset_state(PvkCommandBuffer cmd)
+{
+    cmd->pipeline     = NULL;
+    cmd->gsStateDirty = 0;
+    cmd->uniformsDirty = 0;
+    memset(cmd->sets, 0, sizeof(cmd->sets));
+    memset(cmd->vertexBuffers, 0, sizeof(cmd->vertexBuffers));
+    memset(cmd->vertexOffsets, 0, sizeof(cmd->vertexOffsets));
+    cmd->indexBuffer  = NULL;
+    cmd->indexOffset  = 0;
+    cmd->pushSet      = 0;
+    memset(&cmd->pushLayout, 0, sizeof(cmd->pushLayout));
+    cmd->dynamicSet   = 0;
+    cmd->viewportDirty = 0;
+}
+
+static int is_depth_format(PvkFormat format)
+{
+    return format == PVK_FORMAT_Z32 || format == PVK_FORMAT_Z24 || format == PVK_FORMAT_Z16;
+}
+
+PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBeginInfo *info)
 {
     PvkCommandPool pool = cmd->pool;
-    uint32_t room;
+    uint32_t room, flags = info ? info->flags : 0;
+    int secondary = cmd->level == PVK_COMMAND_BUFFER_LEVEL_SECONDARY;
+    const PvkCommandBufferInheritanceInfo *inherit = info && secondary ? info->inheritanceInfo : NULL;
 
     if (cmd->recording) {
         pvk_error("pvkBeginCommandBuffer: already recording\n");
@@ -173,6 +201,19 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
     }
     if (pool->recording) {
         pvk_error("pvkBeginCommandBuffer: another command buffer of the pool is recording\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (flags & ~(PVK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+                  | PVK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)) {
+        pvk_error("pvkBeginCommandBuffer: unknown flags 0x%x\n", (unsigned)flags);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (secondary && !inherit) {
+        pvk_error("pvkBeginCommandBuffer: a secondary command buffer needs inheritanceInfo\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (inherit && inherit->depthAttachmentFormat != PVK_FORMAT_UNDEFINED && !is_depth_format(inherit->depthAttachmentFormat)) {
+        pvk_error("pvkBeginCommandBuffer: inheritanceInfo->depthAttachmentFormat must be a depth format or PVK_FORMAT_UNDEFINED\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
     if (cmd->size) {
@@ -207,21 +248,18 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd)
     cmd->packet.vif_code_opened_at = NULL;
     pool->recording = cmd;
 
-    cmd->pipeline     = NULL;
+    cmd_reset_state(cmd);
+    cmd->generation++;
+    cmd->usage        = flags;
+    cmd->used         = 0;
+    cmd->executedCount = 0;
     cmd->colorView    = NULL;
     cmd->depthView    = NULL;
-    cmd->gsStateDirty = 0;
-    cmd->uniformsDirty = 0;
-    memset(cmd->sets, 0, sizeof(cmd->sets));
-    memset(cmd->vertexBuffers, 0, sizeof(cmd->vertexBuffers));
-    memset(cmd->vertexOffsets, 0, sizeof(cmd->vertexOffsets));
-    cmd->indexBuffer  = NULL;
-    cmd->indexOffset  = 0;
-    cmd->pushSet      = 0;
-    memset(&cmd->pushLayout, 0, sizeof(cmd->pushLayout));
-    cmd->dynamicSet   = 0;
-    cmd->viewportDirty = 0;
-    cmd->rendering    = 0;
+    /* Inside the primary's rendering from the first command on. */
+    cmd->inherits     = secondary && (flags & PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);
+    cmd->inheritedDepthFormat = inherit ? inherit->depthAttachmentFormat : PVK_FORMAT_UNDEFINED;
+    cmd->secondaryContents = 0;
+    cmd->rendering    = cmd->inherits;
     cmd->failed       = 0;
     cmd->recording    = 1;
     return PVK_SUCCESS;
@@ -231,13 +269,21 @@ PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd)
 {
     qword_t *q;
 
-    if (cmd->rendering) {
+    if (cmd->rendering && !cmd->inherits) {
         pvk_error("pvkEndCommandBuffer inside pvkCmdBeginRendering/pvkCmdEndRendering\n");
         cmd->failed = 1;
     }
 
-    /* GS FINISH after all drawing, so the fence can tell when the GS is done. */
-    if (cmd_reserve(cmd, 5)) {
+    if (cmd->level == PVK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+        /* Back to the primary's chain after the CALL tag that came here. */
+        if (cmd_reserve(cmd, 1)) {
+            packet2_chain_ret(&cmd->packet, 0, 0);
+            packet2_vif_nop(&cmd->packet, 0);
+            packet2_vif_nop(&cmd->packet, 0);
+            packet2_chain_close_tag(&cmd->packet);
+        }
+    } else if (cmd_reserve(cmd, 5)) {
+        /* GS FINISH after all drawing, so the fence can tell when the GS is done. */
         q = cmd_open_direct(cmd);
         q = draw_finish(q);
         cmd_close_direct(cmd, q);
@@ -261,11 +307,6 @@ static int gs_zsm(PvkFormat format)
     case PVK_FORMAT_Z24: return GS_ZBUF_24;
     default:             return GS_ZBUF_32;
     }
-}
-
-static int is_depth_format(PvkFormat format)
-{
-    return format == PVK_FORMAT_Z32 || format == PVK_FORMAT_Z24 || format == PVK_FORMAT_Z16;
 }
 
 /* Vulkan depth 0..1 to the flipped integer the depth buffer stores. */
@@ -345,6 +386,18 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
     zbuffer_t z = { 0 };
     qword_t *q;
 
+    if (cmd->rendering) {
+        pvk_error("pvkCmdBeginRendering: already rendering%s\n", cmd->inherits
+                  ? " (a secondary command buffer recorded with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT "
+                    "is inside the primary's)" : "");
+        cmd->failed = 1;
+        return;
+    }
+    if (info->flags & ~PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) {
+        pvk_error("pvkCmdBeginRendering: unknown flags 0x%x\n", (unsigned)info->flags);
+        cmd->failed = 1;
+        return;
+    }
     if (!colorView || !(colorView->image->usage & PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || colorView->levels != 1) {
         pvk_error("pvkCmdBeginRendering: the color attachment must be a one-level view of a swapchain image or "
                   "an image created with PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT\n");
@@ -367,10 +420,12 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
         }
     }
 
-    if (!cmd_reserve(cmd, 28 + (clearColor || clearDepth ? 5 + 2 * clear_strips(&info->renderArea) : 0)))
+    if (!cmd_reserve(cmd, 48 + (clearColor || clearDepth ? 5 + 2 * clear_strips(&info->renderArea) : 0)))
         return;
 
-    /* ZBUF for the environment; the test and write mask come from the pipeline at draw time. */
+    /* Both GS register sets point at the attachments: context 1 writes depth,
+     * context 2 (ZBUF_2.ZMSK = 1) does not. A pipeline picks one with PRIM.CTXT,
+     * so draws never write FRAME or ZBUF and need not know the addresses. */
     z.enable  = depthImage != NULL;
     z.method  = ZTEST_METHOD_ALLPASS;
     z.address = depthImage ? depthImage->fb.address : 0;
@@ -378,14 +433,23 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
     z.mask    = 1;
 
     q = cmd_open_direct(cmd);
+    q = draw_setup_environment(q, 1, &fb, &z);
+    q = draw_primitive_xyoffset(q, 1, PVK_GS_ORIGIN, PVK_GS_ORIGIN);
+    z.mask    = depthImage ? 0 : 1;
     q = draw_setup_environment(q, 0, &fb, &z);
     q = draw_primitive_xyoffset(q, 0, PVK_GS_ORIGIN, PVK_GS_ORIGIN);
-    if (clearColor || clearDepth)
+    if (clearColor || clearDepth) {
         q = cmd_clear(q, info, &fb, depthImage, clearColor, clearDepth);
+        /* The clear masked FRAME_1/ZBUF_1; restore context 1. */
+        q = gs_ad(q, GIF_SET_TAG(2, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+        q = gs_ad(q, GS_SET_FRAME(fb.address >> 11, fb.width >> 6, fb.psm, 0), GS_REG_FRAME_1);
+        q = gs_ad(q, GS_SET_ZBUF(z.address >> 11, z.zsm, z.mask), GS_REG_ZBUF_1);
+    }
     cmd_close_direct(cmd, q);
 
     cmd->colorView    = colorView;
     cmd->depthView    = depthView;
+    cmd->secondaryContents = (info->flags & PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) != 0;
     cmd->gsStateDirty = 1;
     cmd->rendering    = 1;
 }
@@ -394,13 +458,20 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 #define PVK_GS_STATE_QWORDS 16
 
 /* The scissor the draws use (the pipeline's, or the command buffer's when dynamic),
- * clipped to the attachment level. Returns 0 when nothing is left. */
-static int cmd_scissor(PvkCommandBuffer cmd, const framebuffer_t *fb, PvkRect2D *out)
+ * clipped to the attachment level, or to the GS's 2048x2048 when the attachment
+ * is the primary's and unknown. Returns 0 when nothing is left. */
+static int cmd_scissor(PvkCommandBuffer cmd, const framebuffer_t *fb, const char *name, PvkRect2D *out)
 {
     const PvkPipeline p = cmd->pipeline;
     const PvkRect2D *r = p->dynamic & (1u << PVK_DYNAMIC_STATE_SCISSOR) ? &cmd->scissor : &p->scissor;
-    int32_t x0 = 0, y0 = 0, x1 = (int32_t)fb->width, y1 = (int32_t)fb->height;
+    int32_t x0 = 0, y0 = 0, x1 = fb ? (int32_t)fb->width : 2048, y1 = fb ? (int32_t)fb->height : 2048;
 
+    if (!fb && !(r->width && r->height)) {
+        pvk_error("%s: a secondary command buffer recorded with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT "
+                  "does not know the attachment; the pipeline's scissor (or pvkCmdSetScissor) must give a rectangle\n", name);
+        cmd->failed = 1;
+        return 0;
+    }
     if (r->width && r->height) {
         if (r->x > x0) x0 = r->x;
         if (r->y > y0) y0 = r->y;
@@ -414,19 +485,18 @@ static int cmd_scissor(PvkCommandBuffer cmd, const framebuffer_t *fb, PvkRect2D 
     return out->width && out->height;
 }
 
-/* FRAME, ZBUF, TEST, ALPHA and SCISSOR for drawing with the bound pipeline into the current
- * attachments, plus TEX0, TEXA, TEX1, CLAMP and the MIPTBPs for the image and sampler
+/* TEST, ALPHA and SCISSOR for drawing with the bound pipeline, in the GS context its
+ * PRIM.CTXT picks, plus TEX0, TEXA, TEX1, CLAMP and the MIPTBPs for the image and sampler
  * in the bound descriptor set when the pipeline samples one. Sent before the first draw
  * after pvkCmdBeginRendering, pvkCmdBindPipeline, pvkCmdBindDescriptorSets or a dynamic
- * scissor or blend constant change. */
-static void cmd_gs_state(PvkCommandBuffer cmd, const framebuffer_t *fb, const PvkRect2D *scissor)
+ * scissor or blend constant change. FRAME and ZBUF stay as pvkCmdBeginRendering set them. */
+static void cmd_gs_state(PvkCommandBuffer cmd, const PvkRect2D *scissor)
 {
-    const PvkImage depth = cmd->depthView ? cmd->depthView->image : NULL;
     const PvkPipeline p = cmd->pipeline;
     int textured = p->fs->textured;
     const struct PvkDescriptorSlot *slot = textured ? &cmd->sets[p->samplerSet]->slots[p->samplerSlot] : NULL;
     int mipmapped = textured && slot->view->levels > 1;
-    u64 alpha = p->alpha;
+    u64 alpha = p->alpha, ctxt = p->zmsk;
     qword_t *q;
 
     if (p->blendFix && p->dynamic & (1u << PVK_DYNAMIC_STATE_BLEND_CONSTANTS)) {
@@ -436,15 +506,12 @@ static void cmd_gs_state(PvkCommandBuffer cmd, const framebuffer_t *fb, const Pv
     }
 
     q = cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 12 : 10) : 5, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, 0), GS_REG_FRAME);
-    q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
-                             depth ? p->zmsk : 1), GS_REG_ZBUF);
+    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 10 : 8) : 3, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     /* No alpha test (Vulkan has none); depth test from the pipeline. */
-    q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST);
-    q = gs_ad(q, alpha, GS_REG_ALPHA);
+    q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST_1 + ctxt);
+    q = gs_ad(q, alpha, GS_REG_ALPHA_1 + ctxt);
     q = gs_ad(q, GS_SET_SCISSOR(scissor->x, scissor->x + (int32_t)scissor->width - 1,
-                                scissor->y, scissor->y + (int32_t)scissor->height - 1), GS_REG_SCISSOR);
+                                scissor->y, scissor->y + (int32_t)scissor->height - 1), GS_REG_SCISSOR_1 + ctxt);
     if (textured) {
         const PvkImageView v = slot->view;
         const PvkImage t = v->image, c = slot->colorTable;
@@ -460,14 +527,14 @@ static void cmd_gs_state(PvkCommandBuffer cmd, const framebuffer_t *fb, const Pv
          * shader, filters, levels and LOD from the sampler: LOD = log2(w) + K (L = 0). */
         q = gs_ad(q, GS_SET_TEX0(a[0] >> 6, w[0], t->fb.psm, t->tw - base, t->th - base, TEXTURE_COMPONENTS_RGBA,
                                  p->fs->textureFunction, c ? c->fb.address >> 6 : 0, c ? c->fb.psm : 0, 0, 0,
-                                 c ? 1 : 0), GS_REG_TEX0);
+                                 c ? 1 : 0), GS_REG_TEX0_1 + ctxt);
         /* TEXA: CT24 reads opaque, a set CT16 alpha bit is 0x80. */
         q = gs_ad(q, GS_SET_TEXA(t->format == PVK_FORMAT_CT24 ? 0x80 : 0, 0, 0x80), GS_REG_TEXA);
-        q = gs_ad(q, GS_SET_TEX1(LOD_FORMULAIC, mxl, s->mmag, mxl ? s->mmip : s->mmin, 0, 0, s->k), GS_REG_TEX1);
-        q = gs_ad(q, GS_SET_CLAMP(s->wms, s->wmt, 0, 0, 0, 0), GS_REG_CLAMP);
+        q = gs_ad(q, GS_SET_TEX1(LOD_FORMULAIC, mxl, s->mmag, mxl ? s->mmip : s->mmin, 0, 0, s->k), GS_REG_TEX1_1 + ctxt);
+        q = gs_ad(q, GS_SET_CLAMP(s->wms, s->wmt, 0, 0, 0, 0), GS_REG_CLAMP_1 + ctxt);
         if (mipmapped) {
-            q = gs_ad(q, GS_SET_MIPTBP1(a[1] >> 6, w[1], a[2] >> 6, w[2], a[3] >> 6, w[3]), GS_REG_MIPTBP1);
-            q = gs_ad(q, GS_SET_MIPTBP2(a[4] >> 6, w[4], a[5] >> 6, w[5], a[6] >> 6, w[6]), GS_REG_MIPTBP2);
+            q = gs_ad(q, GS_SET_MIPTBP1(a[1] >> 6, w[1], a[2] >> 6, w[2], a[3] >> 6, w[3]), GS_REG_MIPTBP1_1 + ctxt);
+            q = gs_ad(q, GS_SET_MIPTBP2(a[4] >> 6, w[4], a[5] >> 6, w[5], a[6] >> 6, w[6]), GS_REG_MIPTBP2_1 + ctxt);
         }
         /* The texture cache may hold texels from before an upload or a render into it. */
         q = gs_ad(q, GS_SET_TEXFLUSH(0), GS_REG_TEXFLUSH);
@@ -639,7 +706,101 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
 
 void pvkCmdEndRendering(PvkCommandBuffer cmd)
 {
+    if (cmd->inherits) {
+        pvk_error("pvkCmdEndRendering in a secondary command buffer recorded with "
+                  "PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT: the primary ends the rendering\n");
+        cmd->failed = 1;
+        return;
+    }
     cmd->rendering = 0;
+    cmd->secondaryContents = 0;
+}
+
+void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkCommandBuffer *cmds)
+{
+    PvkFormat depthFormat = cmd->depthView ? cmd->depthView->image->format : PVK_FORMAT_UNDEFINED;
+    uint32_t i;
+
+    if (cmd->level != PVK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+        pvk_error("pvkCmdExecuteCommands: only a primary command buffer runs secondary ones\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (cmd->rendering && !cmd->secondaryContents) {
+        pvk_error("pvkCmdExecuteCommands inside a rendering begun without "
+                  "PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT\n");
+        cmd->failed = 1;
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        PvkCommandBuffer s = cmds[i];
+
+        if (!s || s->level != PVK_COMMAND_BUFFER_LEVEL_SECONDARY || s->device != cmd->device) {
+            pvk_error("pvkCmdExecuteCommands: entry %u is not a secondary command buffer of the device\n", (unsigned)i);
+            cmd->failed = 1;
+            return;
+        }
+        if (s->recording || s->failed || !s->size) {
+            pvk_error("pvkCmdExecuteCommands: entry %u is %s\n", (unsigned)i,
+                      s->recording ? "still recording" : s->failed ? "a failed recording" : "not recorded");
+            cmd->failed = 1;
+            return;
+        }
+        if (s->inherits != cmd->rendering) {
+            pvk_error("pvkCmdExecuteCommands: entry %u was recorded %s PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT "
+                      "but runs %s pvkCmdBeginRendering/pvkCmdEndRendering\n", (unsigned)i,
+                      cmd->rendering ? "without" : "with", cmd->rendering ? "inside" : "outside");
+            cmd->failed = 1;
+            return;
+        }
+        if (s->inherits && s->inheritedDepthFormat != depthFormat) {
+            pvk_error("pvkCmdExecuteCommands: entry %u inherits depth format %d, but the rendering's depth attachment is %d\n",
+                      (unsigned)i, (int)s->inheritedDepthFormat, (int)depthFormat);
+            cmd->failed = 1;
+            return;
+        }
+        if (s->usage & PVK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT && s->used) {
+            pvk_error("pvkCmdExecuteCommands: entry %u was recorded with PVK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT "
+                      "and has run already\n", (unsigned)i);
+            cmd->failed = 1;
+            return;
+        }
+    }
+    if (cmd->executedCount + count > cmd->executedCap) {
+        uint32_t cap = cmd->executedCap ? cmd->executedCap * 2 : 8;
+        struct PvkExecuted *e;
+
+        while (cap < cmd->executedCount + count)
+            cap *= 2;
+        e = realloc(cmd->executed, cap * sizeof(*e));
+        if (!e) {
+            pvk_error("pvkCmdExecuteCommands: out of memory\n");
+            cmd->failed = 1;
+            return;
+        }
+        cmd->executed    = e;
+        cmd->executedCap = cap;
+    }
+    if (!cmd_reserve(cmd, count))
+        return;
+
+    /* A CALL tag per secondary: the DMA runs its chain and its RET tag comes back here. */
+    for (i = 0; i < count; i++) {
+        PvkCommandBuffer s = cmds[i];
+
+        packet2_chain_call(&cmd->packet, s->pool->block + s->start, 0, 0, 0);
+        packet2_vif_nop(&cmd->packet, 0);
+        packet2_vif_nop(&cmd->packet, 0);
+        packet2_chain_close_tag(&cmd->packet);
+        s->used = 1;
+        cmd->executed[cmd->executedCount].cmd        = s;
+        cmd->executed[cmd->executedCount].generation = s->generation;
+        cmd->executedCount++;
+    }
+
+    /* The secondaries replaced the VU1 program and memory and the GS draw
+     * registers; as in Vulkan, the primary's state is undefined from here. */
+    cmd_reset_state(cmd);
 }
 
 void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
@@ -877,9 +1038,17 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
     uint32_t b, missing;
     framebuffer_t fb;
     PvkRect2D scissor;
+    PvkFormat depthFormat = cmd->inherits ? cmd->inheritedDepthFormat
+                          : cmd->depthView ? cmd->depthView->image->format : PVK_FORMAT_UNDEFINED;
 
     if (!cmd->rendering || !p) {
         pvk_error("%s needs pvkCmdBeginRendering and a pipeline\n", name);
+        cmd->failed = 1;
+        return 0;
+    }
+    if (cmd->secondaryContents) {
+        pvk_error("%s in a rendering begun with PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT: "
+                  "its draws come from pvkCmdExecuteCommands\n", name);
         cmd->failed = 1;
         return 0;
     }
@@ -899,10 +1068,10 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         cmd->failed = 1;
         return 0;
     }
-    if (p->depthFormat != (cmd->depthView ? cmd->depthView->image->format : PVK_FORMAT_UNDEFINED)) {
+    if (p->depthFormat != depthFormat) {
         pvk_error("%s: the pipeline's depthAttachmentFormat (%d) does not match the depth "
-                  "attachment of pvkCmdBeginRendering (%d)\n", name, (int)p->depthFormat,
-                  cmd->depthView ? (int)cmd->depthView->image->format : (int)PVK_FORMAT_UNDEFINED);
+                  "attachment of %s (%d)\n", name, (int)p->depthFormat,
+                  cmd->inherits ? "inheritanceInfo" : "pvkCmdBeginRendering", (int)depthFormat);
         cmd->failed = 1;
         return 0;
     }
@@ -940,13 +1109,14 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         cmd->viewportDirty = 0;
     }
 
-    pvk_view_framebuffer(cmd->colorView, &fb);
-    if (!cmd_scissor(cmd, &fb, &scissor))
+    if (!cmd->inherits)
+        pvk_view_framebuffer(cmd->colorView, &fb);
+    if (!cmd_scissor(cmd, cmd->inherits ? NULL : &fb, name, &scissor))
         return 0; /* nothing may be written */
     if (cmd->gsStateDirty) {
         if (!cmd_reserve(cmd, PVK_GS_STATE_QWORDS))
             return 0;
-        cmd_gs_state(cmd, &fb, &scissor);
+        cmd_gs_state(cmd, &scissor);
     }
     return !p->cullAll; /* FRONT_AND_BACK: every triangle is discarded, so nothing to send */
 }

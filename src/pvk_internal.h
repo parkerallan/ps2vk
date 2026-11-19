@@ -166,6 +166,8 @@ struct PvkSampler_T {
 
 /* PRIM.FST, ORed into a pipeline's prim for a draw with such a sampler. */
 #define PVK_PRIM_FST (1ULL << 8)
+/* PRIM.CTXT: the draw uses the GS's second register set (FRAME_2, ZBUF_2, TEST_2, ...). */
+#define PVK_PRIM_CTXT (1ULL << 9)
 
 /* What one bindings[] slot of a set holds: an image and sampler for a combined
  * image sampler, a buffer range for a uniform buffer. All NULL until written. */
@@ -242,10 +244,10 @@ struct PvkPipeline_T {
     int      strip;           /* a triangle strip: the winding flips every triangle */
     float    cullSign;        /* VU1 culls a triangle when its signed area * cullSign < 0; 0 = no culling */
     int      cullAll;         /* FRONT_AND_BACK on triangles: draws are skipped */
-    u64      prim;            /* GS PRIM value for the GIF tag */
+    u64      prim;            /* GS PRIM value for the GIF tag; CTXT = zmsk */
     PvkFormat depthFormat;    /* depth attachment it draws with, or UNDEFINED */
     uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */
-    uint32_t zmsk;            /* GS ZBUF.ZMSK: 1 = no depth writes */
+    uint32_t zmsk;            /* GS context it draws in: 2 (ZBUF_2.ZMSK = 1) when it writes no depth, else 1 */
     u64      alpha;           /* GS ALPHA */
     int      blendFix;        /* ALPHA.C = FIX: the blend constants' alpha */
     uint32_t dynamic;         /* 1 << PvkDynamicState for each state set while recording */
@@ -264,17 +266,32 @@ struct PvkCommandPool_T {
     PvkCommandBuffer buffers; /* allocated from it, linked through `next` */
 };
 
+/* A secondary command buffer a primary calls, and which of its recordings. */
+struct PvkExecuted {
+    PvkCommandBuffer cmd;
+    uint32_t         generation;
+};
+
 struct PvkCommandBuffer_T {
     PvkDevice   device;
     PvkCommandPool pool;
     PvkCommandBuffer next;    /* next in pool->buffers */
+    PvkCommandBufferLevel level;
     uint32_t    start;        /* qword offset of its recording in pool->block */
     uint32_t    size;         /* qwords recorded; 0 = holds no recording */
+    uint32_t    generation;   /* counts its recordings */
+    uint32_t    usage;        /* PvkCommandBufferUsageFlagBits of the recording */
+    int         used;         /* submitted or executed since it was recorded */
+    struct PvkExecuted *executed; /* the secondaries a primary calls, checked at submit */
+    uint32_t    executedCount, executedCap;
     packet2_t   packet;       /* VIF1 DMA chain, inside the pool's block */
     PvkPipeline pipeline;
-    PvkImageView colorView;   /* attachments of the current pvkCmdBeginRendering */
+    PvkImageView colorView;   /* attachments of the current pvkCmdBeginRendering; NULL when inherited */
     PvkImageView depthView;   /* or NULL */
-    int         gsStateDirty; /* FRAME/ZBUF/TEST/TEX0 must be re-sent before the next draw */
+    int         inherits;     /* a secondary with RENDER_PASS_CONTINUE: draws into the primary's attachments */
+    PvkFormat   inheritedDepthFormat;
+    int         secondaryContents; /* the rendering takes its draws from pvkCmdExecuteCommands only */
+    int         gsStateDirty; /* TEST/ALPHA/SCISSOR/TEX0 must be re-sent before the next draw */
     int         uniformsDirty; /* the uniform blocks' buffers must be sent to VU1 before the next draw */
     PvkDescriptorSet sets[PVK_MAX_DESCRIPTOR_SETS]; /* bound with pvkCmdBindDescriptorSets, or NULL */
     PvkBuffer   vertexBuffers[PVK_MAX_VERTEX_BINDINGS]; /* bound with pvkCmdBindVertexBuffers, or NULL */

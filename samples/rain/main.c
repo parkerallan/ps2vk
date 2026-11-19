@@ -287,7 +287,7 @@ int main(void)
     PvkPipelineLayout layout;
     PvkPipeline skyPipe, starPipe, moonPipe, ripplePipe, rainPipe, splashPipe;
     PvkCommandPool commandPool;
-    PvkCommandBuffer cmd;
+    PvkCommandBuffer cmd, backdrop;
     PvkFence fence;
     void *mapped;
 
@@ -346,6 +346,7 @@ int main(void)
         .attributeCount = 2,
         .attributes     = attributes,
         .viewport       = { 0.0f, 0.0f, WIDTH, HEIGHT, 0.0f, 1.0f },
+        .scissor        = { 0, 0, WIDTH, HEIGHT },
     };
     CHECK(make_pipeline(device, &pipelineInfo, PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, BLEND_NONE,  &skyPipe));
     CHECK(make_pipeline(device, &pipelineInfo, PVK_PRIMITIVE_TOPOLOGY_POINT_LIST,     BLEND_ADD,   &starPipe));
@@ -354,13 +355,32 @@ int main(void)
     CHECK(make_pipeline(device, &pipelineInfo, PVK_PRIMITIVE_TOPOLOGY_LINE_LIST,      BLEND_ADD,   &rainPipe));
     CHECK(make_pipeline(device, &pipelineInfo, PVK_PRIMITIVE_TOPOLOGY_SPRITE_LIST,    BLEND_ADD,   &splashPipe));
 
-    PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0 };
+    PvkCommandPoolCreateInfo commandPoolInfo = { .flags = PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT };
     CHECK(pvkCreateCommandPool(device, &commandPoolInfo, &commandPool));
     PvkCommandBufferAllocateInfo cmdInfo = {
         .commandPool = commandPool, .level = PVK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
     };
     CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
+    PvkCommandBufferBeginInfo beginInfo = { .flags = 0 };
+
+    /* The backdrop, recorded once. */
+    PvkCommandBufferAllocateInfo backdropInfo = {
+        .commandPool = commandPool, .level = PVK_COMMAND_BUFFER_LEVEL_SECONDARY, .commandBufferCount = 1,
+    };
+    CHECK(pvkAllocateCommandBuffers(device, &backdropInfo, &backdrop));
+    PvkCommandBufferInheritanceInfo inheritance = { .depthAttachmentFormat = PVK_FORMAT_UNDEFINED };
+    PvkCommandBufferBeginInfo backdropBegin = {
+        .flags = PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, .inheritanceInfo = &inheritance,
+    };
+    CHECK(pvkBeginCommandBuffer(backdrop, &backdropBegin));
+    pvkCmdBindVertexBuffers(backdrop, 0, 1, &vertexBuffer, &noOffset);
+    pvkCmdBindPipeline(backdrop, skyPipe);
+    pvkCmdDraw(backdrop, SKY_VERTS, 1, SKY_FIRST, 0);
+    pvkCmdBindPipeline(backdrop, moonPipe);
+    for (int i = 0; i < 3; i++)
+        pvkCmdDraw(backdrop, FAN_VERTS, 1, MOON_FIRST + i * FAN_VERTS, 0);
+    CHECK(pvkEndCommandBuffer(backdrop));
 
     printf("rain: running\n");
 
@@ -376,9 +396,10 @@ int main(void)
 
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
-        CHECK(pvkResetCommandPool(device, commandPool, 0));
-        CHECK(pvkBeginCommandBuffer(cmd));
+        CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
+
         PvkRenderingInfo rendering = {
+            .flags      = PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT,
             .renderArea = { 0, 0, WIDTH, HEIGHT },
             .colorAttachment = {
                 .imageView  = views[imageIndex],
@@ -387,17 +408,16 @@ int main(void)
             },
         };
         pvkCmdBeginRendering(cmd, &rendering);
-        pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
+        pvkCmdExecuteCommands(cmd, 1, &backdrop);
+        pvkCmdEndRendering(cmd);
 
-        pvkCmdBindPipeline(cmd, skyPipe);
-        pvkCmdDraw(cmd, SKY_VERTS, 1, SKY_FIRST, 0);
+        rendering.flags = 0;
+        rendering.colorAttachment.loadOp = PVK_ATTACHMENT_LOAD_OP_LOAD;
+        pvkCmdBeginRendering(cmd, &rendering);
+        pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
 
         pvkCmdBindPipeline(cmd, starPipe);
         pvkCmdDraw(cmd, STARS, 1, STAR_FIRST, 0);
-
-        pvkCmdBindPipeline(cmd, moonPipe);
-        for (i = 0; i < 3; i++)
-            pvkCmdDraw(cmd, FAN_VERTS, 1, MOON_FIRST + i * FAN_VERTS, 0);
 
         pvkCmdBindPipeline(cmd, ripplePipe);
         for (i = 0; i < RIPPLES; i++)

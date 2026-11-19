@@ -74,6 +74,7 @@ int main(void)
     };
     CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
+    PvkCommandBufferBeginInfo beginInfo = { .flags = 0 };
 
     printf("clear: running\n");
 
@@ -84,7 +85,7 @@ int main(void)
         CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
 
         CHECK(pvkResetCommandPool(device, commandPool, 0));
-        CHECK(pvkBeginCommandBuffer(cmd));
+        CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },
             .colorAttachment = {
