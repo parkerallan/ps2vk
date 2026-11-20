@@ -282,10 +282,20 @@ PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd)
             packet2_vif_nop(&cmd->packet, 0);
             packet2_chain_close_tag(&cmd->packet);
         }
-    } else if (cmd_reserve(cmd, 5)) {
-        /* GS FINISH after all drawing, so the fence can tell when the GS is done. */
+    } else if (cmd_reserve(cmd, 6)) {
+        /* GS FINISH, then SIGNAL: its interrupt releases the submission's fence.
+         * The SIGNAL ID is filled in at submit, when the fence is known. */
         q = cmd_open_direct(cmd);
-        q = draw_finish(q);
+        q->dw[0] = GIF_SET_TAG(2, 1, 0, 0, GIF_FLG_PACKED, 1);
+        q->dw[1] = GIF_REG_AD;
+        q++;
+        q->dw[0] = GS_SET_FINISH(0);
+        q->dw[1] = GS_REG_FINISH;
+        q++;
+        cmd->signalQw = q - cmd->packet.base;
+        q->dw[0] = GS_SET_SIGNAL(0, 0xFFFFFFFF);
+        q->dw[1] = GS_REG_SIGNAL;
+        q++;
         cmd_close_direct(cmd, q);
         packet2_utils_vu_add_end_tag(&cmd->packet);
     }

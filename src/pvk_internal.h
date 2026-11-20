@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #include <tamtypes.h>
+#include <kernel.h>
 #include <dma.h>
 #include <draw.h>
 #include <graph.h>
@@ -42,15 +43,26 @@ struct PvkInstance_T {
 /* What pvkGetPhysicalDeviceProperties reports; every size check reads it. */
 extern const PvkPhysicalDeviceLimits pvk_limits;
 
-/* One in-order queue. Only one submission is in flight at a time: the GS
- * FINISH flag can't tell submissions apart, so submit waits for the last one. */
-struct PvkQueue_T {
-    PvkDevice device;
-    int       busy;     /* a submission may still be running */
-    PvkFence  fence;    /* fence to signal when it completes, or NULL */
+/* Signaled by the GS SIGNAL at the end of the submission it was passed to. */
+struct PvkFence_T {
+    s32          sema;      /* EE semaphore the INTC_GS handler releases */
+    volatile int pending;   /* submitted, its SIGNAL not seen yet */
+    volatile int signaled;
 };
 
-void pvk_queue_wait_idle(PvkQueue queue);
+/* One in-order queue. Submissions run back to back on the VIF1 channel; each
+ * ends with a GS SIGNAL carrying its fence, so any number can be in flight. */
+struct PvkQueue_T {
+    PvkDevice device;
+    PvkFence  last;         /* fence of the newest submission; NULL = idle */
+    struct PvkFence_T idle; /* stands in when a submission has no fence */
+};
+
+void      pvk_queue_wait_idle(PvkQueue queue);
+PvkResult pvk_fence_init(PvkFence fence, int signaled);
+void      pvk_fence_wait(PvkFence fence);
+void      pvk_gs_signal_install(void);
+void      pvk_gs_signal_remove(void);
 
 #define PVK_MAX_VRAM_ALLOCATIONS 64
 
@@ -285,6 +297,7 @@ struct PvkCommandBuffer_T {
     struct PvkExecuted *executed; /* the secondaries a primary calls, checked at submit */
     uint32_t    executedCount, executedCap;
     packet2_t   packet;       /* VIF1 DMA chain, inside the pool's block */
+    uint32_t    signalQw;     /* qword of the GS SIGNAL at a primary's end; its ID is set at submit */
     PvkPipeline pipeline;
     PvkImageView colorView;   /* attachments of the current pvkCmdBeginRendering; NULL when inherited */
     PvkImageView depthView;   /* or NULL */
@@ -309,11 +322,6 @@ struct PvkCommandBuffer_T {
     int         recording;
     int         rendering;
     int         failed;       /* a recording error makes the buffer unusable */
-};
-
-struct PvkFence_T {
-    int pending;              /* submitted, not yet waited on */
-    int signaled;
 };
 
 #endif /* PVK_INTERNAL_H */

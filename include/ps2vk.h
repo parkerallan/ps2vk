@@ -1941,7 +1941,13 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t insta
  * @{
  */
 
-/** @brief Lets the CPU wait until a submission has finished drawing. */
+/**
+ * @brief Lets the CPU wait until a submission has finished drawing.
+ *
+ * Each submission ends with a GS FINISH and a GS SIGNAL whose ID names its
+ * fence. The SIGNAL raises INTC_GS; the handler marks the fence signaled and
+ * releases an EE semaphore, so a waiting thread sleeps instead of polling.
+ */
 typedef struct PvkFence_T         *PvkFence;
 
 /** @brief Parameters for pvkCreateFence(). May be NULL. */
@@ -1952,18 +1958,23 @@ typedef struct PvkFenceCreateInfo {
 /**
  * @brief Sends a command buffer to the hardware.
  *
- * Writes the CPU cache back to RAM and starts DMA. Only one submission can be
- * in flight, so this first waits for the previous one.
+ * Writes the CPU cache back to RAM and starts DMA on the VIF1 channel. The
+ * channel takes one chain at a time, so this waits until the previous
+ * submission's chain has been read; the GS may still be drawing it. Any
+ * number of submissions can be in flight; each is tracked by its fence.
+ * A submission without a fence uses one the queue keeps, so it waits for the
+ * previous fenceless submission to finish first.
  *
  * @param queue The queue.
  * @param cmd A primary command buffer that has finished recording.
- * @param fence Fence to signal when drawing finishes, or NULL.
+ * @param fence Unsignaled fence not in use by another submission, to signal
+ *              when drawing finishes; or NULL.
  * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if the command buffer is
  *         secondary, still recording, failed to record, holds no recording
  *         (never recorded, or its pool was reset since), was recorded with
  *         PVK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT and submitted before,
- *         or executes a secondary command buffer that was recorded again or
- *         lost its recording since.
+ *         executes a secondary command buffer that was recorded again or
+ *         lost its recording since, or if the fence is signaled or in use.
  */
 PvkResult pvkQueueSubmit(PvkQueue queue, PvkCommandBuffer cmd, PvkFence fence);
 
@@ -1987,13 +1998,17 @@ void      pvkDestroyFence(PvkDevice device, PvkFence fence);
  * @brief Sets fences back to unsignaled.
  * @param device The device.
  * @param count Number of fences.
- * @param fences The fences.
- * @return PVK_SUCCESS.
+ * @param fences The fences; none may be in use by a submission.
+ * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if a fence is in use.
  */
 PvkResult pvkResetFences(PvkDevice device, uint32_t count, const PvkFence *fences);
 
 /**
  * @brief Waits until the fences' submissions have finished drawing.
+ *
+ * The thread sleeps on each pending fence's semaphore until the GS SIGNAL
+ * interrupt releases it; a fence that is already signaled costs nothing.
+ *
  * @param device The device.
  * @param count Number of fences.
  * @param fences The fences.

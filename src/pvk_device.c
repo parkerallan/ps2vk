@@ -113,6 +113,11 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
     dev->queue.device = dev;
     if (info && info->enabledFeatures)
         dev->features = *info->enabledFeatures;
+    if (pvk_fence_init(&dev->queue.idle, 1) != PVK_SUCCESS) {
+        free(dev);
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    pvk_gs_signal_install();
 
     /* Reset the GIF: the BIOS (OSDSYS) leaves it busy, which stalls the first
      * VIF1 DIRECT transfer forever (ps2gl does the same in glutInit). */
@@ -133,6 +138,8 @@ void pvkDestroyDevice(PvkDevice device)
     if (!device)
         return;
     pvkDeviceWaitIdle(device);
+    pvk_gs_signal_remove();
+    DeleteSema(device->queue.idle.sema);
     free(device);
 }
 
