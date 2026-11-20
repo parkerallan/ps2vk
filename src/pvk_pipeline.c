@@ -611,6 +611,79 @@ static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const 
     return PVK_SUCCESS;
 }
 
+/* Vulkan's rules for a stage's PvkSpecializationInfo: every entry lies within
+ * data. Which constants exist is the shader's business (specialize). */
+static PvkResult check_specialization(const PvkSpecializationInfo *info, uint32_t stage)
+{
+    uint32_t i;
+
+    if (!info)
+        return PVK_SUCCESS;
+    if ((info->mapEntryCount && !info->mapEntries) || (info->dataSize && !info->data)) {
+        pvk_error("pipeline: stage %u has specialization entries or data without the pointer to them\n",
+                  (unsigned)stage);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    for (i = 0; i < info->mapEntryCount; i++) {
+        const PvkSpecializationMapEntry *e = &info->mapEntries[i];
+
+        if (e->size == 0 || e->offset > info->dataSize || e->size > info->dataSize - e->offset) {
+            pvk_error("pipeline: stage %u specialization entry %u (offset %u, size %u) lies outside its "
+                      "%u bytes of data\n", (unsigned)stage, (unsigned)i, (unsigned)e->offset,
+                      (unsigned)e->size, (unsigned)info->dataSize);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+    }
+    return PVK_SUCCESS;
+}
+
+/* Writes the value each entry gives one of the vertex shader's specialization
+ * constants over the LOI immediate holding its default in the pipeline's copy
+ * of the code, as the float VU1 computes with. */
+static PvkResult specialize(PvkPipeline p, const PvkSpecializationInfo *info)
+{
+    const PvkShaderCode *vs = p->vs;
+    uint32_t i, j;
+
+    for (i = 0; i < vs->vu1SpecConstantCount; i++) {
+        const PvkShaderSpecConstant *c = &vs->vu1SpecConstants[i];
+
+        if (c->vu1Word < vs->vu1CodeStart || c->vu1Word >= vs->vu1CodeEnd) {
+            pvk_error("pipeline: vertex shader '%s' has a specialization constant outside its code\n", vs->name);
+            return PVK_ERROR_INVALID_SHADER;
+        }
+        for (j = 0; info && j < info->mapEntryCount; j++) {
+            const PvkSpecializationMapEntry *e = &info->mapEntries[j];
+            uint32_t raw;
+            float v;
+
+            if (e->constantID != c->constantID)
+                continue;
+            if (e->size != 4) {
+                pvk_error("pipeline: specialization entry %u sets constant %u of vertex shader '%s' with %u "
+                          "bytes; it is 4 bytes\n", (unsigned)j, (unsigned)e->constantID, vs->name,
+                          (unsigned)e->size);
+                return PVK_ERROR_VALIDATION_FAILED;
+            }
+            memcpy(&raw, (const uint8_t *)info->data + e->offset, sizeof(raw));
+            switch (c->type) {
+            case PVK_SPEC_CONSTANT_TYPE_INT:  v = (float)(int32_t)raw;      break;
+            case PVK_SPEC_CONSTANT_TYPE_UINT: v = (float)raw;               break;
+            case PVK_SPEC_CONSTANT_TYPE_BOOL: v = raw ? 1.0f : 0.0f;        break;
+            default:                          memcpy(&v, &raw, sizeof(v)); break;
+            }
+            if (v != v || v - v != 0.0f) {
+                pvk_error("pipeline: specialization constant %u of vertex shader '%s' is infinite or NaN, "
+                          "which VU1 cannot represent\n", (unsigned)e->constantID, vs->name);
+                return PVK_ERROR_VALIDATION_FAILED;
+            }
+            memcpy(p->code + (c->vu1Word - vs->vu1CodeStart), &v, sizeof(v));
+            break;
+        }
+    }
+    return PVK_SUCCESS;
+}
+
 static uint32_t max_batch_vertices(const PvkPipeline p, uint32_t step)
 {
     /* Up to align - 1 unused vertices come before and after a batch's. */
@@ -636,15 +709,46 @@ static const struct {
 
 PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineCreateInfo *info, PvkPipeline *pipeline)
 {
-    const PvkShaderCode *vs = info->vertexShader ? info->vertexShader->code : NULL;
-    const PvkShaderCode *fs = info->fragmentShader ? info->fragmentShader->code : NULL;
+    const PvkShaderCode *vs = NULL, *fs = NULL;
+    const PvkSpecializationInfo *vsSpec = NULL;
     const VertexFormat *fmt[PVK_MAX_VERTEX_INPUTS];
-    uint32_t qword[PVK_MAX_VERTEX_INPUTS];
+    uint32_t qword[PVK_MAX_VERTEX_INPUTS], i;
     int instance[PVK_MAX_VERTEX_INPUTS];
     PvkPipeline p;
     PvkResult res;
     float *ctx;
 
+    for (i = 0; i < info->stageCount; i++) {
+        const PvkPipelineShaderStageCreateInfo *s = &info->stages[i];
+        const PvkShaderCode **slot = s->stage == PVK_SHADER_STAGE_VERTEX ? &vs
+                                   : s->stage == PVK_SHADER_STAGE_FRAGMENT ? &fs : NULL;
+
+        if (!slot || *slot || !s->module) {
+            pvk_error("pipeline: stage %u must be the one PVK_SHADER_STAGE_VERTEX or the one "
+                      "PVK_SHADER_STAGE_FRAGMENT stage, with a module\n", (unsigned)i);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (s->module->code->stage != s->stage) {
+            pvk_error("pipeline: stage %u names stage %d, but its module '%s' is not that stage's shader\n",
+                      (unsigned)i, (int)s->stage, s->module->code->name);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (!s->name || !s->module->code->entryPoint || strcmp(s->name, s->module->code->entryPoint)) {
+            pvk_error("pipeline: stage %u names entry point '%s', but module '%s' has '%s'\n", (unsigned)i,
+                      s->name ? s->name : "(null)", s->module->code->name,
+                      s->module->code->entryPoint ? s->module->code->entryPoint : "(none; rebuild it with this shaderc)");
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if ((res = check_specialization(s->specializationInfo, i)) != PVK_SUCCESS)
+            return res;
+        *slot = s->module->code;
+        if (s->stage == PVK_SHADER_STAGE_VERTEX)
+            vsSpec = s->specializationInfo;
+    }
+    if (!vs || !fs) {
+        pvk_error("pipeline: stages must hold a vertex and a fragment stage\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     if ((res = validate_shaders(vs, fs)) != PVK_SUCCESS)
         return res;
     if ((unsigned)info->topology >= sizeof(topologies) / sizeof(topologies[0])) {
@@ -662,7 +766,8 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
     p->layout       = info->layout;
     if ((res = validate_layout(p, info)) != PVK_SUCCESS ||
         (res = setup_vertex_input(p, info, fmt, qword, instance)) != PVK_SUCCESS ||
-        (res = copy_code(p, fmt, qword, instance, device->features.robustBufferAccess != 0)) != PVK_SUCCESS) {
+        (res = copy_code(p, fmt, qword, instance, device->features.robustBufferAccess != 0)) != PVK_SUCCESS ||
+        (res = specialize(p, vsSpec)) != PVK_SUCCESS) {
         pvkDestroyPipeline(device, p);
         return res;
     }

@@ -8,6 +8,7 @@ extern uint32_t builtin_efu_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode builtin_efu_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "builtin_efu.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &builtin_efu_vert_CodeStart,
     .vu1CodeEnd = &builtin_efu_vert_CodeEnd,
     .vu1Convert = &builtin_efu_vert_Convert,

@@ -25,7 +25,9 @@
  *             arrays indexed by constants), calls to the shader's own
  *             functions, int counters and arithmetic (+, -, * as floats),
  *             comparisons with &&, || and !, if/else, ?: and loops (unrolled
- *             when the count is constant, else VU1 branches)
+ *             when the count is constant, else VU1 branches), and specialization
+ *             constants (float, int, uint, bool and vectors of them), whose
+ *             values the pipeline writes into its copy of the code
  *   fragment: outColor = vColor;                      (Gouraud)
  *             outColor = texture(tex, vUV);           (GS TFX decal)
  *             outColor = texture(tex, vUV) * vColor;  (GS TFX modulate)
@@ -50,6 +52,7 @@
 #define MAX_OPERANDS 8
 #define MAX_PHIS    64
 #define MAX_PHI_PREDS 8
+#define MAX_SPEC_OPS 32
 
 /* SPIR-V opcodes used here (SPIR-V 1.x specification). */
 enum {
@@ -63,7 +66,9 @@ enum {
     OpConvertFToU = 109, OpConvertFToS = 110, OpConvertSToF = 111, OpConvertUToF = 112,
     OpBitcast = 124, OpSNegate = 126, OpIAdd = 128, OpISub = 130, OpIMul = 132,
     OpUDiv = 134, OpSDiv = 135, OpUMod = 137, OpSRem = 138, OpSMod = 139,
-    OpConstantComposite = 44, OpFunction = 54, OpFunctionParameter = 55, OpFunctionEnd = 56,
+    OpConstantComposite = 44, OpSpecConstantTrue = 48, OpSpecConstantFalse = 49, OpSpecConstant = 50,
+    OpSpecConstantComposite = 51, OpSpecConstantOp = 52, OpFunction = 54, OpFunctionParameter = 55,
+    OpFunctionEnd = 56,
     OpFunctionCall = 57, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
     OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
     OpCompositeExtract = 81, OpCompositeInsert = 82, OpTranspose = 84, OpSampledImage = 86,
@@ -91,7 +96,7 @@ enum {
 #define LoopControlUnroll     1
 #define LoopControlDontUnroll 2
 
-enum { DecBlock = 2, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
+enum { DecSpecId = 1, DecBlock = 2, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
        DecBuiltIn = 11, DecLocation = 30, DecBinding = 33, DecDescriptorSet = 34, DecOffset = 35 };
 enum { BuiltInPosition = 0, BuiltInInstanceIndex = 43 };
 enum { ScUniformConstant = 0, ScInput = 1, ScUniform = 2, ScOutput = 3, ScFunction = 7,
@@ -165,6 +170,7 @@ typedef struct {
     uint32_t comps[4];       /* constant components (float bits) */
     int      compCount;      /* 0 if the constant isn't a float or float vector */
     int      vf00;           /* scalar constant 0 or 1: read from VF00 (field comp) */
+    int      specId[4];      /* specialization constant id of each component (SpecId), -1 if fixed */
     /* variables and pointers */
     uint32_t varType;        /* pointer type id */
     int      location;       /* -1 if none */
@@ -219,6 +225,9 @@ static int g_memberDecorCount;
 static const char *g_src = "shader";
 static const char *g_sym = "";       /* symbol prefix of the microcode being written */
 static int g_clamps = 0;             /* run-time index clamps labelled so far */
+#define MAX_SPECS 64
+static struct { int id, type; } g_specs[MAX_SPECS]; /* specialization constants labelled so far */
+static int g_specCount = 0;
 static const char *g_file = NULL;    /* from OpLine/OpString, if present */
 static uint32_t g_line = 0;
 
@@ -438,6 +447,12 @@ static uint32_t root(const IdInfo *ids, uint32_t id)
     return id;
 }
 
+/* Nonzero if any component of the constant is a specialization constant. */
+static int is_spec(const IdInfo *c)
+{
+    return c->specId[0] >= 0 || c->specId[1] >= 0 || c->specId[2] >= 0 || c->specId[3] >= 0;
+}
+
 /* Write mask for the first n fields: "x", "xy", "xyz", "xyzw". */
 static const char *mask_n(int n)
 {
@@ -517,6 +532,7 @@ typedef struct {
 
 typedef struct {
     uint32_t execModel;
+    const char *entryPoint;         /* OpEntryPoint name */
     uint32_t glsl450;               /* id of the GLSL.std.450 import, 0 if none */
     Var      inputs[MAX_INPUTS];
     int      inputCount;
@@ -892,7 +908,7 @@ static void define_map(IdInfo *ids, Shader *sh, uint32_t op, uint32_t id, uint32
 
     ids[id].valType = type;
     for (int j = 0; j < size; j++) {
-        if (fl[j].src && ids[fl[j].src].kind != ID_CONST)
+        if (fl[j].src && (ids[fl[j].src].kind != ID_CONST || is_spec(&ids[fl[j].src])))
             allConst = 0;
         if (fl[j].src == 0 && fl[j].comp != FIELD_UNDEF)
             allConst = 0;
@@ -926,7 +942,7 @@ static void define_map(IdInfo *ids, Shader *sh, uint32_t op, uint32_t id, uint32
             b->fieldOp[j] = fl[j].comp;
             continue;
         }
-        if (ids[src].kind == ID_CONST) {
+        if (ids[src].kind == ID_CONST && !is_spec(&ids[src])) {
             uint32_t bits = ids[src].comps[fl[j].comp];
             if (!(bits & 0x7fffffff)) { b->fieldOp[j] = FIELD_ZERO; continue; }
             if (bits == 0x3f800000) { b->fieldOp[j] = FIELD_ONE; continue; }
@@ -1037,6 +1053,16 @@ static void rebuild_phis(IdInfo *ids, Shader *sh)
  * the last read in that block: a reload is cheaper than a register held across
  * a branch or a loop. The reads are repointed at the block's loaded value.
  */
+/* A specialization constant keeps its default in the code, as LOI immediates
+ * the pipeline overwrites. The GS has no code to overwrite. */
+static void spec_declared(const IdInfo *ids, const Shader *sh, uint32_t id)
+{
+    if (is_spec(&ids[id]) && sh->execModel == ExecFragment)
+        fail("fragment shader declares specialization constant '%s'; the GS has fixed functions, "
+             "so there is nothing for it to change. Specialization constants are only available "
+             "in vertex shaders", ids[id].name ? ids[id].name : "constant");
+}
+
 static void place_const_loads(IdInfo *ids, Shader *sh)
 {
     static BodyOp out[MAX_BODY];
@@ -1097,7 +1123,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 {
     size_t pc;
     uint32_t bound = code[3];
-    int inFunction = 0, functions = 0;
+    int inFunction = 0, functions = 0, specOpCount = 0, replayed = 0, labels = 0;
+    const uint32_t *specOps[MAX_SPEC_OPS];
 
     /* Ids past the SPIR-V bound stand for the push constant and uniform qwords. */
     if (bound + CONST_QWORDS > MAX_IDS)
@@ -1112,6 +1139,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     for (uint32_t i = 0; i < MAX_IDS; i++) {
         ids[i].location = ids[i].binding = ids[i].set = ids[i].builtin = ids[i].structPosMember = -1;
         ids[i].fromInput = ids[i].fromConst = -1;
+        ids[i].specId[0] = ids[i].specId[1] = ids[i].specId[2] = ids[i].specId[3] = -1;
     }
     for (int q = 0; q < CONST_QWORDS; q++) {
         ids[sh->constBase + q].kind = ID_VALUE;
@@ -1135,6 +1163,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             if (sh->execModel != ~0u)
                 fail("only one entry point per file is supported");
             sh->execModel = w[1];
+            sh->entryPoint = (const char *)&w[3];
             break;
         case OpString:
             ids[w[1]].name = (const char *)&w[2];
@@ -1159,6 +1188,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[w[1]].builtin = (int)w[3];
             else if (w[2] == DecArrayStride)
                 ids[w[1]].stride = w[3];
+            else if (w[2] == DecSpecId)
+                ids[w[1]].specId[0] = (int)w[3];
             break;
         case OpMemberDecorate:
             if (w[3] == DecBuiltIn && w[4] == BuiltInPosition) {
@@ -1196,6 +1227,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         case OpTypeArray:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_ARRAY;
             ids[w[1]].elemType = w[2];
+            if (ids[w[3]].kind == ID_CONST && is_spec(&ids[w[3]]))
+                fail("an array's length is a specialization constant; VU1 memory is laid out when "
+                     "the shader is compiled, so give it a fixed length");
             ids[w[1]].elemCount = ids[w[3]].kind == ID_CONST ? ids[w[3]].value : 0;
             break;
         case OpTypePointer:
@@ -1214,7 +1248,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         case OpTypeFunction:
             ids[w[1]].kind = ID_TYPE; ids[w[1]].type = T_OTHER;
             break;
-        case OpConstant:
+        case OpConstant: case OpSpecConstant:
             ids[w[2]].kind = ID_CONST; ids[w[2]].value = w[3];
             ids[w[2]].valType = w[1];
             if (is_float(ids, w[1])) {
@@ -1226,15 +1260,31 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 memcpy(&ids[w[2]].comps[0], &v, sizeof(v));
                 ids[w[2]].compCount = 1;
             }
+            spec_declared(ids, sh, w[2]);
             break;
-        case OpConstantComposite: {
+        case OpSpecConstantTrue: case OpSpecConstantFalse: {
+            /* A bool VU1 tests as a float: 1.0 or 0.0 until the pipeline sets it. */
+            float v = op == OpSpecConstantTrue ? 1.0f : 0.0f;
+            ids[w[2]].kind = ID_CONST; ids[w[2]].value = op == OpSpecConstantTrue;
+            ids[w[2]].valType = w[1];
+            memcpy(&ids[w[2]].comps[0], &v, sizeof(v));
+            ids[w[2]].compCount = 1;
+            ids[w[2]].boolKind = BOOL_FLOAT;
+            ids[w[2]].boolA = w[2];
+            spec_declared(ids, sh, w[2]);
+            break;
+        }
+        case OpConstantComposite: case OpSpecConstantComposite: {
             uint32_t id = w[2];
             ids[id].kind = ID_CONST;
             ids[id].valType = w[1];
             if (ids[w[1]].type == T_VECTOR && is_float(ids, ids[w[1]].elemType) && n - 3 <= 4) {
-                for (uint32_t i = 0; i < n - 3; i++)
+                for (uint32_t i = 0; i < n - 3; i++) {
                     ids[id].comps[i] = ids[w[3 + i]].comps[0];
+                    ids[id].specId[i] = ids[w[3 + i]].specId[0];
+                }
                 ids[id].compCount = (int)(n - 3);
+                spec_declared(ids, sh, id);
             } else if (ids[w[1]].type == T_MATRIX) {
                 /* A constant matrix: its columns are vector constants of their own. */
                 ids[id].members = &w[3];
@@ -1434,10 +1484,25 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     /* Pass 2: the function body. */
     inFunction = 0;
     for (pc = 5; pc < words;) {
-        uint32_t op = code[pc] & 0xffff, n = code[pc] >> 16;
+        uint32_t op = code[pc] & 0xffff, n = code[pc] >> 16, fake[16];
         const uint32_t *w = &code[pc];
         const char *stage = sh->execModel == ExecVertex ? "vertex" : "fragment";
+        int replay = labels && replayed < specOpCount;
 
+        if (replay) {
+            /* An operation on specialization constants, as the same body op at the
+             * start of the body: its operands are only known at pipeline creation. */
+            const uint32_t *so = specOps[replayed++];
+            n = (so[0] >> 16) - 1;
+            op = so[3];
+            if (n < 3 || n > 16)
+                fail("corrupt SPIR-V: OpSpecConstantOp with %u words", (unsigned)n);
+            fake[0] = (n << 16) | op;
+            fake[1] = so[1];
+            fake[2] = so[2];
+            memcpy(&fake[3], &so[4], (n - 3) * sizeof(uint32_t));
+            w = fake;
+        }
         if (op == OpLine) {
             g_file = ids[w[1]].name;
             g_line = w[2];
@@ -1455,6 +1520,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             case OpLabel:
                 new_op(sh->body, &sh->bodyCount, OpLabel, w[1]);
                 sh->lastLabel = w[1];
+                labels++;
                 break;
             case OpReturn:
                 sh->returns++;
@@ -1717,7 +1783,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     unsupported(op, stage);
                 if (value_size(ids, src, stage) != 1)
                     fail("corrupt SPIR-V: int() of something other than a float");
-                if (ids[src].kind == ID_CONST) {
+                if (ids[src].kind == ID_CONST && !is_spec(&ids[src])) {
                     float v;
                     memcpy(&v, &ids[src].comps[0], sizeof(v));
                     ids[id].kind = ID_CONST;
@@ -2010,6 +2076,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 
                     for (uint32_t i = 4; i < n; i++) {
                         uint32_t idx = w[i], v;
+                        if (ids[idx].kind == ID_CONST && is_spec(&ids[idx]))
+                            fail("vertex shader indexes a %s with a specialization constant; the element's "
+                                 "address is part of the code, so index with a fixed constant, or at run "
+                                 "time with int() of a float", kind);
                         if (ids[idx].kind != ID_CONST) {
                             /* pc.array[i], pc.m[i]: VI08 = i * qwords per element, added
                              * to the element's static address, i clamped to the array like
@@ -2173,8 +2243,13 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             default:
                 unsupported(op, stage);
             }
+        } else if (op == OpSpecConstantOp) {
+            if (specOpCount == MAX_SPEC_OPS)
+                fail("shader has more than %d operations on specialization constants", MAX_SPEC_OPS);
+            specOps[specOpCount++] = w;
         }
-        pc += n;
+        if (!replay)
+            pc += n;
     }
     g_line = 0;
 
@@ -2208,7 +2283,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         place_const_loads(ids, sh);
         /* A scalar 0 or 1 reads VF00 = (0, 0, 0, 1) instead of taking a register. */
         for (uint32_t i = 0; i < sh->constBase; i++) {
-            if (ids[i].kind != ID_CONST || ids[i].compCount != 1)
+            if (ids[i].kind != ID_CONST || ids[i].compCount != 1 || is_spec(&ids[i]))
                 continue;
             if (!(ids[i].comps[0] & 0x7fffffff)) {
                 ids[i].vf00 = 1;
@@ -2421,27 +2496,59 @@ static void loi_text(uint32_t bits, char *ins, size_t insSize, char *comment, si
     snprintf(comment, commentSize, "%.9g", v);
 }
 
-/* Loads a constant into its register: zero it, then LOI + ADDI per distinct component value. */
-static void emit_constant(FILE *f, const IdInfo *c, int reg)
+/* PvkSpecConstantType of a specialization constant of that type, or a vector of it. */
+static int spec_type(const IdInfo *ids, uint32_t type)
+{
+    if (ids[type].type == T_VECTOR)
+        type = ids[type].elemType;
+    if (ids[type].type == T_BOOL)
+        return PVK_SPEC_CONSTANT_TYPE_BOOL;
+    if (ids[type].type == T_INT)
+        return ids[type].storage ? PVK_SPEC_CONSTANT_TYPE_INT : PVK_SPEC_CONSTANT_TYPE_UINT;
+    return PVK_SPEC_CONSTANT_TYPE_FLOAT;
+}
+
+static const char *const spec_type_names[] = {
+    "PVK_SPEC_CONSTANT_TYPE_FLOAT", "PVK_SPEC_CONSTANT_TYPE_INT", "PVK_SPEC_CONSTANT_TYPE_UINT",
+    "PVK_SPEC_CONSTANT_TYPE_BOOL"
+};
+
+/* Loads a constant into its register: zero it, then LOI + ADDI per distinct
+ * component value. A specialization constant's component gets a labelled LOI
+ * of its own, whose immediate the pipeline overwrites. */
+static void emit_constant(FILE *f, const IdInfo *ids, const IdInfo *c, int reg, const char *sym)
 {
     static const char field[] = "xyzw";
-    char buf[64], buf2[64], mask[5], val[32];
+    char buf[64], buf2[96], mask[5], val[32];
     int done[4] = { 0 }, i, j, k;
 
     snprintf(buf, sizeof(buf), "sub.xyzw      VF%02d,VF00,VF00", reg);
     snprintf(buf2, sizeof(buf2), "%s", c->compCount == 1 ? "float constant" : "vec4 constant");
     vu(f, buf, "NOP", buf2);
     for (i = 0; i < c->compCount; i++) {
-        if (done[i] || !(c->comps[i] & 0x7fffffff))
+        if (done[i] || (c->specId[i] < 0 && !(c->comps[i] & 0x7fffffff)))
             continue;
-        for (j = i, k = 0; j < c->compCount; j++)
-            if (c->comps[j] == c->comps[i]) {
-                mask[k++] = field[j];
-                done[j] = 1;
-            }
-        mask[k] = 0;
         loi_text(c->comps[i], buf, sizeof(buf), val, sizeof(val));
-        vu(f, "NOP", buf, val);
+        if (c->specId[i] >= 0) {
+            if (g_specCount == MAX_SPECS)
+                fail("vertex shader uses more than %d specialization constants", MAX_SPECS);
+            g_specs[g_specCount].id = c->specId[i];
+            g_specs[g_specCount].type = spec_type(ids, c->valType);
+            fprintf(f, "%s_Spec%d:\n", sym, g_specCount++);
+            mask[0] = field[i];
+            mask[1] = 0;
+            done[i] = 1;
+            snprintf(buf2, sizeof(buf2), "specialization constant %d, default %s", c->specId[i], val);
+            vu(f, "NOP", buf, buf2);
+        } else {
+            for (j = i, k = 0; j < c->compCount; j++)
+                if (c->comps[j] == c->comps[i] && c->specId[j] < 0) {
+                    mask[k++] = field[j];
+                    done[j] = 1;
+                }
+            mask[k] = 0;
+            vu(f, "NOP", buf, val);
+        }
         snprintf(buf, sizeof(buf), "addi.%-8s VF%02d,VF%02d,I", mask, reg, reg);
         vu(f, buf, "NOP", NULL);
     }
@@ -3050,9 +3157,11 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             uint32_t c = use[j] ? root(ids, use[j]) : 0, k;
             if (!c || ids[c].kind != ID_CONST || r.reg[c] || ids[c].vf00)
                 continue;
-            /* a constant with the same value already has a register */
-            for (k = 0; k < sh->constBase; k++)
-                if (k != c && ids[k].kind == ID_CONST && r.reg[k] && ids[k].compCount == ids[c].compCount &&
+            /* a constant with the same value already has a register; a specialization
+             * constant keeps its own, since the pipeline may change its value */
+            for (k = is_spec(&ids[c]) ? sh->constBase : 0; k < sh->constBase; k++)
+                if (k != c && ids[k].kind == ID_CONST && r.reg[k] && !is_spec(&ids[k]) &&
+                    ids[k].compCount == ids[c].compCount &&
                     !memcmp(ids[k].comps, ids[c].comps, sizeof(uint32_t) * (size_t)ids[c].compCount))
                     break;
             if (k < sh->constBase) {
@@ -3062,7 +3171,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             if (!constants++)
                 fprintf(f, "; constants\n");
             r.reg[c] = reg_alloc(&r);
-            emit_constant(f, &ids[c], r.reg[c]);
+            emit_constant(f, ids, &ids[c], r.reg[c], sym);
         }
     }
 
@@ -3331,6 +3440,8 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, "\t\t.align 4\n%s_CodeEnd:\n", sym);
     for (i = 0; i < g_clamps; i++)
         fprintf(f, "\t\t.global\t%s_Clamp%d\n", sym, i);
+    for (i = 0; i < g_specCount; i++)
+        fprintf(f, "\t\t.global\t%s_Spec%d\n", sym, i);
     fclose(f);
 
     f = open_out(base, ".c");
@@ -3341,21 +3452,35 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, "extern uint32_t %s_CodeEnd __attribute__((section(\".vudata\")));\n", sym);
     for (i = 0; i < g_clamps; i++)
         fprintf(f, "extern uint32_t %s_Clamp%d __attribute__((section(\".vudata\")));\n", sym, i);
+    for (i = 0; i < g_specCount; i++)
+        fprintf(f, "extern uint32_t %s_Spec%d __attribute__((section(\".vudata\")));\n", sym, i);
     if (g_clamps) {
         fprintf(f, "\nstatic const uint32_t *const %s_Clamps[] = {", sym);
         for (i = 0; i < g_clamps; i++)
             fprintf(f, "%s&%s_Clamp%d", i ? ", " : " ", sym, i);
         fprintf(f, " };\n");
     }
+    if (g_specCount) {
+        fprintf(f, "\nstatic const PvkShaderSpecConstant %s_SpecConstants[] = {\n", sym);
+        for (i = 0; i < g_specCount; i++)
+            fprintf(f, "    { .constantID = %d, .vu1Word = &%s_Spec%d, .type = %s },\n",
+                    g_specs[i].id, sym, i, spec_type_names[g_specs[i].type]);
+        fprintf(f, "};\n");
+    }
     fprintf(f, "\nconst PvkShaderCode %s = {\n", sym);
     fprintf(f, "    .stage = PVK_SHADER_STAGE_VERTEX,\n");
     fprintf(f, "    .name = \"%s\",\n", g_src);
+    fprintf(f, "    .entryPoint = \"%s\",\n", sh->entryPoint);
     fprintf(f, "    .vu1CodeStart = &%s_CodeStart,\n", sym);
     fprintf(f, "    .vu1CodeEnd = &%s_CodeEnd,\n", sym);
     fprintf(f, "    .vu1Convert = &%s_Convert,\n", sym);
     if (g_clamps) {
         fprintf(f, "    .vu1ClampCount = %d,\n", g_clamps);
         fprintf(f, "    .vu1Clamps = %s_Clamps,\n", sym);
+    }
+    if (g_specCount) {
+        fprintf(f, "    .vu1SpecConstantCount = %d,\n", g_specCount);
+        fprintf(f, "    .vu1SpecConstants = %s_SpecConstants,\n", sym);
     }
     fprintf(f, "    .inputCount = %d,\n", sh->inputCount);
     fprintf(f, "    .inputLocations = {");
@@ -3398,6 +3523,7 @@ static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base,
     fprintf(f, "const PvkShaderCode %s = {\n", sym);
     fprintf(f, "    .stage = PVK_SHADER_STAGE_FRAGMENT,\n");
     fprintf(f, "    .name = \"%s\",\n", g_src);
+    fprintf(f, "    .entryPoint = \"%s\",\n", sh->entryPoint);
     fprintf(f, "    .colorOutputLocation = -1,\n");
     fprintf(f, "    .texcoordOutputLocation = -1,\n");
     fprintf(f, "    .colorInputLocation = %d,\n",

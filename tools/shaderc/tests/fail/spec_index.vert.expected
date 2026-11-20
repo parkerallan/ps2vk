@@ -1,0 +1,1 @@
+spec_index.vert:15: error: vertex shader indexes a push constant with a specialization constant; the element's address is part of the code, so index with a fixed constant, or at run time with int() of a float

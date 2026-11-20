@@ -8,6 +8,7 @@ extern uint32_t if_else_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode if_else_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "if_else.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &if_else_vert_CodeStart,
     .vu1CodeEnd = &if_else_vert_CodeEnd,
     .vu1Convert = &if_else_vert_Convert,

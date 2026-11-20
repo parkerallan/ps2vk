@@ -8,6 +8,7 @@ extern uint32_t uniform_two_blocks_vert_CodeEnd __attribute__((section(".vudata"
 const PvkShaderCode uniform_two_blocks_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "uniform_two_blocks.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &uniform_two_blocks_vert_CodeStart,
     .vu1CodeEnd = &uniform_two_blocks_vert_CodeEnd,
     .vu1Convert = &uniform_two_blocks_vert_Convert,

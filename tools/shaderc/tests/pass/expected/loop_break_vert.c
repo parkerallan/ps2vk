@@ -11,6 +11,7 @@ static const uint32_t *const loop_break_vert_Clamps[] = { &loop_break_vert_Clamp
 const PvkShaderCode loop_break_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "loop_break.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &loop_break_vert_CodeStart,
     .vu1CodeEnd = &loop_break_vert_CodeEnd,
     .vu1Convert = &loop_break_vert_Convert,

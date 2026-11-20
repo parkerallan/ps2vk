@@ -8,6 +8,7 @@ extern uint32_t divide_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode divide_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "divide.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &divide_vert_CodeStart,
     .vu1CodeEnd = &divide_vert_CodeEnd,
     .vu1Convert = &divide_vert_Convert,

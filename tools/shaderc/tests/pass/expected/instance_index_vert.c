@@ -8,6 +8,7 @@ extern uint32_t instance_index_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode instance_index_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "instance_index.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &instance_index_vert_CodeStart,
     .vu1CodeEnd = &instance_index_vert_CodeEnd,
     .vu1Convert = &instance_index_vert_Convert,

@@ -8,6 +8,7 @@ extern uint32_t uniform_registers_vert_CodeEnd __attribute__((section(".vudata")
 const PvkShaderCode uniform_registers_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "uniform_registers.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &uniform_registers_vert_CodeStart,
     .vu1CodeEnd = &uniform_registers_vert_CodeEnd,
     .vu1Convert = &uniform_registers_vert_Convert,

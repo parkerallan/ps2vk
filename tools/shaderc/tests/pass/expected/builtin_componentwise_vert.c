@@ -8,6 +8,7 @@ extern uint32_t builtin_componentwise_vert_CodeEnd __attribute__((section(".vuda
 const PvkShaderCode builtin_componentwise_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "builtin_componentwise.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &builtin_componentwise_vert_CodeStart,
     .vu1CodeEnd = &builtin_componentwise_vert_CodeEnd,
     .vu1Convert = &builtin_componentwise_vert_Convert,

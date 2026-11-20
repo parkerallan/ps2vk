@@ -8,6 +8,7 @@ extern uint32_t builtin_fdiv_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode builtin_fdiv_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "builtin_fdiv.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &builtin_fdiv_vert_CodeStart,
     .vu1CodeEnd = &builtin_fdiv_vert_CodeEnd,
     .vu1Convert = &builtin_fdiv_vert_Convert,

@@ -1,0 +1,1 @@
+spec_in_fragment.frag: error: fragment shader declares specialization constant 'SCALE'; the GS has fixed functions, so there is nothing for it to change. Specialization constants are only available in vertex shaders

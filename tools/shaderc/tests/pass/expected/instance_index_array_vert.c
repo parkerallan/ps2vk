@@ -11,6 +11,7 @@ static const uint32_t *const instance_index_array_vert_Clamps[] = { &instance_in
 const PvkShaderCode instance_index_array_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "instance_index_array.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &instance_index_array_vert_CodeStart,
     .vu1CodeEnd = &instance_index_array_vert_CodeEnd,
     .vu1Convert = &instance_index_array_vert_Convert,

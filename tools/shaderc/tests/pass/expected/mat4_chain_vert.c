@@ -8,6 +8,7 @@ extern uint32_t mat4_chain_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode mat4_chain_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "mat4_chain.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &mat4_chain_vert_CodeStart,
     .vu1CodeEnd = &mat4_chain_vert_CodeEnd,
     .vu1Convert = &mat4_chain_vert_Convert,

@@ -11,6 +11,7 @@ static const uint32_t *const uniform_bones_vert_Clamps[] = { &uniform_bones_vert
 const PvkShaderCode uniform_bones_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "uniform_bones.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &uniform_bones_vert_CodeStart,
     .vu1CodeEnd = &uniform_bones_vert_CodeEnd,
     .vu1Convert = &uniform_bones_vert_Convert,

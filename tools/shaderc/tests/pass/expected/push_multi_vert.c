@@ -8,6 +8,7 @@ extern uint32_t push_multi_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode push_multi_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "push_multi.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &push_multi_vert_CodeStart,
     .vu1CodeEnd = &push_multi_vert_CodeEnd,
     .vu1Convert = &push_multi_vert_Convert,

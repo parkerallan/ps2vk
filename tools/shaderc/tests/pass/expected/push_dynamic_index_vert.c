@@ -11,6 +11,7 @@ static const uint32_t *const push_dynamic_index_vert_Clamps[] = { &push_dynamic_
 const PvkShaderCode push_dynamic_index_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "push_dynamic_index.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &push_dynamic_index_vert_CodeStart,
     .vu1CodeEnd = &push_dynamic_index_vert_CodeEnd,
     .vu1Convert = &push_dynamic_index_vert_Convert,

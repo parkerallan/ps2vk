@@ -337,9 +337,13 @@ int main(void)
 
     /* One pipeline per topology and blend mode; everything else is shared.
      * Additive adds light on top of the sky; alpha lets the ripples fade out. */
+    PvkPipelineShaderStageCreateInfo stages[] = {
+        { .stage = PVK_SHADER_STAGE_VERTEX,   .module = vs, .name = "main" },
+        { .stage = PVK_SHADER_STAGE_FRAGMENT, .module = fs, .name = "main" },
+    };
     PvkGraphicsPipelineCreateInfo pipelineInfo = {
-        .vertexShader   = vs,
-        .fragmentShader = fs,
+        .stageCount     = 2,
+        .stages         = stages,
         .layout         = layout,
         .bindingCount   = 1,
         .bindings       = &binding,

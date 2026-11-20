@@ -8,6 +8,7 @@ extern uint32_t tri_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode tri_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "tri.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &tri_vert_CodeStart,
     .vu1CodeEnd = &tri_vert_CodeEnd,
     .vu1Convert = &tri_vert_Convert,

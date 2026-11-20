@@ -8,6 +8,7 @@ extern uint32_t builtin_lighting_vert_CodeEnd __attribute__((section(".vudata"))
 const PvkShaderCode builtin_lighting_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "builtin_lighting.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &builtin_lighting_vert_CodeStart,
     .vu1CodeEnd = &builtin_lighting_vert_CodeEnd,
     .vu1Convert = &builtin_lighting_vert_Convert,

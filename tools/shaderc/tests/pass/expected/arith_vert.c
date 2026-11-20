@@ -8,6 +8,7 @@ extern uint32_t arith_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode arith_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "arith.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &arith_vert_CodeStart,
     .vu1CodeEnd = &arith_vert_CodeEnd,
     .vu1Convert = &arith_vert_Convert,

@@ -5,6 +5,7 @@
 const PvkShaderCode tex_frag = {
     .stage = PVK_SHADER_STAGE_FRAGMENT,
     .name = "tex.frag",
+    .entryPoint = "main",
     .colorOutputLocation = -1,
     .texcoordOutputLocation = -1,
     .colorInputLocation = -1,

@@ -22,6 +22,10 @@ layout(push_constant) uniform Push {
     vec4 material;
 } pc;
 
+// Set when the pipeline is created (PvkSpecializationInfo), not per draw:
+// false draws the sphere unlit, in its plain material color.
+layout(constant_id = 0) const bool LIGHTING = true;
+
 layout(location = 0) out vec4 vColor;
 layout(location = 1) out vec2 vRamp;
 
@@ -32,7 +36,10 @@ layout(location = 1) out vec2 vRamp;
 // bilinear filtering never wraps around.
 void main()
 {
-    gl_Position = cam.viewProj * (pc.model * inPos);
+    // Both pc.model products first: VU1 frees its four columns before loading cam.viewProj.
+    vec4 world = pc.model * inPos;
+    float d = LIGHTING ? dot((pc.model * inNormal).xyz, light.direction.xyz) : 1.0;
+    gl_Position = cam.viewProj * world;
     vColor = pc.material * light.color;
-    vRamp = vec2(dot((pc.model * inNormal).xyz, light.direction.xyz) * 0.49609375 + 0.5, 0.0);
+    vRamp = vec2(d * 0.49609375 + 0.5, 0.0);
 }

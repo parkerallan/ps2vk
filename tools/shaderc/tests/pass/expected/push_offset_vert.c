@@ -8,6 +8,7 @@ extern uint32_t push_offset_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode push_offset_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "push_offset.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &push_offset_vert_CodeStart,
     .vu1CodeEnd = &push_offset_vert_CodeEnd,
     .vu1Convert = &push_offset_vert_Convert,

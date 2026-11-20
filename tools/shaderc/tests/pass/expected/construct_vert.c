@@ -8,6 +8,7 @@ extern uint32_t construct_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode construct_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "construct.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &construct_vert_CodeStart,
     .vu1CodeEnd = &construct_vert_CodeEnd,
     .vu1Convert = &construct_vert_Convert,

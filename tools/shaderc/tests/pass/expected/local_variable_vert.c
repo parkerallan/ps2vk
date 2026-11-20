@@ -8,6 +8,7 @@ extern uint32_t local_variable_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode local_variable_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "local_variable.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &local_variable_vert_CodeStart,
     .vu1CodeEnd = &local_variable_vert_CodeEnd,
     .vu1Convert = &local_variable_vert_Convert,

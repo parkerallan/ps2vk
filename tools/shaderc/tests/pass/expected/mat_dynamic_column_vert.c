@@ -11,6 +11,7 @@ static const uint32_t *const mat_dynamic_column_vert_Clamps[] = { &mat_dynamic_c
 const PvkShaderCode mat_dynamic_column_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "mat_dynamic_column.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &mat_dynamic_column_vert_CodeStart,
     .vu1CodeEnd = &mat_dynamic_column_vert_CodeEnd,
     .vu1Convert = &mat_dynamic_column_vert_Convert,

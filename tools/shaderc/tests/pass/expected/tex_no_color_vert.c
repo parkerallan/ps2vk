@@ -8,6 +8,7 @@ extern uint32_t tex_no_color_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode tex_no_color_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "tex_no_color.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &tex_no_color_vert_CodeStart,
     .vu1CodeEnd = &tex_no_color_vert_CodeEnd,
     .vu1Convert = &tex_no_color_vert_Convert,

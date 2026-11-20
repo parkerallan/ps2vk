@@ -8,6 +8,7 @@ extern uint32_t local_struct_array_vert_CodeEnd __attribute__((section(".vudata"
 const PvkShaderCode local_struct_array_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "local_struct_array.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &local_struct_array_vert_CodeStart,
     .vu1CodeEnd = &local_struct_array_vert_CodeEnd,
     .vu1Convert = &local_struct_array_vert_Convert,

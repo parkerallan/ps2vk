@@ -8,6 +8,7 @@ extern uint32_t pos_only_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode pos_only_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "pos_only.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &pos_only_vert_CodeStart,
     .vu1CodeEnd = &pos_only_vert_CodeEnd,
     .vu1Convert = &pos_only_vert_Convert,

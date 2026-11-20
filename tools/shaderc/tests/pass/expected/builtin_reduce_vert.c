@@ -8,6 +8,7 @@ extern uint32_t builtin_reduce_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode builtin_reduce_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "builtin_reduce.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &builtin_reduce_vert_CodeStart,
     .vu1CodeEnd = &builtin_reduce_vert_CodeEnd,
     .vu1Convert = &builtin_reduce_vert_Convert,

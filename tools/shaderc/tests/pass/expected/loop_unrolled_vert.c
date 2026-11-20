@@ -14,6 +14,7 @@ static const uint32_t *const loop_unrolled_vert_Clamps[] = { &loop_unrolled_vert
 const PvkShaderCode loop_unrolled_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "loop_unrolled.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &loop_unrolled_vert_CodeStart,
     .vu1CodeEnd = &loop_unrolled_vert_CodeEnd,
     .vu1Convert = &loop_unrolled_vert_Convert,

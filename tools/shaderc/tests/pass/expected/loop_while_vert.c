@@ -8,6 +8,7 @@ extern uint32_t loop_while_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode loop_while_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "loop_while.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &loop_while_vert_CodeStart,
     .vu1CodeEnd = &loop_while_vert_CodeEnd,
     .vu1Convert = &loop_while_vert_Convert,

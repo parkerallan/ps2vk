@@ -322,9 +322,13 @@ int main(void)
 
     /* The inner cube's pipeline draws into the target: its viewport and depth
      * format are the target's. The outer cube's pipeline draws on screen. */
+    PvkPipelineShaderStageCreateInfo stages[] = {
+        { .stage = PVK_SHADER_STAGE_VERTEX,   .module = vs, .name = "main" },
+        { .stage = PVK_SHADER_STAGE_FRAGMENT, .module = colorFs, .name = "main" },
+    };
     PvkGraphicsPipelineCreateInfo pipelineInfo = {
-        .vertexShader   = vs,
-        .fragmentShader = colorFs,
+        .stageCount     = 2,
+        .stages         = stages,
         .layout         = layout,
         .bindingCount   = 1,
         .bindings       = &binding,
@@ -337,7 +341,7 @@ int main(void)
         .depthStencil   = { .depthTestEnable = 1, .depthWriteEnable = 1, .depthCompareOp = PVK_COMPARE_OP_LESS },
     };
     CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &innerPipeline));
-    pipelineInfo.fragmentShader = textureFs;
+    stages[1].module = textureFs;
     pipelineInfo.viewport = (PvkViewport){ 0.0f, 0.0f, WIDTH, HEIGHT, 0.0f, 1.0f };
     pipelineInfo.depthAttachmentFormat = PVK_FORMAT_Z24;
     CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &outerPipeline));

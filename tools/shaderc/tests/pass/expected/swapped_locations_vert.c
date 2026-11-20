@@ -8,6 +8,7 @@ extern uint32_t swapped_locations_vert_CodeEnd __attribute__((section(".vudata")
 const PvkShaderCode swapped_locations_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "swapped_locations.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &swapped_locations_vert_CodeStart,
     .vu1CodeEnd = &swapped_locations_vert_CodeEnd,
     .vu1Convert = &swapped_locations_vert_Convert,

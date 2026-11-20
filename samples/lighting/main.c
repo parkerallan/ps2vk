@@ -6,6 +6,8 @@
  * material color are push constants. The vertex shader computes the dot
  * product of normal and light per vertex; the lit intensity comes from a ramp
  * texture the GS looks up per pixel, so the day/night line stays a clean curve.
+ * A specialization constant set when the pipeline is created switches the
+ * lighting off, leaving the plain material color.
  */
 #include <math.h>
 #include <stdio.h>
@@ -20,6 +22,7 @@ extern const PvkShaderCode lighting_frag;
 
 #define WIDTH  640
 #define HEIGHT 448
+#define LIGHTING_OFF 0 /* 1 builds the pipeline with the vertex shader's LIGHTING constant off */
 
 #define CHECK(call)                                                       \
     do {                                                                  \
@@ -381,9 +384,22 @@ int main(void)
     };
     pvkUpdateDescriptorSets(device, 3, writes);
 
+    /* The lighting switch. The shader's default is lit; set LIGHTING_OFF to
+     * build the pipeline with the lighting off instead. The value becomes an
+     * immediate in the pipeline's copy of the VU1 code, so the vertex shader
+     * reads no push constant or uniform for it. */
+    uint32_t off = 0;
+    PvkSpecializationMapEntry lightingEntry = { .constantID = 0, .offset = 0, .size = sizeof(off) };
+    PvkSpecializationInfo lightingOff = {
+        .mapEntryCount = 1, .mapEntries = &lightingEntry, .dataSize = sizeof(off), .data = &off,
+    };
+    PvkPipelineShaderStageCreateInfo stages[] = {
+        { .stage = PVK_SHADER_STAGE_VERTEX,   .module = vs, .name = "main", .specializationInfo = LIGHTING_OFF ? &lightingOff : NULL },
+        { .stage = PVK_SHADER_STAGE_FRAGMENT, .module = fs, .name = "main" },
+    };
     PvkGraphicsPipelineCreateInfo pipelineInfo = {
-        .vertexShader   = vs,
-        .fragmentShader = fs,
+        .stageCount     = 2,
+        .stages         = stages,
         .layout         = layout,
         .bindingCount   = 1,
         .bindings       = &binding,

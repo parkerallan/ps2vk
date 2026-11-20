@@ -8,6 +8,7 @@ extern uint32_t scale_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode scale_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "scale.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &scale_vert_CodeStart,
     .vu1CodeEnd = &scale_vert_CodeEnd,
     .vu1Convert = &scale_vert_Convert,

@@ -8,6 +8,7 @@ extern uint32_t tex_swizzle_vert_CodeEnd __attribute__((section(".vudata")));
 const PvkShaderCode tex_swizzle_vert = {
     .stage = PVK_SHADER_STAGE_VERTEX,
     .name = "tex_swizzle.vert",
+    .entryPoint = "main",
     .vu1CodeStart = &tex_swizzle_vert_CodeStart,
     .vu1CodeEnd = &tex_swizzle_vert_CodeEnd,
     .vu1Convert = &tex_swizzle_vert_Convert,

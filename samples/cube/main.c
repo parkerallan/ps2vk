@@ -404,9 +404,13 @@ int main(void)
     };
     pvkUpdateDescriptorSets(device, 1, &write);
 
+    PvkPipelineShaderStageCreateInfo stages[] = {
+        { .stage = PVK_SHADER_STAGE_VERTEX,   .module = vs, .name = "main" },
+        { .stage = PVK_SHADER_STAGE_FRAGMENT, .module = fs, .name = "main" },
+    };
     PvkGraphicsPipelineCreateInfo pipelineInfo = {
-        .vertexShader   = vs,
-        .fragmentShader = fs,
+        .stageCount     = 2,
+        .stages         = stages,
         .layout         = layout,
         .bindingCount   = 2,
         .bindings       = bindings,
