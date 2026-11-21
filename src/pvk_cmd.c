@@ -516,7 +516,7 @@ static void cmd_gs_state(PvkCommandBuffer cmd, const PvkRect2D *scissor)
     }
 
     q = cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 10 : 8) : 3, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 9 : 7) : 3, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     /* No alpha test (Vulkan has none); depth test from the pipeline. */
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST_1 + ctxt);
     q = gs_ad(q, alpha, GS_REG_ALPHA_1 + ctxt);
@@ -546,8 +546,6 @@ static void cmd_gs_state(PvkCommandBuffer cmd, const PvkRect2D *scissor)
             q = gs_ad(q, GS_SET_MIPTBP1(a[1] >> 6, w[1], a[2] >> 6, w[2], a[3] >> 6, w[3]), GS_REG_MIPTBP1_1 + ctxt);
             q = gs_ad(q, GS_SET_MIPTBP2(a[4] >> 6, w[4], a[5] >> 6, w[5], a[6] >> 6, w[6]), GS_REG_MIPTBP2_1 + ctxt);
         }
-        /* The texture cache may hold texels from before an upload or a render into it. */
-        q = gs_ad(q, GS_SET_TEXFLUSH(0), GS_REG_TEXFLUSH);
     }
     cmd_close_direct(cmd, q);
 
@@ -711,6 +709,106 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
         packet2_vif_nop(&cmd->packet, 0);
         packet2_add_u32(&cmd->packet, MAKE_VIF_CODE(chunk, 0, P2_VIF_DIRECT, 0));
         sent += chunk;
+    }
+}
+
+/* Stages after which the GS may still be drawing: everything past the vertex shader. */
+#define PVK_GS_STAGES (PVK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | PVK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | \
+                       PVK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | PVK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | \
+                       PVK_PIPELINE_STAGE_TRANSFER_BIT | PVK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | \
+                       PVK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | PVK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
+
+static int barrier_queue_families(PvkCommandBuffer cmd, const char *what, uint32_t src, uint32_t dst)
+{
+    if ((src != PVK_QUEUE_FAMILY_IGNORED && src != 0) || (dst != PVK_QUEUE_FAMILY_IGNORED && dst != 0)) {
+        pvk_error("pvkCmdPipelineBarrier: %s barrier names queue family %u -> %u; the device has family 0 only\n",
+                  what, (unsigned)src, (unsigned)dst);
+        cmd->failed = 1;
+        return 0;
+    }
+    return 1;
+}
+
+void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageMask, PvkPipelineStageFlags dstStageMask,
+                           PvkDependencyFlags dependencyFlags,
+                           uint32_t memoryBarrierCount, const PvkMemoryBarrier *memoryBarriers,
+                           uint32_t bufferMemoryBarrierCount, const PvkBufferMemoryBarrier *bufferMemoryBarriers,
+                           uint32_t imageMemoryBarrierCount, const PvkImageMemoryBarrier *imageMemoryBarriers)
+{
+    uint32_t i, dstAccess = 0;
+    qword_t *q;
+
+    (void)dstStageMask;
+    if (cmd->rendering) {
+        pvk_error("pvkCmdPipelineBarrier must be called outside pvkCmdBeginRendering/pvkCmdEndRendering\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (dependencyFlags & ~PVK_DEPENDENCY_BY_REGION_BIT) {
+        pvk_error("pvkCmdPipelineBarrier: unknown dependency flags 0x%x\n", (unsigned)dependencyFlags);
+        cmd->failed = 1;
+        return;
+    }
+    for (i = 0; i < memoryBarrierCount; i++)
+        dstAccess |= memoryBarriers[i].dstAccessMask;
+    for (i = 0; i < bufferMemoryBarrierCount; i++) {
+        const PvkBufferMemoryBarrier *b = &bufferMemoryBarriers[i];
+        if (!barrier_queue_families(cmd, "buffer", b->srcQueueFamilyIndex, b->dstQueueFamilyIndex))
+            return;
+        if (!b->buffer || b->offset > b->buffer->size ||
+            (b->size != PVK_WHOLE_SIZE && b->offset + b->size > b->buffer->size)) {
+            pvk_error("pvkCmdPipelineBarrier: buffer barrier %u covers bytes outside the buffer\n", (unsigned)i);
+            cmd->failed = 1;
+            return;
+        }
+        dstAccess |= b->dstAccessMask;
+    }
+    for (i = 0; i < imageMemoryBarrierCount; i++) {
+        const PvkImageMemoryBarrier *b = &imageMemoryBarriers[i];
+        const PvkImageSubresourceRange *r = &b->subresourceRange;
+        uint32_t aspect;
+
+        if (!barrier_queue_families(cmd, "image", b->srcQueueFamilyIndex, b->dstQueueFamilyIndex))
+            return;
+        if (!b->image) {
+            pvk_error("pvkCmdPipelineBarrier: image barrier %u has no image\n", (unsigned)i);
+            cmd->failed = 1;
+            return;
+        }
+        aspect = pvk_is_color_format(b->image->format) ? PVK_IMAGE_ASPECT_COLOR_BIT : PVK_IMAGE_ASPECT_DEPTH_BIT;
+        if (r->aspectMask != aspect) {
+            pvk_error("pvkCmdPipelineBarrier: image barrier %u names aspect 0x%x; the image's is 0x%x\n",
+                      (unsigned)i, (unsigned)r->aspectMask, (unsigned)aspect);
+            cmd->failed = 1;
+            return;
+        }
+        if (r->baseMipLevel >= b->image->levels ||
+            (r->levelCount != PVK_REMAINING_MIP_LEVELS && r->baseMipLevel + r->levelCount > b->image->levels) ||
+            r->baseArrayLayer != 0 || (r->layerCount != 1 && r->layerCount != PVK_REMAINING_ARRAY_LAYERS)) {
+            pvk_error("pvkCmdPipelineBarrier: image barrier %u covers levels or layers the image does not have\n",
+                      (unsigned)i);
+            cmd->failed = 1;
+            return;
+        }
+        dstAccess |= b->dstAccessMask;
+    }
+    if (!cmd_reserve(cmd, 4))
+        return;
+
+    if (dstAccess & PVK_ACCESS_SHADER_READ_BIT) {
+        /* The DIRECT block opens with a FLUSH; TEXFLUSH drops the texels the cache holds. */
+        q = cmd_open_direct(cmd);
+        q = gs_ad(q, GIF_SET_TAG(1, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+        q = gs_ad(q, GS_SET_TEXFLUSH(0), GS_REG_TEXFLUSH);
+        cmd_close_direct(cmd, q);
+    } else if (srcStageMask & PVK_GS_STAGES) {
+        cmd_flush(cmd);
+    } else if (srcStageMask & (PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT | PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                               PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT)) {
+        packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+        packet2_vif_flushe(&cmd->packet, 0);
+        packet2_vif_nop(&cmd->packet, 0);
+        packet2_chain_close_tag(&cmd->packet);
     }
 }
 

@@ -380,6 +380,24 @@ int main(void)
         CHECK(pvkResetCommandPool(device, commandPool, 0));
         CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
 
+        /* Before pass 1: last frame's pass 2 used the texture, and pass 1 is about to draw into it again.
+         * Pass 1 clears it, so UNDEFINED: the old contents are not needed. On the PS2 this records a VIF FLUSH. */
+        PvkImageSubresourceRange targetRange = {
+            .aspectMask = PVK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1,
+        };
+        PvkImageMemoryBarrier toAttachment = {
+            .srcAccessMask       = PVK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask       = PVK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout           = PVK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout           = PVK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED, /* one queue family: no handover */
+            .dstQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED,
+            .image               = target,
+            .subresourceRange    = targetRange,
+        };
+        pvkCmdPipelineBarrier(cmd, PVK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, PVK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                              0, 0, NULL, 0, NULL, 1, &toAttachment);
+
         /* Pass 1: the inner cube into the texture. */
         PvkRenderingInfo toTexture = {
             .renderArea = { 0, 0, TARGET_SIZE, TARGET_SIZE },
@@ -401,6 +419,21 @@ int main(void)
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
         pvkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
         pvkCmdEndRendering(cmd);
+
+        /* Between the passes: pass 2 must not use the texture until pass 1 has finished drawing into it.
+         * On the PS2 this barrier records a VIF FLUSH and a GS TEXFLUSH. */
+        PvkImageMemoryBarrier toSampled = {
+            .srcAccessMask       = PVK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask       = PVK_ACCESS_SHADER_READ_BIT,
+            .oldLayout           = PVK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout           = PVK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED,
+            .image               = target,
+            .subresourceRange    = targetRange,
+        };
+        pvkCmdPipelineBarrier(cmd, PVK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, PVK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                              0, 0, NULL, 0, NULL, 1, &toSampled);
 
         /* Pass 2: the outer cube on screen, textured with pass 1's result. */
         PvkRenderingInfo toScreen = {

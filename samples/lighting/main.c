@@ -424,10 +424,38 @@ int main(void)
     CHECK(pvkCreateSemaphore(device, NULL, &renderDone));
     PvkCommandBufferBeginInfo beginInfo = { .flags = 0 };
 
-    /* Upload the ramp once, outside rendering, and wait for it. */
+    /* Upload the ramp once, outside rendering, and wait for it.
+     * Vulkan needs a barrier before the upload and another between the upload and the first draw that uses the ramp. */
     CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
+    /* Before the upload: the ramp is new, so there is nothing to wait for; UNDEFINED says so.
+     * On the PS2 this barrier records nothing. */
+    PvkImageMemoryBarrier toTransfer = {
+        .dstAccessMask       = PVK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout           = PVK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout           = PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED, /* one queue family: no handover */
+        .dstQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED,
+        .image               = ramp,
+        .subresourceRange    = { .aspectMask = PVK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
+    };
+    pvkCmdPipelineBarrier(cmd, PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, PVK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                          0, NULL, 0, NULL, 1, &toTransfer);
     PvkBufferImageCopy copy = { .bufferOffset = 0, .rect = { 0, 0, RAMP_WIDTH, RAMP_HEIGHT } };
     pvkCmdCopyBufferToImage(cmd, rampBuffer, ramp, &copy);
+    /* After the upload: the draws that use the ramp must not start until the upload is finished.
+     * On the PS2 this barrier records a VIF FLUSH and a GS TEXFLUSH. */
+    PvkImageMemoryBarrier toSampled = {
+        .srcAccessMask       = PVK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask       = PVK_ACCESS_SHADER_READ_BIT,
+        .oldLayout           = PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout           = PVK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED,
+        .image               = ramp,
+        .subresourceRange    = { .aspectMask = PVK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
+    };
+    pvkCmdPipelineBarrier(cmd, PVK_PIPELINE_STAGE_TRANSFER_BIT, PVK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                          0, NULL, 0, NULL, 1, &toSampled);
     CHECK(pvkEndCommandBuffer(cmd));
     PvkSubmitInfo uploadSubmit = { .commandBufferCount = 1, .commandBuffers = &cmd };
     CHECK(pvkQueueSubmit(queue, 1, &uploadSubmit, fence));

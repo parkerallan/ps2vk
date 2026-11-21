@@ -514,8 +514,8 @@ void      pvkUnmapMemory(PvkDevice device, PvkDeviceMemory memory);
  *
  * A texture created with PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT can also be
  * rendered into: pvkCmdBeginRendering() points GS FRAME at its VRAM instead
- * of a swapchain image's, and a later draw samples the same VRAM through
- * TEX0, which is how the PS2 did mirrors, in-game screens and post effects.
+ * of a swapchain image's, and a later draw, after a pvkCmdPipelineBarrier(),
+ * samples the same VRAM through TEX0, which is how the PS2 did mirrors, in-game screens and post effects.
  * Such an image gets page-aligned VRAM (FRAME addresses in 8 KB pages, where
  * a plain texture only needs 256-byte blocks) and must be at least 64 wide,
  * the unit of FRAME.FBW. Everything that reads or renders an image goes
@@ -614,6 +614,36 @@ PvkResult pvkBindImageMemory(PvkDevice device, PvkImage image, PvkDeviceMemory m
 
 /** @brief Every level from baseMipLevel on, as the levelCount of a PvkImageViewCreateInfo. */
 #define PVK_REMAINING_MIP_LEVELS (~0u)
+/** @brief Every array layer from baseArrayLayer on. */
+#define PVK_REMAINING_ARRAY_LAYERS (~0u)
+
+/** @brief How an image is being used; named in barriers. The GS reads VRAM the same way in every layout, so a change moves no bytes. */
+typedef enum PvkImageLayout {
+    PVK_IMAGE_LAYOUT_UNDEFINED                        = 0, /**< Contents unknown: a new image, or one whose contents may be discarded. */
+    PVK_IMAGE_LAYOUT_GENERAL                          = 1, /**< Any use. */
+    PVK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL         = 2, /**< Rendered into through GS FRAME. */
+    PVK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL = 3, /**< Rendered into through GS ZBUF. */
+    PVK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL         = 5, /**< Sampled through GS TEX0. */
+    PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL             = 7, /**< Written by pvkCmdCopyBufferToImage(). */
+    PVK_IMAGE_LAYOUT_PRESENT_SRC                      = 1000001002 /**< Shown through GS DISPFB. */
+} PvkImageLayout;
+
+/** @brief Which part of an image's pixels. */
+typedef enum PvkImageAspectFlagBits {
+    PVK_IMAGE_ASPECT_COLOR_BIT = 0x1, /**< The color of a CT32/CT24/CT16/T8/T4 image. */
+    PVK_IMAGE_ASPECT_DEPTH_BIT = 0x2  /**< The depth of a Z32/Z24/Z16 image. */
+} PvkImageAspectFlagBits;
+/** @brief Bitmask of PvkImageAspectFlagBits. */
+typedef uint32_t PvkImageAspectFlags;
+
+/** @brief A range of an image's mip levels. */
+typedef struct PvkImageSubresourceRange {
+    PvkImageAspectFlags aspectMask;     /**< PVK_IMAGE_ASPECT_COLOR_BIT for a color image, PVK_IMAGE_ASPECT_DEPTH_BIT for a depth image. */
+    uint32_t            baseMipLevel;   /**< First level. */
+    uint32_t            levelCount;     /**< Levels from baseMipLevel on, or PVK_REMAINING_MIP_LEVELS. */
+    uint32_t            baseArrayLayer; /**< 0: an image has one layer. */
+    uint32_t            layerCount;     /**< 1, or PVK_REMAINING_ARRAY_LAYERS. */
+} PvkImageSubresourceRange;
 
 /** @brief Parameters for pvkCreateImageView(). */
 typedef struct PvkImageViewCreateInfo {
@@ -1743,8 +1773,9 @@ typedef enum PvkRenderingFlagBits {
  * as wide as the color attachment's level, since the GS gives both buffers one
  * width, and the pipelines drawn with it must name its format in
  * depthAttachmentFormat. Rendering into a texture and sampling it later in the
- * same command buffer needs nothing more: the draw state sent before the
- * sampling draw includes a GS TEXFLUSH.
+ * same command buffer needs a pvkCmdPipelineBarrier() between the two, as
+ * in Vulkan: the barrier carries the GS TEXFLUSH that empties the texture
+ * cache.
  */
 typedef struct PvkRenderingInfo {
     uint32_t                   flags;           /**< PvkRenderingFlagBits ORed together; 0 turns none of them on, so the primary draws itself. */
@@ -2102,6 +2133,94 @@ typedef enum PvkPipelineStageFlagBits {
 } PvkPipelineStageFlagBits;
 /** @brief Bitmask of PvkPipelineStageFlagBits. */
 typedef uint32_t PvkPipelineStageFlags;
+
+/** @brief Ways a stage reads or writes memory; names what a barrier makes visible. */
+typedef enum PvkAccessFlagBits {
+    PVK_ACCESS_INDIRECT_COMMAND_READ_BIT          = 0x00000001, /**< Draw parameters read when the draw is recorded. */
+    PVK_ACCESS_INDEX_READ_BIT                     = 0x00000002, /**< Indices read when the draw is recorded. */
+    PVK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT          = 0x00000004, /**< Vertex buffers read by the VIF as the chain runs. */
+    PVK_ACCESS_UNIFORM_READ_BIT                   = 0x00000008, /**< Uniform buffers read by the VIF as the chain runs. */
+    PVK_ACCESS_SHADER_READ_BIT                    = 0x00000020, /**< A texture sampled through GS TEX0; a barrier whose destination has this bit ends with a GS TEXFLUSH. */
+    PVK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT         = 0x00000100, /**< Pixels written through GS FRAME. */
+    PVK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT = 0x00000400, /**< Depth written through GS ZBUF. */
+    PVK_ACCESS_TRANSFER_WRITE_BIT                 = 0x00001000, /**< Texels written by pvkCmdCopyBufferToImage(). */
+    PVK_ACCESS_HOST_WRITE_BIT                     = 0x00004000, /**< CPU writes to mapped memory; written back at pvkQueueSubmit(). */
+    PVK_ACCESS_MEMORY_READ_BIT                    = 0x00008000, /**< Any read. */
+    PVK_ACCESS_MEMORY_WRITE_BIT                   = 0x00010000  /**< Any write. */
+} PvkAccessFlagBits;
+/** @brief Bitmask of PvkAccessFlagBits. */
+typedef uint32_t PvkAccessFlags;
+
+/** @brief Flags for pvkCmdPipelineBarrier(). */
+typedef enum PvkDependencyFlagBits {
+    PVK_DEPENDENCY_BY_REGION_BIT = 0x00000001 /**< The dependency holds per pixel; the GS finishes whole draws, so the barrier is the same. */
+} PvkDependencyFlagBits;
+/** @brief Bitmask of PvkDependencyFlagBits. */
+typedef uint32_t PvkDependencyFlags;
+
+/** @brief Barrier source or destination queue family meaning no ownership transfer. The PS2 has one queue family. */
+#define PVK_QUEUE_FAMILY_IGNORED (~0u)
+
+/** @brief A barrier over all memory. */
+typedef struct PvkMemoryBarrier {
+    PvkAccessFlags srcAccessMask; /**< Writes made before the barrier. */
+    PvkAccessFlags dstAccessMask; /**< Reads and writes made after it. */
+} PvkMemoryBarrier;
+
+/** @brief A barrier over a range of a buffer. */
+typedef struct PvkBufferMemoryBarrier {
+    PvkAccessFlags srcAccessMask;       /**< Writes made before the barrier. */
+    PvkAccessFlags dstAccessMask;       /**< Reads and writes made after it. */
+    uint32_t       srcQueueFamilyIndex; /**< PVK_QUEUE_FAMILY_IGNORED, or 0, the one family. */
+    uint32_t       dstQueueFamilyIndex; /**< PVK_QUEUE_FAMILY_IGNORED, or 0, the one family. */
+    PvkBuffer      buffer;              /**< The buffer. */
+    size_t         offset;              /**< First byte of the range. */
+    size_t         size;                /**< Bytes from offset, or PVK_WHOLE_SIZE. */
+} PvkBufferMemoryBarrier;
+
+/** @brief A barrier over a range of an image's mip levels, with its layout change. */
+typedef struct PvkImageMemoryBarrier {
+    PvkAccessFlags           srcAccessMask;       /**< Writes made before the barrier. */
+    PvkAccessFlags           dstAccessMask;       /**< Reads and writes made after it. */
+    PvkImageLayout           oldLayout;           /**< The layout the image is in, or PVK_IMAGE_LAYOUT_UNDEFINED when its contents may be discarded. */
+    PvkImageLayout           newLayout;           /**< The layout the image is in after the barrier. */
+    uint32_t                 srcQueueFamilyIndex; /**< PVK_QUEUE_FAMILY_IGNORED, or 0, the one family. */
+    uint32_t                 dstQueueFamilyIndex; /**< PVK_QUEUE_FAMILY_IGNORED, or 0, the one family. */
+    PvkImage                 image;               /**< The image. */
+    PvkImageSubresourceRange subresourceRange;    /**< The levels covered. */
+} PvkImageMemoryBarrier;
+
+/**
+ * @brief Records a barrier: the work recorded after it waits for the work recorded before it.
+ *
+ * A command buffer is one VIF1 DMA chain, so when the barrier is reached the
+ * only work still running is the VU1 program and the GS primitives of the
+ * last draw, and the GS texture cache may hold texels of a level that was
+ * uploaded or rendered into before. The barrier is a VIF FLUSHE when
+ * srcStageMask names only vertex stages (waits for VU1 to end) and a VIF
+ * FLUSH otherwise (waits for VU1 to end and the GS to take every primitive
+ * and texel), followed by a GS TEXFLUSH when a barrier's dstAccessMask has
+ * PVK_ACCESS_SHADER_READ_BIT, so the next sampling draw reads VRAM and not
+ * the cache. A layout change moves no bytes: the GS reads VRAM the same
+ * way in every layout. Must be called outside pvkCmdBeginRendering() /
+ * pvkCmdEndRendering().
+ *
+ * @param cmd The command buffer.
+ * @param srcStageMask Stages whose work must have finished.
+ * @param dstStageMask Stages whose work waits.
+ * @param dependencyFlags PvkDependencyFlagBits ORed together, or 0.
+ * @param memoryBarrierCount Number of entries in memoryBarriers.
+ * @param memoryBarriers Barriers over all memory.
+ * @param bufferMemoryBarrierCount Number of entries in bufferMemoryBarriers.
+ * @param bufferMemoryBarriers Barriers over buffer ranges.
+ * @param imageMemoryBarrierCount Number of entries in imageMemoryBarriers.
+ * @param imageMemoryBarriers Barriers over image level ranges.
+ */
+void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageMask, PvkPipelineStageFlags dstStageMask,
+                           PvkDependencyFlags dependencyFlags,
+                           uint32_t memoryBarrierCount, const PvkMemoryBarrier *memoryBarriers,
+                           uint32_t bufferMemoryBarrierCount, const PvkBufferMemoryBarrier *bufferMemoryBarriers,
+                           uint32_t imageMemoryBarrierCount, const PvkImageMemoryBarrier *imageMemoryBarriers);
 
 /** @brief One batch of command buffers for pvkQueueSubmit(). */
 typedef struct PvkSubmitInfo {
