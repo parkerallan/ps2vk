@@ -118,11 +118,30 @@ struct PvkDevice_T {
     PvkPhysicalDeviceFeatures features;
     uint32_t vramCount;       /* taken VRAM ranges, sorted by start: swapchain framebuffers and type 1 allocations */
     struct PvkVramRange vram[PVK_MAX_VRAM_ALLOCATIONS];
+    PvkQueryPool queryPools[PVK_MAX_QUERY_POOLS]; /* by the number a SIGNAL ID carries, or NULL */
 };
 
 /* Takes `words` words of VRAM (a multiple of a page) at the first fit; 0 when none. */
 int  pvk_vram_alloc(PvkDevice device, uint32_t words, uint32_t *address);
 void pvk_vram_free(PvkDevice device, uint32_t address);
+
+/* Timestamp slots the INTC_GS handler fills: a SIGNAL ID with bit 31 set names a pool and slot. */
+struct PvkQueryPool_T {
+    PvkDevice device;
+    uint32_t  index;             /* its number in device->queryPools */
+    uint32_t  count;
+    s32       sema;              /* EE semaphore released whenever a slot is written */
+    volatile uint32_t *values;   /* EE COP0 Count at the SIGNAL */
+    volatile uint8_t  *written;
+};
+
+#define PVK_QUERY_SIGNAL_BIT 0x80000000u
+#define PVK_QUERY_RESET_BIT  0x40000000u
+/* Timestamp ID: pool number in bits 24-27, slot in bits 0-11. A reset ID adds the slot count - 1 in bits 12-23. */
+#define PVK_QUERY_ID(pool, slot)               (PVK_QUERY_SIGNAL_BIT | (pool)->index << 24 | (slot))
+#define PVK_QUERY_RESET_ID(pool, first, count) (PVK_QUERY_ID(pool, first) | PVK_QUERY_RESET_BIT | ((count) - 1) << 12)
+/* From the INTC_GS handler: stores `ticks` in the slot, or clears the range, the ID names. */
+void pvk_query_signal(PvkDevice device, uint32_t id, uint32_t ticks);
 
 /* One allocation: EE RAM (type 0, `data`) or GS VRAM (type 1, `vram` word address). */
 struct PvkDeviceMemory_T {

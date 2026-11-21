@@ -1,6 +1,8 @@
 /*
  * ps2vk step 1: clear the screen through a command buffer and present it.
  * No shaders or VU1. The clear color cycles so a hung frame is easy to spot.
+ * Two timestamps around the clear give the time the GS spent on it, printed
+ * every 60 frames.
  */
 #include <stdio.h>
 
@@ -36,6 +38,7 @@ int main(void)
     PvkCommandBuffer cmd;
     PvkFence fence;
     PvkSemaphore imageAvailable, renderDone;
+    PvkQueryPool queryPool;
     uint32_t frame = 0;
 
     PvkInstanceCreateInfo instanceInfo = { .applicationName = "clear" };
@@ -80,6 +83,9 @@ int main(void)
     CHECK(pvkCreateFence(device, NULL, &fence));
     CHECK(pvkCreateSemaphore(device, NULL, &imageAvailable));
     CHECK(pvkCreateSemaphore(device, NULL, &renderDone));
+    /* Two timestamp slots: the point before the clear and the point after it. */
+    PvkQueryPoolCreateInfo queryPoolInfo = { .queryType = PVK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 };
+    CHECK(pvkCreateQueryPool(device, &queryPoolInfo, &queryPool));
     PvkCommandBufferBeginInfo beginInfo = { .flags = 0 };
 
     printf("clear: running\n");
@@ -91,11 +97,21 @@ int main(void)
         /* The command buffer is re-recorded below, so the previous frame must be done with it. */
         CHECK(pvkWaitForFences(device, 1, &fence));
         CHECK(pvkResetFences(device, 1, &fence));
+        /* The previous frame's timestamps are in once its fence is; every 60th frame, print the GS time. */
+        if (frame > 0 && frame % 60 == 0) {
+            uint32_t ticks[2];
+            CHECK(pvkGetQueryPoolResults(device, queryPool, 0, 2, sizeof(ticks), ticks, sizeof(ticks[0]), 0));
+            printf("clear: frame %u cleared in %u us on the GS\n", (unsigned)(frame - 1),
+                   (unsigned)((ticks[1] - ticks[0]) * properties.limits.timestampPeriod / 1000.0f));
+        }
         /* imageAvailable is signaled when the image leaves the screen; the draw waits for it. */
         CHECK(pvkAcquireNextImage(device, swapchain, UINT64_MAX, imageAvailable, NULL, &imageIndex));
 
         CHECK(pvkResetCommandPool(device, commandPool, 0));
         CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
+        /* A slot must be reset before each write; timestamp 0 goes before the clear, 1 after it. */
+        pvkCmdResetQueryPool(cmd, queryPool, 0, 2);
+        pvkCmdWriteTimestamp(cmd, PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 0);
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },
             .colorAttachment = {
@@ -106,6 +122,7 @@ int main(void)
         };
         pvkCmdBeginRendering(cmd, &rendering);
         pvkCmdEndRendering(cmd);
+        pvkCmdWriteTimestamp(cmd, PVK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 1);
         CHECK(pvkEndCommandBuffer(cmd));
 
         /* The draw waits for the image and signals renderDone; the present waits for renderDone. */

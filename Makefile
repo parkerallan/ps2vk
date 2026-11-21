@@ -3,7 +3,7 @@
 
 EE_LIB  = lib/libps2vk.a
 EE_OBJS = src/pvk_device.o src/pvk_swapchain.o src/pvk_image.o src/pvk_sampler.o src/pvk_memory.o src/pvk_shader.o \
-          src/pvk_descriptor.o src/pvk_pipeline.o src/pvk_cmd.o src/pvk_queue.o
+          src/pvk_descriptor.o src/pvk_pipeline.o src/pvk_cmd.o src/pvk_queue.o src/pvk_query.o
 EE_INCS = -Iinclude
 EE_WARNFLAGS = -Wall -Wextra
 

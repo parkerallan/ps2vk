@@ -30,6 +30,8 @@ const PvkPhysicalDeviceLimits pvk_limits = {
     .pointSizeRange                      = { 1.0f, 1.0f },
     .lineWidthRange                      = { 1.0f, 1.0f },
     .subPixelPrecisionBits               = 4,
+    .timestampPeriod                     = 1.0e9f / 294912000.0f,
+    .timestampComputeAndGraphics         = 1,
 };
 
 static const PvkPhysicalDeviceFeatures supported_features = {
@@ -97,8 +99,8 @@ void pvkGetPhysicalDeviceMemoryProperties(PvkPhysicalDevice physicalDevice, PvkP
 
 /* Family 0 feeds VIF1 (PATH2), family 1 the GIF channel (PATH3). */
 static const PvkQueueFamilyProperties queue_families[PVK_MAX_QUEUE_FAMILIES] = {
-    { PVK_QUEUE_GRAPHICS_BIT | PVK_QUEUE_TRANSFER_BIT, 1, 0, { 1, 1, 1 } },
-    { PVK_QUEUE_TRANSFER_BIT, 1, 0, { 1, 1, 1 } },
+    { PVK_QUEUE_GRAPHICS_BIT | PVK_QUEUE_TRANSFER_BIT, 1, 32, { 1, 1, 1 } },
+    { PVK_QUEUE_TRANSFER_BIT, 1, 32, { 1, 1, 1 } },
 };
 
 void pvkGetPhysicalDeviceQueueFamilyProperties(PvkPhysicalDevice physicalDevice, uint32_t *count,

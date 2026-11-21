@@ -213,6 +213,8 @@ typedef enum PvkPhysicalDeviceType {
  * | maxSamplerAnisotropy | 1 | none |
  * | pointSizeRange, lineWidthRange | 1 to 1 | GS points and lines are one pixel |
  * | subPixelPrecisionBits | 4 | XYZ2 is 12.4 fixed point |
+ * | timestampPeriod | 1e9 / 294912000 ns | the EE COP0 Count register, read when the SIGNAL interrupt fires |
+ * | timestampComputeAndGraphics | 1 | a GS SIGNAL goes through PATH2 and PATH3 alike |
  */
 typedef struct PvkPhysicalDeviceLimits {
     uint32_t maxImageDimension2D;                 /**< Widest and tallest texture, in texels. */
@@ -239,6 +241,8 @@ typedef struct PvkPhysicalDeviceLimits {
     float    pointSizeRange[2];                   /**< Smallest and largest point size, in pixels. */
     float    lineWidthRange[2];                   /**< Thinnest and widest line, in pixels. */
     uint32_t subPixelPrecisionBits;               /**< Fraction bits of a rasterized position. */
+    float    timestampPeriod;                     /**< Nanoseconds per timestamp tick: the EE clock, 1e9 / 294912000. */
+    uint32_t timestampComputeAndGraphics;         /**< 1: every queue family writes timestamps. */
 } PvkPhysicalDeviceLimits;
 
 /** @brief Who and what the physical device is. */
@@ -341,7 +345,7 @@ typedef struct PvkExtent3D {
 typedef struct PvkQueueFamilyProperties {
     PvkQueueFlags queueFlags;                  /**< PvkQueueFlagBits ORed together. */
     uint32_t      queueCount;                  /**< Queues in the family: 1. */
-    uint32_t      timestampValidBits;          /**< 0: no timestamps. */
+    uint32_t      timestampValidBits;          /**< 32: the EE COP0 Count register pvkCmdWriteTimestamp() reads. */
     PvkExtent3D   minImageTransferGranularity; /**< (1, 1, 1): copies are limited by format and qword size only, see pvkCmdCopyBufferToImage(). */
 } PvkQueueFamilyProperties;
 
@@ -2417,6 +2421,141 @@ PvkResult pvkResetFences(PvkDevice device, uint32_t count, const PvkFence *fence
  * @return PVK_SUCCESS.
  */
 PvkResult pvkWaitForFences(PvkDevice device, uint32_t count, const PvkFence *fences);
+
+/** @} */
+
+/**
+ * @defgroup queries Queries
+ * @brief Timestamps the GS writes as a command buffer runs, read back after it finishes.
+ * @{
+ */
+
+/** @brief A pool of query slots. Each slot holds one timestamp and whether the slot has been written. */
+typedef struct PvkQueryPool_T *PvkQueryPool;
+
+/** @brief What a query measures. */
+typedef enum PvkQueryType {
+    PVK_QUERY_TYPE_OCCLUSION           = 0, /**< Pixels that passed the depth test. The GS counts no pixels, so pvkCreateQueryPool() fails with PVK_ERROR_FEATURE_NOT_PRESENT. */
+    PVK_QUERY_TYPE_PIPELINE_STATISTICS = 1, /**< Primitive and shader invocation counts. The GS and VU1 count nothing, so pvkCreateQueryPool() fails with PVK_ERROR_FEATURE_NOT_PRESENT. */
+    PVK_QUERY_TYPE_TIMESTAMP           = 2  /**< The EE COP0 Count register, read when the GS reaches the pvkCmdWriteTimestamp(). */
+} PvkQueryType;
+
+/** @brief Most slots in one query pool: the GS SIGNAL ID carries the slot in 12 bits. */
+#define PVK_MAX_QUERIES_PER_POOL 4096
+/** @brief Most query pools a device has at once: the GS SIGNAL ID carries the pool's number in 4 bits. */
+#define PVK_MAX_QUERY_POOLS 16
+
+/** @brief Parameters for pvkCreateQueryPool(). */
+typedef struct PvkQueryPoolCreateInfo {
+    uint32_t     flags;              /**< Reserved; 0. */
+    PvkQueryType queryType;          /**< PVK_QUERY_TYPE_TIMESTAMP. */
+    uint32_t     queryCount;         /**< Slots in the pool, 1 to PVK_MAX_QUERIES_PER_POOL. */
+    uint32_t     pipelineStatistics; /**< Reserved; 0. */
+} PvkQueryPoolCreateInfo;
+
+/** @brief How pvkGetQueryPoolResults() writes the results. */
+typedef enum PvkQueryResultFlagBits {
+    PVK_QUERY_RESULT_64_BIT_BIT            = 0x00000001, /**< Each value is a uint64_t; a uint32_t otherwise. */
+    PVK_QUERY_RESULT_WAIT_BIT              = 0x00000002, /**< Sleep until every slot asked for has been written. */
+    PVK_QUERY_RESULT_WITH_AVAILABILITY_BIT = 0x00000004, /**< After each value, one more of the same size: nonzero when the slot has been written. */
+    PVK_QUERY_RESULT_PARTIAL_BIT           = 0x00000008  /**< Not allowed for a timestamp pool, the only kind: pvkGetQueryPoolResults() fails with PVK_ERROR_VALIDATION_FAILED. */
+} PvkQueryResultFlagBits;
+/** @brief Bitmask of PvkQueryResultFlagBits. */
+typedef uint32_t PvkQueryResultFlags;
+
+/**
+ * @brief Creates a pool of timestamp slots, all unwritten.
+ *
+ * The pool takes one of the PVK_MAX_QUERY_POOLS numbers of the device, which
+ * the INTC_GS handler finds in a SIGNAL ID.
+ *
+ * @param device The device.
+ * @param info Type and slot count.
+ * @param pool Receives the pool.
+ * @return PVK_SUCCESS, PVK_ERROR_FEATURE_NOT_PRESENT for a type other than
+ *         PVK_QUERY_TYPE_TIMESTAMP, PVK_ERROR_VALIDATION_FAILED for a count
+ *         of 0 or above PVK_MAX_QUERIES_PER_POOL, or
+ *         PVK_ERROR_OUT_OF_HOST_MEMORY, also when every pool number is taken.
+ */
+PvkResult pvkCreateQueryPool(PvkDevice device, const PvkQueryPoolCreateInfo *info, PvkQueryPool *pool);
+
+/**
+ * @brief Destroys a query pool.
+ * @param device The device.
+ * @param pool The pool, or NULL; no submitted command buffer may still write to the pool.
+ */
+void      pvkDestroyQueryPool(PvkDevice device, PvkQueryPool pool);
+
+/**
+ * @brief Marks slots unwritten from the CPU, at once.
+ * @param device The device.
+ * @param pool The pool.
+ * @param firstQuery First slot.
+ * @param queryCount Slots from firstQuery; the range must lie in the pool.
+ */
+void      pvkResetQueryPool(PvkDevice device, PvkQueryPool pool, uint32_t firstQuery, uint32_t queryCount);
+
+/**
+ * @brief Records a reset: the slots are marked unwritten when the GS reaches this point.
+ *
+ * A GS SIGNAL whose ID names the pool and the range; the INTC_GS handler
+ * clears the slots. A slot must be reset, here or with pvkResetQueryPool(),
+ * before each pvkCmdWriteTimestamp() into the slot. Must be called outside
+ * pvkCmdBeginRendering() / pvkCmdEndRendering().
+ *
+ * @param cmd The command buffer, of either queue family.
+ * @param pool The pool.
+ * @param firstQuery First slot.
+ * @param queryCount Slots from firstQuery; the range must lie in the pool.
+ */
+void      pvkCmdResetQueryPool(PvkCommandBuffer cmd, PvkQueryPool pool, uint32_t firstQuery, uint32_t queryCount);
+
+/**
+ * @brief Records a timestamp: the slot takes the time at which the GS reaches this point.
+ *
+ * A VIF FLUSH (none in a transfer family command buffer), a GS FINISH and a
+ * GS SIGNAL whose ID names the pool and slot; the INTC_GS handler reads the
+ * EE COP0 Count register when the SIGNAL interrupt fires and stores the
+ * count in the slot. The GS has taken every primitive recorded before this
+ * point, so every value of @p pipelineStage marks that same point, as every
+ * stage of a wait marks the chain's DMA start (see PvkPipelineStageFlagBits).
+ * Count runs at the EE clock, PvkPhysicalDeviceLimits::timestampPeriod
+ * nanoseconds per tick, and has 32 bits: the difference of two values is
+ * right while the two lie less than 2^32 ticks (14.5 s) apart.
+ *
+ * @param cmd The command buffer, of either queue family; inside or outside a rendering.
+ * @param pipelineStage One PvkPipelineStageFlagBits value.
+ * @param pool The pool.
+ * @param query The slot, below the pool's queryCount.
+ */
+void      pvkCmdWriteTimestamp(PvkCommandBuffer cmd, PvkPipelineStageFlagBits pipelineStage, PvkQueryPool pool, uint32_t query);
+
+/**
+ * @brief Copies slot values out of a pool.
+ *
+ * Slot firstQuery + i is written at @p data + i × @p stride as a uint32_t,
+ * or a uint64_t with PVK_QUERY_RESULT_64_BIT_BIT; with
+ * PVK_QUERY_RESULT_WITH_AVAILABILITY_BIT a second value of the same size
+ * follows, nonzero when the slot has been written. With
+ * PVK_QUERY_RESULT_WAIT_BIT the thread sleeps until every slot in the range
+ * has been written, and never wakes for a slot no submitted command buffer
+ * writes. Without the bit, an unwritten slot is skipped and the call returns
+ * PVK_NOT_READY after writing the slots that are ready.
+ *
+ * @param device The device.
+ * @param pool The pool.
+ * @param firstQuery First slot.
+ * @param queryCount Slots from firstQuery; the range must lie in the pool.
+ * @param dataSize Bytes at @p data; must hold the last slot's values.
+ * @param data Where the values go.
+ * @param stride Bytes between one slot's values and the next's.
+ * @param flags PvkQueryResultFlagBits.
+ * @return PVK_SUCCESS, PVK_NOT_READY, or PVK_ERROR_VALIDATION_FAILED for a
+ *         range outside the pool, PVK_QUERY_RESULT_PARTIAL_BIT, a @p stride
+ *         smaller than the values or a @p dataSize too small.
+ */
+PvkResult pvkGetQueryPoolResults(PvkDevice device, PvkQueryPool pool, uint32_t firstQuery, uint32_t queryCount,
+                                 size_t dataSize, void *data, size_t stride, PvkQueryResultFlags flags);
 
 /** @} */
 

@@ -101,18 +101,32 @@ void pvk_device_kick(PvkDevice device)
         pvk_queue_kick(&device->transfer);
 }
 
+/* The EE COP0 Count register: one tick per EE clock. */
+static inline uint32_t ee_count(void)
+{
+    uint32_t count;
+
+    asm volatile("mfc0 %0, $9" : "=r"(count));
+    return count;
+}
+
 /* INTC_GS fires on SIGNAL: the oldest sent chain of the queue the ID names has finished. */
 static s32 gs_signal_handler(s32 cause)
 {
     PvkDevice dev = handler_device;
+    uint32_t ticks = ee_count();
 
     (void)cause;
     if (*GS_REG_CSR & 1) {
         if (dev) {
             uint32_t id = (uint32_t)*GS_REG_SIGLBLID;
-            PvkQueue queue = (id >> 8) & 1 ? &dev->transfer : &dev->queue;
-            if (queue->head != queue->tail && queue->ring[queue->head].state == 2)
-                complete_head(queue);
+            if (id & PVK_QUERY_SIGNAL_BIT) {
+                pvk_query_signal(dev, id, ticks);
+            } else {
+                PvkQueue queue = (id >> 8) & 1 ? &dev->transfer : &dev->queue;
+                if (queue->head != queue->tail && queue->ring[queue->head].state == 2)
+                    complete_head(queue);
+            }
         }
         /* Acknowledge, or the GS stalls at its next SIGNAL. */
         *GS_REG_CSR = 1;

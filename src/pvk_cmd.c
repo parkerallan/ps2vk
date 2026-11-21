@@ -924,6 +924,71 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
     }
 }
 
+
+#define PVK_ALL_STAGES (PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | \
+                        PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT | PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT | PVK_GS_STAGES)
+
+/* Open a GS packet on the command buffer's path: DIRECT (PATH2) or the GIF channel (PATH3). */
+static qword_t *cmd_open_gs(PvkCommandBuffer cmd)
+{
+    return cmd->pool->family ? cmd_open_gif(cmd) : cmd_open_direct(cmd);
+}
+
+static void cmd_close_gs(PvkCommandBuffer cmd, qword_t *end)
+{
+    if (cmd->pool->family)
+        cmd_close_gif(cmd, end);
+    else
+        cmd_close_direct(cmd, end);
+}
+
+/* Fails the recording for a slot range outside the pool. */
+static int cmd_query_range(PvkCommandBuffer cmd, const char *who, PvkQueryPool pool, uint32_t first, uint32_t count)
+{
+    if (pool && first < pool->count && count >= 1 && count <= pool->count - first)
+        return 1;
+    pvk_error("%s: slots %u to %u lie outside the pool's %u\n", who, (unsigned)first, (unsigned)(first + count - 1),
+              pool ? (unsigned)pool->count : 0u);
+    cmd->failed = 1;
+    return 0;
+}
+
+void pvkCmdResetQueryPool(PvkCommandBuffer cmd, PvkQueryPool pool, uint32_t firstQuery, uint32_t queryCount)
+{
+    qword_t *q;
+
+    if (cmd->rendering) {
+        pvk_error("pvkCmdResetQueryPool must be called outside pvkCmdBeginRendering/pvkCmdEndRendering\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (!cmd_query_range(cmd, "pvkCmdResetQueryPool", pool, firstQuery, queryCount) || !cmd_reserve(cmd, 5))
+        return;
+    /* The handler clears the slots when the GS reaches the SIGNAL. */
+    q = cmd_open_gs(cmd);
+    q = gs_ad(q, GIF_SET_TAG(1, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_SIGNAL(PVK_QUERY_RESET_ID(pool, firstQuery, queryCount), 0xFFFFFFFF), GS_REG_SIGNAL);
+    cmd_close_gs(cmd, q);
+}
+
+void pvkCmdWriteTimestamp(PvkCommandBuffer cmd, PvkPipelineStageFlagBits pipelineStage, PvkQueryPool pool, uint32_t query)
+{
+    qword_t *q;
+
+    if (!pipelineStage || (pipelineStage & (pipelineStage - 1)) || (pipelineStage & ~PVK_ALL_STAGES)) {
+        pvk_error("pvkCmdWriteTimestamp: pipelineStage 0x%x is not one stage\n", (unsigned)pipelineStage);
+        cmd->failed = 1;
+        return;
+    }
+    if (!cmd_query_range(cmd, "pvkCmdWriteTimestamp", pool, query, 1) || !cmd_reserve(cmd, 6))
+        return;
+    /* FLUSH (in the DIRECT open), FINISH, then the SIGNAL the handler times. */
+    q = cmd_open_gs(cmd);
+    q = gs_ad(q, GIF_SET_TAG(2, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_FINISH(0), GS_REG_FINISH);
+    q = gs_ad(q, GS_SET_SIGNAL(PVK_QUERY_ID(pool, query), 0xFFFFFFFF), GS_REG_SIGNAL);
+    cmd_close_gs(cmd, q);
+}
 void pvkCmdEndRendering(PvkCommandBuffer cmd)
 {
     if (cmd->inherits) {
