@@ -56,8 +56,11 @@ int main(void)
     for (uint32_t i = 0; i < memory.memoryTypeCount; i++)
         printf("clear: memory type %u: heap %u, flags 0x%x\n", (unsigned)i, (unsigned)memory.memoryTypes[i].heapIndex,
                (unsigned)memory.memoryTypes[i].propertyFlags);
-    CHECK(pvkCreateDevice(physicalDevice, NULL, &device));
-    pvkGetDeviceQueue(device, &queue);
+    /* Queue family 0 is the graphics queue (pvkGetPhysicalDeviceQueueFamilyProperties lists it). */
+    PvkDeviceQueueCreateInfo queueInfo = { .queueFamilyIndex = 0, .queueCount = 1 };
+    PvkDeviceCreateInfo deviceInfo = { .queueCreateInfoCount = 1, .queueCreateInfos = &queueInfo };
+    CHECK(pvkCreateDevice(physicalDevice, &deviceInfo, &device));
+    pvkGetDeviceQueue(device, 0, 0, &queue);
 
     PvkSwapchainCreateInfo swapchainInfo = {
         .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_CT32, .imageCount = 2,

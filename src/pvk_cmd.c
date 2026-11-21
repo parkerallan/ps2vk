@@ -1,4 +1,6 @@
-/* Command buffers: recorded as a VIF1 DMA chain, sent as-is on submit. */
+/* Command buffers: recorded as a DMA chain, sent as-is on submit: a VIF1 chain for the
+ * graphics family, a GIF channel chain (no VIF codes, GS packets straight through PATH3) for
+ * the transfer family. */
 #include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +9,9 @@
 
 /* VIF UNPACK writes at most 256 qwords per code; stay below that. */
 #define PVK_MAX_UNPACK_QWORDS 255
+
+/* Writes one A+D register setting. */
+static qword_t *gs_ad(qword_t *q, u64 value, u64 reg);
 
 /* Make sure `qwords` more fit in the chain; mark the buffer failed if not. */
 static int cmd_reserve(PvkCommandBuffer cmd, uint32_t qwords)
@@ -53,14 +58,48 @@ static void cmd_close_direct(PvkCommandBuffer cmd, qword_t *end)
     packet2_chain_close_tag(&cmd->packet);
 }
 
+/* Open a CNT tag on the GIF channel (PATH3); GS packets are written at the returned pointer. */
+static qword_t *cmd_open_gif(PvkCommandBuffer cmd)
+{
+    packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+    return cmd->packet.next;
+}
+
+static void cmd_close_gif(PvkCommandBuffer cmd, qword_t *end)
+{
+    packet2_update(&cmd->packet, end);
+    packet2_chain_close_tag(&cmd->packet);
+}
+
+/* The queue a pool's command buffers go to. */
+static PvkQueue pool_queue(PvkCommandPool pool)
+{
+    return pool->family ? &pool->device->transfer : &pool->device->queue;
+}
+
+/* Fails the recording when the command needs the graphics family. */
+static int cmd_graphics(PvkCommandBuffer cmd, const char *who)
+{
+    if (cmd->pool->family == 0)
+        return 1;
+    pvk_error("%s: the command buffer is from a pool of the transfer family (1), which has no graphics\n", who);
+    cmd->failed = 1;
+    return 0;
+}
+
 PvkResult pvkCreateCommandPool(PvkDevice device, const PvkCommandPoolCreateInfo *info, PvkCommandPool *pool)
 {
     PvkCommandPool p;
     uint32_t flags  = info ? info->flags : 0;
+    uint32_t family = info ? info->queueFamilyIndex : 0;
     uint32_t qwords = info && info->maxQwords ? info->maxQwords : PVK_DEFAULT_CMD_QWORDS;
 
     if (flags & ~(PVK_COMMAND_POOL_CREATE_TRANSIENT_BIT | PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)) {
         pvk_error("command pool: unknown flags 0x%x\n", (unsigned)flags);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (family >= PVK_MAX_QUEUE_FAMILIES || !device->families[family]) {
+        pvk_error("command pool: queue family %u was not asked for at pvkCreateDevice\n", (unsigned)family);
         return PVK_ERROR_VALIDATION_FAILED;
     }
 
@@ -74,6 +113,7 @@ PvkResult pvkCreateCommandPool(PvkDevice device, const PvkCommandPoolCreateInfo 
     }
     p->device = device;
     p->flags  = flags;
+    p->family = family;
     p->qwords = qwords;
 
     *pool = p;
@@ -86,7 +126,8 @@ void pvkDestroyCommandPool(PvkDevice device, PvkCommandPool pool)
 
     if (!pool)
         return;
-    pvk_queue_wait_idle(&device->queue);
+    (void)device;
+    pvk_queue_wait_idle(pool_queue(pool));
     for (cmd = pool->buffers; cmd; cmd = next) {
         next = cmd->next;
         free(cmd->executed);
@@ -100,12 +141,13 @@ PvkResult pvkResetCommandPool(PvkDevice device, PvkCommandPool pool, uint32_t fl
 {
     PvkCommandBuffer cmd;
 
+    (void)device;
     (void)flags;
     if (pool->recording) {
         pvk_error("pvkResetCommandPool: a command buffer of the pool is recording\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
-    pvk_queue_wait_idle(&device->queue);
+    pvk_queue_wait_idle(pool_queue(pool));
     for (cmd = pool->buffers; cmd; cmd = cmd->next)
         cmd->size = 0;
     pool->used = 0;
@@ -222,7 +264,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
                       "PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT\n");
             return PVK_ERROR_VALIDATION_FAILED;
         }
-        pvk_queue_wait_idle(&cmd->device->queue);
+        pvk_queue_wait_idle(pool_queue(pool));
         if (cmd->start + cmd->size == pool->used)
             pool->used = cmd->start;
         cmd->size = 0;
@@ -241,7 +283,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
     cmd->packet.max_qwords_count   = room;
     cmd->packet.type               = P2_TYPE_NORMAL;
     cmd->packet.mode               = P2_MODE_CHAIN;
-    cmd->packet.tte                = 1;
+    cmd->packet.tte                = pool->family == 0; /* the GIF channel takes no VIF codes */
     cmd->packet.base               = pool->block + cmd->start;
     cmd->packet.next               = cmd->packet.base;
     cmd->packet.tag_opened_at      = NULL;
@@ -262,6 +304,15 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
     cmd->rendering    = cmd->inherits;
     cmd->failed       = 0;
     cmd->recording    = 1;
+
+    /* With a transfer queue, a draw chain holds PATH3 off (VIF MSKPATH3) until its end, so an
+     * upload takes the GIF between draw chains and not between the packets of one. */
+    if (!secondary && pool->family == 0 && cmd->device->families[1] && cmd_reserve(cmd, 1)) {
+        packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+        packet2_vif_mskpath3(&cmd->packet, 1, 0);
+        packet2_vif_nop(&cmd->packet, 0);
+        packet2_chain_close_tag(&cmd->packet);
+    }
     return PVK_SUCCESS;
 }
 
@@ -278,8 +329,22 @@ PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd)
         /* Back to the primary's chain after the CALL tag that came here. */
         if (cmd_reserve(cmd, 1)) {
             packet2_chain_ret(&cmd->packet, 0, 0);
-            packet2_vif_nop(&cmd->packet, 0);
-            packet2_vif_nop(&cmd->packet, 0);
+            if (cmd->packet.tte) {
+                packet2_vif_nop(&cmd->packet, 0);
+                packet2_vif_nop(&cmd->packet, 0);
+            }
+            packet2_chain_close_tag(&cmd->packet);
+        }
+    } else if (cmd->pool->family == 1) {
+        /* END tag holding the GS FINISH and SIGNAL; the ID is filled in at submit. */
+        if (cmd_reserve(cmd, 4)) {
+            packet2_chain_open_end(&cmd->packet, 0, 0);
+            q = cmd->packet.next;
+            q = gs_ad(q, GIF_SET_TAG(2, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+            q = gs_ad(q, GS_SET_FINISH(0), GS_REG_FINISH);
+            cmd->signalQw = q - cmd->packet.base;
+            q = gs_ad(q, GS_SET_SIGNAL(0, 0xFFFFFFFF), GS_REG_SIGNAL);
+            packet2_update(&cmd->packet, q);
             packet2_chain_close_tag(&cmd->packet);
         }
     } else if (cmd_reserve(cmd, 6)) {
@@ -297,7 +362,14 @@ PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd)
         q->dw[1] = GS_REG_SIGNAL;
         q++;
         cmd_close_direct(cmd, q);
-        packet2_utils_vu_add_end_tag(&cmd->packet);
+        /* The END tag lets PATH3 go again (MSKPATH3 off) once the chain is in. */
+        packet2_chain_open_end(&cmd->packet, 0, 0);
+        if (cmd->device->families[1])
+            packet2_vif_mskpath3(&cmd->packet, 0, 0);
+        else
+            packet2_vif_nop(&cmd->packet, 0);
+        packet2_vif_nop(&cmd->packet, 0);
+        packet2_chain_close_tag(&cmd->packet);
     }
 
     /* Keep what was recorded; the rest of the block is free again. */
@@ -396,6 +468,8 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
     zbuffer_t z = { 0 };
     qword_t *q;
 
+    if (!cmd_graphics(cmd, "pvkCmdBeginRendering"))
+        return;
     if (cmd->rendering) {
         pvk_error("pvkCmdBeginRendering: already rendering%s\n", cmd->inherits
                   ? " (a secondary command buffer recorded with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT "
@@ -557,6 +631,8 @@ void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, ui
 {
     uint32_t i;
 
+    if (!cmd_graphics(cmd, "pvkCmdBindDescriptorSets"))
+        return;
     if (firstSet + setCount > layout->setLayoutCount || firstSet + setCount > pvk_limits.maxBoundDescriptorSets) {
         pvk_error("pvkCmdBindDescriptorSets: sets %u to %u, but the pipeline layout has %u set layouts\n",
                   (unsigned)firstSet, (unsigned)(firstSet + setCount), (unsigned)layout->setLayoutCount);
@@ -587,6 +663,7 @@ static void cmd_copy_color_table(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImag
     const PvkRect2D *r = &region->rect;
     uint32_t entries = table->fb.width, bytes = pvk_format_bits(table->format) / 8, qwords = entries * bytes / 16, i;
     const uint8_t *src = (const uint8_t *)buffer->data + region->bufferOffset;
+    int path3 = cmd->pool->family == 1;
     uint8_t *dst;
     qword_t *q;
 
@@ -604,19 +681,22 @@ static void cmd_copy_color_table(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImag
     if (!cmd_reserve(cmd, 8 + qwords))
         return;
 
-    q = cmd_open_direct(cmd);
+    q = path3 ? cmd_open_gif(cmd) : cmd_open_direct(cmd);
     q = gs_ad(q, GIF_SET_TAG(4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     q = gs_ad(q, GS_SET_BITBLTBUF(0, 0, 0, table->fb.address >> 6, 1, table->fb.psm), GS_REG_BITBLTBUF);
     q = gs_ad(q, GS_SET_TRXPOS(0, 0, 0, 0, 0), GS_REG_TRXPOS);
     q = gs_ad(q, GS_SET_TRXREG(entries == 256 ? 16 : 8, entries == 256 ? 16 : 2), GS_REG_TRXREG);
     q = gs_ad(q, GS_SET_TRXDIR(0), GS_REG_TRXDIR);
-    q = gs_ad(q, GIF_SET_TAG(qwords, 0, 0, 0, GIF_FLG_IMAGE, 0), 0);
+    q = gs_ad(q, GIF_SET_TAG(qwords, path3, 0, 0, GIF_FLG_IMAGE, 0), 0);
     dst = (uint8_t *)q;
     for (i = 0; i < entries; i++) {
         uint32_t slot = entries == 256 ? (i & ~0x18u) | ((i & 8) << 1) | ((i & 16) >> 1) : i;
         memcpy(dst + slot * bytes, src + i * bytes, bytes);
     }
-    cmd_close_direct(cmd, q + qwords);
+    if (path3)
+        cmd_close_gif(cmd, q + qwords);
+    else
+        cmd_close_direct(cmd, q + qwords);
 }
 
 void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage image, const PvkBufferImageCopy *region)
@@ -624,6 +704,7 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
     const PvkRect2D *r = &region->rect;
     const uint8_t *src;
     uint32_t bytes, qwords, sent = 0, level = region->mipLevel, width, height;
+    int path3 = cmd->pool->family == 1;
     qword_t *q;
 
     if (!(image->usage & PVK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
@@ -677,13 +758,14 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
     }
     src = (const uint8_t *)buffer->data + region->bufferOffset;
 
-    /* Chain: a DIRECT block with the transfer setup, then per chunk a DIRECT
-     * block holding the IMAGE tag and a REF tag streaming the pixels from the
-     * buffer through a DIRECT of its own (the two VIF codes in the REF tag). */
+    /* Chain: a block with the transfer setup, then per chunk a block holding the IMAGE tag and a
+     * REF tag streaming the pixels from the buffer. On VIF1 each block is a DIRECT (the REF tag
+     * carries the DIRECT code for its pixels); on the GIF channel the GS packets go as they are,
+     * and every chunk ends its GIF packet so a draw chain may take the GIF between chunks. */
     if (!cmd_reserve(cmd, 7 + 3 * ((qwords + PVK_IMAGE_CHUNK_QWORDS - 1) / PVK_IMAGE_CHUNK_QWORDS)))
         return;
 
-    q = cmd_open_direct(cmd);
+    q = path3 ? cmd_open_gif(cmd) : cmd_open_direct(cmd);
     q = gs_ad(q, GIF_SET_TAG(4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     q = gs_ad(q, GS_SET_BITBLTBUF(0, 0, 0, image->levelAddress[level] >> 6, image->levelTbw[level], image->fb.psm),
               GS_REG_BITBLTBUF);
@@ -691,23 +773,29 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
     q = gs_ad(q, GS_SET_TRXREG(r->width, r->height), GS_REG_TRXREG);
     q = gs_ad(q, GS_SET_TRXDIR(0), GS_REG_TRXDIR); /* host to local */
     packet2_update(&cmd->packet, q);
-    packet2_vif_close_direct_auto(&cmd->packet);
+    if (!path3)
+        packet2_vif_close_direct_auto(&cmd->packet);
     packet2_chain_close_tag(&cmd->packet);
 
     while (sent < qwords) {
         uint32_t chunk = qwords - sent < PVK_IMAGE_CHUNK_QWORDS ? qwords - sent : PVK_IMAGE_CHUNK_QWORDS;
-        int last = sent + chunk == qwords;
+        int eop = path3 || sent + chunk == qwords;
 
         packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
-        packet2_vif_nop(&cmd->packet, 0);
-        packet2_vif_open_direct(&cmd->packet, 0);
-        packet2_add_2x_s64(&cmd->packet, GIF_SET_TAG(chunk, last, 0, 0, GIF_FLG_IMAGE, 0), 0);
-        packet2_vif_close_direct_auto(&cmd->packet);
+        if (!path3) {
+            packet2_vif_nop(&cmd->packet, 0);
+            packet2_vif_open_direct(&cmd->packet, 0);
+        }
+        packet2_add_2x_s64(&cmd->packet, GIF_SET_TAG(chunk, eop, 0, 0, GIF_FLG_IMAGE, 0), 0);
+        if (!path3)
+            packet2_vif_close_direct_auto(&cmd->packet);
         packet2_chain_close_tag(&cmd->packet);
 
         packet2_chain_ref(&cmd->packet, src + (size_t)sent * 16, chunk, 0, 0, 0);
-        packet2_vif_nop(&cmd->packet, 0);
-        packet2_add_u32(&cmd->packet, MAKE_VIF_CODE(chunk, 0, P2_VIF_DIRECT, 0));
+        if (!path3) {
+            packet2_vif_nop(&cmd->packet, 0);
+            packet2_add_u32(&cmd->packet, MAKE_VIF_CODE(chunk, 0, P2_VIF_DIRECT, 0));
+        }
         sent += chunk;
     }
 }
@@ -718,11 +806,22 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
                        PVK_PIPELINE_STAGE_TRANSFER_BIT | PVK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | \
                        PVK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | PVK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
 
+/* Both PVK_QUEUE_FAMILY_IGNORED, or two families the device has, one of them the command buffer's. */
 static int barrier_queue_families(PvkCommandBuffer cmd, const char *what, uint32_t src, uint32_t dst)
 {
-    if ((src != PVK_QUEUE_FAMILY_IGNORED && src != 0) || (dst != PVK_QUEUE_FAMILY_IGNORED && dst != 0)) {
-        pvk_error("pvkCmdPipelineBarrier: %s barrier names queue family %u -> %u; the device has family 0 only\n",
-                  what, (unsigned)src, (unsigned)dst);
+    PvkDevice dev = cmd->device;
+
+    if ((src == PVK_QUEUE_FAMILY_IGNORED) != (dst == PVK_QUEUE_FAMILY_IGNORED) ||
+        (src != PVK_QUEUE_FAMILY_IGNORED && (src >= PVK_MAX_QUEUE_FAMILIES || dst >= PVK_MAX_QUEUE_FAMILIES ||
+                                             !dev->families[src] || !dev->families[dst]))) {
+        pvk_error("pvkCmdPipelineBarrier: %s barrier names queue family %u -> %u; both PVK_QUEUE_FAMILY_IGNORED, "
+                  "or two families the device was created with\n", what, (unsigned)src, (unsigned)dst);
+        cmd->failed = 1;
+        return 0;
+    }
+    if (src != dst && src != cmd->pool->family && dst != cmd->pool->family) {
+        pvk_error("pvkCmdPipelineBarrier: %s barrier hands over from family %u to %u, but the command buffer is "
+                  "of family %u\n", what, (unsigned)src, (unsigned)dst, (unsigned)cmd->pool->family);
         cmd->failed = 1;
         return 0;
     }
@@ -736,6 +835,7 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
                            uint32_t imageMemoryBarrierCount, const PvkImageMemoryBarrier *imageMemoryBarriers)
 {
     uint32_t i, dstAccess = 0;
+    int fromTransfer = 0;
     qword_t *q;
 
     (void)dstStageMask;
@@ -762,6 +862,7 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
             return;
         }
         dstAccess |= b->dstAccessMask;
+        fromTransfer |= b->srcQueueFamilyIndex == 1 && b->dstQueueFamilyIndex == 0;
     }
     for (i = 0; i < imageMemoryBarrierCount; i++) {
         const PvkImageMemoryBarrier *b = &imageMemoryBarriers[i];
@@ -791,10 +892,21 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
             return;
         }
         dstAccess |= b->dstAccessMask;
+        fromTransfer |= b->srcQueueFamilyIndex == 1 && b->dstQueueFamilyIndex == 0;
     }
-    if (!cmd_reserve(cmd, 4))
+    /* The GIF channel carries no VIF codes, and the GS takes the transfer queue's copies in order. */
+    if (cmd->pool->family == 1)
+        return;
+    if (!cmd_reserve(cmd, 5))
         return;
 
+    /* Taking over from the transfer queue: FLUSHA also waits for the PATH3 packet the GIF is taking. */
+    if (fromTransfer) {
+        packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+        packet2_vif_flusha(&cmd->packet, 0);
+        packet2_vif_nop(&cmd->packet, 0);
+        packet2_chain_close_tag(&cmd->packet);
+    }
     if (dstAccess & PVK_ACCESS_SHADER_READ_BIT) {
         /* The DIRECT block opens with a FLUSH; TEXFLUSH drops the texels the cache holds. */
         q = cmd_open_direct(cmd);
@@ -834,6 +946,13 @@ void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkComman
         cmd->failed = 1;
         return;
     }
+    for (i = 0; i < count; i++)
+        if (cmds[i]->pool->family != cmd->pool->family) {
+            pvk_error("pvkCmdExecuteCommands: secondary %u is from a pool of queue family %u, the primary of %u\n",
+                      (unsigned)i, (unsigned)cmds[i]->pool->family, (unsigned)cmd->pool->family);
+            cmd->failed = 1;
+            return;
+        }
     if (cmd->rendering && !cmd->secondaryContents) {
         pvk_error("pvkCmdExecuteCommands inside a rendering begun without "
                   "PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT\n");
@@ -897,8 +1016,10 @@ void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkComman
         PvkCommandBuffer s = cmds[i];
 
         packet2_chain_call(&cmd->packet, s->pool->block + s->start, 0, 0, 0);
-        packet2_vif_nop(&cmd->packet, 0);
-        packet2_vif_nop(&cmd->packet, 0);
+        if (cmd->packet.tte) {
+            packet2_vif_nop(&cmd->packet, 0);
+            packet2_vif_nop(&cmd->packet, 0);
+        }
         packet2_chain_close_tag(&cmd->packet);
         s->used = 1;
         cmd->executed[cmd->executedCount].cmd        = s;
@@ -918,6 +1039,8 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
     float context[PVK_VU1_CONTEXT_QWORDS * 4];
     uint32_t i;
 
+    if (!cmd_graphics(cmd, "pvkCmdBindPipeline"))
+        return;
     if (!cmd_reserve(cmd, packet2_utils_get_packet_size_for_program(start, end) + 8))
         return;
 
@@ -943,6 +1066,8 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
 void pvkCmdSetViewport(PvkCommandBuffer cmd, uint32_t firstViewport, uint32_t viewportCount,
                        const PvkViewport *viewports)
 {
+    if (!cmd_graphics(cmd, "pvkCmdSetViewport"))
+        return;
     if (firstViewport != 0 || viewportCount != 1) {
         pvk_error("pvkCmdSetViewport: viewport %u, count %u; the GS has one viewport\n", (unsigned)firstViewport,
                   (unsigned)viewportCount);
@@ -956,6 +1081,8 @@ void pvkCmdSetViewport(PvkCommandBuffer cmd, uint32_t firstViewport, uint32_t vi
 
 void pvkCmdSetScissor(PvkCommandBuffer cmd, uint32_t firstScissor, uint32_t scissorCount, const PvkRect2D *scissors)
 {
+    if (!cmd_graphics(cmd, "pvkCmdSetScissor"))
+        return;
     if (firstScissor != 0 || scissorCount != 1) {
         pvk_error("pvkCmdSetScissor: scissor %u, count %u; the GS has one scissor\n", (unsigned)firstScissor,
                   (unsigned)scissorCount);
@@ -969,6 +1096,8 @@ void pvkCmdSetScissor(PvkCommandBuffer cmd, uint32_t firstScissor, uint32_t scis
 
 void pvkCmdSetBlendConstants(PvkCommandBuffer cmd, const float blendConstants[4])
 {
+    if (!cmd_graphics(cmd, "pvkCmdSetBlendConstants"))
+        return;
     memcpy(cmd->blendConstants, blendConstants, sizeof(cmd->blendConstants));
     cmd->dynamicSet  |= 1u << PVK_DYNAMIC_STATE_BLEND_CONSTANTS;
     cmd->gsStateDirty = 1;
@@ -980,6 +1109,8 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_
     uint32_t first, last, q, i, mask;
     const uint32_t *words;
 
+    if (!cmd_graphics(cmd, "pvkCmdPushConstants"))
+        return;
     if ((offset | size) & 3 || size == 0 || offset + size > pvk_limits.maxPushConstantsSize) {
         pvk_error("pvkCmdPushConstants: offset %u and size %u must be multiples of 4 "
                   "within %u bytes (maxPushConstantsSize)\n", (unsigned)offset, (unsigned)size,
@@ -1031,6 +1162,8 @@ void pvkCmdBindVertexBuffers(PvkCommandBuffer cmd, uint32_t firstBinding, uint32
 {
     uint32_t i;
 
+    if (!cmd_graphics(cmd, "pvkCmdBindVertexBuffers"))
+        return;
     if (firstBinding + bindingCount > pvk_limits.maxVertexInputBindings) {
         pvk_error("pvkCmdBindVertexBuffers: bindings %u..%u go past maxVertexInputBindings\n",
                   (unsigned)firstBinding, (unsigned)(firstBinding + bindingCount - 1));
@@ -1051,6 +1184,8 @@ void pvkCmdBindVertexBuffers(PvkCommandBuffer cmd, uint32_t firstBinding, uint32
 
 void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, PvkIndexType type)
 {
+    if (!cmd_graphics(cmd, "pvkCmdBindIndexBuffer"))
+        return;
     if (type != PVK_INDEX_TYPE_UINT16) {
         pvk_error("pvkCmdBindIndexBuffer: only PVK_INDEX_TYPE_UINT16 is supported\n");
         cmd->failed = 1;
@@ -1146,7 +1281,11 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
     uint32_t b, missing;
     framebuffer_t fb;
     PvkRect2D scissor;
-    PvkFormat depthFormat = cmd->inherits ? cmd->inheritedDepthFormat
+    PvkFormat depthFormat;
+
+    if (!cmd_graphics(cmd, name))
+        return 0;
+    depthFormat = cmd->inherits ? cmd->inheritedDepthFormat
                           : cmd->depthView ? cmd->depthView->image->format : PVK_FORMAT_UNDEFINED;
 
     if (!cmd->rendering || !p) {

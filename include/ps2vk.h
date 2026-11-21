@@ -133,7 +133,15 @@ typedef struct PvkInstance_T      *PvkInstance;
 typedef struct PvkPhysicalDevice_T *PvkPhysicalDevice;
 /** @brief The PS2 graphics hardware (EE DMA, VU1, GS). There is only one. */
 typedef struct PvkDevice_T        *PvkDevice;
-/** @brief Where command buffers are submitted. The device has exactly one. */
+/**
+ * @brief Where command buffers are submitted: one per queue family the device was created with.
+ *
+ * The graphics queue (family 0) sends its chains down DMA channel 1 through
+ * VIF1 and PATH2; the transfer queue (family 1) sends its chains down DMA
+ * channel 2 straight to the GIF through PATH3, so a texture upload runs
+ * while VIF1 and VU1 feed draws. The GIF takes PATH2 and PATH3 packets in
+ * turn, so the two queues interleave at GIF packet boundaries.
+ */
 typedef struct PvkQueue_T         *PvkQueue;
 /**
  * @brief Lets the CPU wait until a submission has finished drawing, or an acquired swapchain image is free.
@@ -308,9 +316,50 @@ typedef struct PvkPhysicalDeviceMemoryProperties {
     PvkMemoryHeap memoryHeaps[PVK_MAX_MEMORY_HEAPS]; /**< The heaps. */
 } PvkPhysicalDeviceMemoryProperties;
 
-/** @brief Parameters for pvkCreateDevice(). May be NULL. */
+/** @brief What a queue family's queues can do. */
+typedef enum PvkQueueFlagBits {
+    PVK_QUEUE_GRAPHICS_BIT = 0x00000001, /**< Draws: pvkCmdBeginRendering() and everything inside it. */
+    PVK_QUEUE_TRANSFER_BIT = 0x00000004  /**< Copies: pvkCmdCopyBufferToImage(). A graphics family has it too. */
+} PvkQueueFlagBits;
+/** @brief Bitmask of PvkQueueFlagBits. */
+typedef uint32_t PvkQueueFlags;
+
+/** @brief A size in three dimensions. */
+typedef struct PvkExtent3D {
+    uint32_t width;  /**< Width. */
+    uint32_t height; /**< Height. */
+    uint32_t depth;  /**< Depth. */
+} PvkExtent3D;
+
+/**
+ * @brief One queue family: a kind of queue and how many of it the device has.
+ *
+ * Family 0 is the graphics queue: VIF1 and PATH2, GRAPHICS and TRANSFER.
+ * Family 1 is the transfer queue: the GIF DMA channel and PATH3, TRANSFER
+ * only. Each has one queue; family 0 alone presents.
+ */
+typedef struct PvkQueueFamilyProperties {
+    PvkQueueFlags queueFlags;                  /**< PvkQueueFlagBits ORed together. */
+    uint32_t      queueCount;                  /**< Queues in the family: 1. */
+    uint32_t      timestampValidBits;          /**< 0: no timestamps. */
+    PvkExtent3D   minImageTransferGranularity; /**< (1, 1, 1): copies are limited by format and qword size only, see pvkCmdCopyBufferToImage(). */
+} PvkQueueFamilyProperties;
+
+/** @brief Most queue families the device has. */
+#define PVK_MAX_QUEUE_FAMILIES 2
+
+/** @brief One queue family to create queues of, for PvkDeviceCreateInfo. */
+typedef struct PvkDeviceQueueCreateInfo {
+    uint32_t     queueFamilyIndex; /**< 0 for the graphics queue, 1 for the transfer queue. */
+    uint32_t     queueCount;       /**< Queues of the family: 1. */
+    const float *queuePriorities;  /**< One priority per queue, or NULL; the hardware has none to set. */
+} PvkDeviceQueueCreateInfo;
+
+/** @brief Parameters for pvkCreateDevice(). */
 typedef struct PvkDeviceCreateInfo {
-    const PvkPhysicalDeviceFeatures *enabledFeatures; /**< Features to turn on, or NULL for none. */
+    uint32_t                        queueCreateInfoCount; /**< Number of entries in queueCreateInfos, at least 1. */
+    const PvkDeviceQueueCreateInfo *queueCreateInfos;     /**< The queue families to create queues of, each family once. */
+    const PvkPhysicalDeviceFeatures *enabledFeatures;     /**< Features to turn on, or NULL for none. */
 } PvkDeviceCreateInfo;
 
 /**
@@ -358,11 +407,19 @@ void      pvkGetPhysicalDeviceFeatures(PvkPhysicalDevice physicalDevice, PvkPhys
 void      pvkGetPhysicalDeviceMemoryProperties(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceMemoryProperties *properties);
 
 /**
- * @brief Prepares the graphics hardware: resets the GIF and sets up the GIF and VIF1 DMA channels.
+ * @brief Reports the queue families: the graphics queue (family 0) and the transfer queue (family 1).
+ * @param physicalDevice The physical device.
+ * @param[in,out] count With @p properties NULL, receives how many there are (2); otherwise how many fit, then how many were written.
+ * @param[out] properties The families, or NULL to ask for the count.
+ */
+void      pvkGetPhysicalDeviceQueueFamilyProperties(PvkPhysicalDevice physicalDevice, uint32_t *count, PvkQueueFamilyProperties *properties);
+
+/**
+ * @brief Prepares the graphics hardware: resets the GIF, sets up the VIF1 DMA channel and, when family 1 is asked for, the GIF DMA channel.
  * @param physicalDevice The physical device from pvkEnumeratePhysicalDevices().
- * @param info Device parameters and the features to enable, or NULL for none.
+ * @param info The queue families to create queues of and the features to enable.
  * @param[out] device The new device.
- * @return PVK_SUCCESS, PVK_ERROR_FEATURE_NOT_PRESENT for an enabled feature the hardware lacks, or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED if no queue is asked for, a family is unknown or asked for twice, or a queueCount is not 1; PVK_ERROR_FEATURE_NOT_PRESENT for an enabled feature the hardware lacks; or PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
 PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreateInfo *info, PvkDevice *device);
 
@@ -373,11 +430,13 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
 void      pvkDestroyDevice(PvkDevice device);
 
 /**
- * @brief Gets the device's queue.
+ * @brief Gets one of the device's queues.
  * @param device The device.
- * @param[out] queue The queue.
+ * @param queueFamilyIndex A family named in the device's PvkDeviceCreateInfo: 0 graphics, 1 transfer.
+ * @param queueIndex 0: each family has one queue.
+ * @param[out] queue The queue, or NULL if the family was not asked for at pvkCreateDevice() or the index is not 0.
  */
-void      pvkGetDeviceQueue(PvkDevice device, PvkQueue *queue);
+void      pvkGetDeviceQueue(PvkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, PvkQueue *queue);
 
 /**
  * @brief Waits until all submitted work has finished.
@@ -536,6 +595,18 @@ typedef enum PvkImageUsageFlagBits {
     PVK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT = 0x20  /**< Rendered into as the depth attachment: GS ZBUF. */
 } PvkImageUsageFlagBits;
 
+/**
+ * @brief Which queue families may use a buffer or image at once.
+ *
+ * GS VRAM and EE RAM are read the same way from both queues, so the mode
+ * changes no bytes; with EXCLUSIVE, passing a resource from one queue to the
+ * other is written as a pair of pvkCmdPipelineBarrier() ownership transfers.
+ */
+typedef enum PvkSharingMode {
+    PVK_SHARING_MODE_EXCLUSIVE  = 0, /**< One queue family at a time; a barrier naming both families hands it over. */
+    PVK_SHARING_MODE_CONCURRENT = 1  /**< The families in queueFamilyIndices, with no handover. */
+} PvkSharingMode;
+
 /** @brief Parameters for pvkCreateImage(). */
 typedef struct PvkImageCreateInfo {
     uint32_t  width;     /**< Width in pixels; a depth buffer must be as wide as the color attachment it is used with, a texture a power of two from 8 to 1024 (64 or more when it is also a color attachment), a color table 16 or 256 (its entries). */
@@ -543,6 +614,9 @@ typedef struct PvkImageCreateInfo {
     uint32_t  mipLevels; /**< Texture only: number of mip levels, 0 or 1 for the base level alone, up to PVK_MAX_MIP_LEVELS. Each level halves the one before and must stay at least 8 on each side. */
     PvkFormat format;    /**< PVK_FORMAT_CT32, PVK_FORMAT_CT24, PVK_FORMAT_CT16, PVK_FORMAT_T8 or PVK_FORMAT_T4 for a texture; PVK_FORMAT_CT32 or PVK_FORMAT_CT16 for a color table; PVK_FORMAT_Z32, PVK_FORMAT_Z24 or PVK_FORMAT_Z16 for a depth buffer. */
     uint32_t  usage;     /**< PvkImageUsageFlagBits ORed together, or 0 for the format's usual use: TRANSFER_DST and SAMPLED for a texture, TRANSFER_DST for a color table, DEPTH_STENCIL_ATTACHMENT for a depth format. */
+    PvkSharingMode  sharingMode;           /**< PVK_SHARING_MODE_EXCLUSIVE or PVK_SHARING_MODE_CONCURRENT. */
+    uint32_t        queueFamilyIndexCount; /**< CONCURRENT only: number of entries in queueFamilyIndices, at least 2. */
+    const uint32_t *queueFamilyIndices;    /**< CONCURRENT only: the families, each once. */
 } PvkImageCreateInfo;
 
 /**
@@ -889,9 +963,10 @@ typedef struct PvkPresentInfo {
  * then free for the acquire waiting on it. Up to 2 presents can be queued,
  * and the call sleeps while there are that many.
  *
- * @param queue The queue.
+ * @param queue The graphics queue (family 0); the transfer queue does not present.
  * @param info What to show and what to wait for.
- * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if swapchainCount is
+ * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if the queue is not
+ *         the graphics queue, swapchainCount is
  *         not 1, the swapchain is not the device's, the image index is out
  *         of range, there are more than 4 wait semaphores, or a wait
  *         semaphore has no signal pending.
@@ -912,7 +987,10 @@ typedef struct PvkBuffer_T        *PvkBuffer;
 
 /** @brief Parameters for pvkCreateBuffer(). */
 typedef struct PvkBufferCreateInfo {
-    size_t size; /**< Size in bytes; rounded up to a multiple of 16. */
+    size_t          size;                  /**< Size in bytes; rounded up to a multiple of 16. */
+    PvkSharingMode  sharingMode;           /**< PVK_SHARING_MODE_EXCLUSIVE or PVK_SHARING_MODE_CONCURRENT. */
+    uint32_t        queueFamilyIndexCount; /**< CONCURRENT only: number of entries in queueFamilyIndices, at least 2. */
+    const uint32_t *queueFamilyIndices;    /**< CONCURRENT only: the families, each once. */
 } PvkBufferCreateInfo;
 
 /**
@@ -1637,7 +1715,7 @@ void      pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const P
  * @{
  */
 
-/** @brief A recorded list of commands: a VIF1 DMA chain in main RAM. */
+/** @brief A recorded list of commands: a DMA chain in main RAM, for VIF1 (graphics family) or the GIF channel (transfer family). */
 typedef struct PvkCommandBuffer_T *PvkCommandBuffer;
 
 /** @brief What happens to an image's contents when rendering begins. */
@@ -1675,11 +1753,18 @@ typedef enum PvkCommandPoolResetFlagBits {
 } PvkCommandPoolResetFlagBits;
 
 /**
- * @brief Parameters for pvkCreateCommandPool(). No queueFamilyIndex: the device has one queue.
+ * @brief Parameters for pvkCreateCommandPool().
+ *
+ * A pool's command buffers are submitted to the queue of its family. Those of
+ * the graphics family (0) are VIF1 chains and take every command; those of
+ * the transfer family (1) are GIF channel chains, which carry no VIF codes,
+ * so they take pvkCmdCopyBufferToImage(), pvkCmdPipelineBarrier() and
+ * pvkCmdExecuteCommands() only.
  */
 typedef struct PvkCommandPoolCreateInfo {
-    uint32_t flags;     /**< PvkCommandPoolCreateFlagBits, or 0. */
-    uint32_t maxQwords; /**< Size of the block in 16-byte qwords, shared by all of the pool's recordings; 0 = 4096 (64 KB). */
+    uint32_t flags;            /**< PvkCommandPoolCreateFlagBits, or 0. */
+    uint32_t queueFamilyIndex; /**< Family of the queue the pool's command buffers are submitted to: 0 graphics, 1 transfer. */
+    uint32_t maxQwords;        /**< Size of the block in 16-byte qwords, shared by all of the pool's recordings; 0 = 4096 (64 KB). */
 } PvkCommandPoolCreateInfo;
 
 /**
@@ -1866,7 +1951,7 @@ PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd);
  *
  * @param cmd A primary command buffer that is recording.
  * @param count Number of entries in cmds.
- * @param cmds Secondary command buffers that have finished recording, in the order they run.
+ * @param cmds Secondary command buffers that have finished recording, from pools of the primary's family, in the order they run.
  */
 void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkCommandBuffer *cmds);
 
@@ -2017,8 +2102,11 @@ typedef struct PvkBufferImageCopy {
  * (4 CT32 texels, 16 CT24, 8 CT16, 16 T8, 32 T4). A color table's entries
  * are copied into the command buffer as it is recorded, rearranged into the
  * GS's CSM1 layout (a 256-entry table swaps index bits 3 and 4), so its
- * buffer is free again at once. Must be called outside
- * pvkCmdBeginRendering() / pvkCmdEndRendering().
+ * buffer is free again at once. In a graphics family command buffer the
+ * packets go through VIF1 DIRECT (PATH2); in a transfer family one they go
+ * down the GIF channel (PATH3), each 16K-qword IMAGE packet ending its GIF
+ * packet so a draw chain may take the GIF between them. Must be called
+ * outside pvkCmdBeginRendering() / pvkCmdEndRendering().
  *
  * @param cmd The command buffer.
  * @param buffer Source texels in the image's format.
@@ -2158,7 +2246,7 @@ typedef enum PvkDependencyFlagBits {
 /** @brief Bitmask of PvkDependencyFlagBits. */
 typedef uint32_t PvkDependencyFlags;
 
-/** @brief Barrier source or destination queue family meaning no ownership transfer. The PS2 has one queue family. */
+/** @brief Barrier source and destination queue family meaning no ownership transfer. */
 #define PVK_QUEUE_FAMILY_IGNORED (~0u)
 
 /** @brief A barrier over all memory. */
@@ -2171,8 +2259,8 @@ typedef struct PvkMemoryBarrier {
 typedef struct PvkBufferMemoryBarrier {
     PvkAccessFlags srcAccessMask;       /**< Writes made before the barrier. */
     PvkAccessFlags dstAccessMask;       /**< Reads and writes made after it. */
-    uint32_t       srcQueueFamilyIndex; /**< PVK_QUEUE_FAMILY_IGNORED, or 0, the one family. */
-    uint32_t       dstQueueFamilyIndex; /**< PVK_QUEUE_FAMILY_IGNORED, or 0, the one family. */
+    uint32_t       srcQueueFamilyIndex; /**< Family giving the range up, or PVK_QUEUE_FAMILY_IGNORED with dstQueueFamilyIndex for no handover. */
+    uint32_t       dstQueueFamilyIndex; /**< Family taking the range over; the command buffer's family must be one of the two. */
     PvkBuffer      buffer;              /**< The buffer. */
     size_t         offset;              /**< First byte of the range. */
     size_t         size;                /**< Bytes from offset, or PVK_WHOLE_SIZE. */
@@ -2184,8 +2272,8 @@ typedef struct PvkImageMemoryBarrier {
     PvkAccessFlags           dstAccessMask;       /**< Reads and writes made after it. */
     PvkImageLayout           oldLayout;           /**< The layout the image is in, or PVK_IMAGE_LAYOUT_UNDEFINED when its contents may be discarded. */
     PvkImageLayout           newLayout;           /**< The layout the image is in after the barrier. */
-    uint32_t                 srcQueueFamilyIndex; /**< PVK_QUEUE_FAMILY_IGNORED, or 0, the one family. */
-    uint32_t                 dstQueueFamilyIndex; /**< PVK_QUEUE_FAMILY_IGNORED, or 0, the one family. */
+    uint32_t                 srcQueueFamilyIndex; /**< Family giving the levels up, or PVK_QUEUE_FAMILY_IGNORED with dstQueueFamilyIndex for no handover. */
+    uint32_t                 dstQueueFamilyIndex; /**< Family taking the levels over; the command buffer's family must be one of the two. */
     PvkImage                 image;               /**< The image. */
     PvkImageSubresourceRange subresourceRange;    /**< The levels covered. */
 } PvkImageMemoryBarrier;
@@ -2201,8 +2289,13 @@ typedef struct PvkImageMemoryBarrier {
  * FLUSH otherwise (waits for VU1 to end and the GS to take every primitive
  * and texel), followed by a GS TEXFLUSH when a barrier's dstAccessMask has
  * PVK_ACCESS_SHADER_READ_BIT, so the next sampling draw reads VRAM and not
- * the cache. A layout change moves no bytes: the GS reads VRAM the same
- * way in every layout. Must be called outside pvkCmdBeginRendering() /
+ * the cache. A barrier taking a resource over from the transfer family
+ * (srcQueueFamilyIndex 1) opens with a VIF FLUSHA instead, which also waits
+ * for the PATH3 packet the GIF is taking. A layout change and an ownership
+ * transfer move no bytes: the GS reads VRAM the same way in every layout and
+ * from either path. In a transfer family command buffer the barrier records
+ * nothing: the GIF channel carries no VIF codes and the GS takes the copies
+ * in order. Must be called outside pvkCmdBeginRendering() /
  * pvkCmdEndRendering().
  *
  * @param cmd The command buffer.
@@ -2236,12 +2329,14 @@ typedef struct PvkSubmitInfo {
 /**
  * @brief Queues command buffers for the hardware.
  *
- * Writes the CPU cache back to RAM and places each command buffer's VIF1 DMA
+ * Writes the CPU cache back to RAM and places each command buffer's DMA
  * chain in the queue's ring of 8. Chains are started in ring order by the
- * DMAC and vblank interrupt handlers, each as soon as the channel is free
- * and its wait semaphores are signaled, so the GS may still be drawing the
- * chain before it. The call sleeps only while the ring is full. Each chain
- * ends with a GS SIGNAL; its INTC_GS handler signals the submit's semaphores
+ * DMAC and vblank interrupt handlers, each as soon as the queue's channel
+ * (VIF1 for the graphics queue, GIF for the transfer queue) is free and its
+ * wait semaphores are signaled, so the GS may still be drawing the chain
+ * before it. The call sleeps only while the ring is full. Each chain ends
+ * with a GS SIGNAL whose ID names the queue and ring entry; its INTC_GS
+ * handler reads the ID back from SIGLBLID, signals the submit's semaphores
  * after the submit's last chain and the fence after the last chain of the
  * call. A batch with no command buffer takes one ring entry too: its waits
  * are consumed and its signals and the fence raised once every earlier
@@ -2260,7 +2355,8 @@ typedef struct PvkSubmitInfo {
  *         executes a secondary command buffer that was recorded again or
  *         lost its recording since; if a batch has more than 4 semaphores
  *         in a list; if a wait semaphore has no signal
- *         pending or a signal semaphore is signaled or has one pending; or
+ *         pending or a signal semaphore is signaled or has one pending;
+ *         if a command buffer's pool is of another family than the queue; or
  *         if the fence is signaled or in use.
  */
 PvkResult pvkQueueSubmit(PvkQueue queue, uint32_t submitCount, const PvkSubmitInfo *submits, PvkFence fence);

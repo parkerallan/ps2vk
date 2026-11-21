@@ -117,12 +117,39 @@ void pvkUnmapMemory(PvkDevice device, PvkDeviceMemory memory)
     (void)memory;
 }
 
+/* CONCURRENT needs at least two different families that exist. */
+int pvk_sharing_check(const char *who, PvkSharingMode mode, uint32_t count, const uint32_t *families)
+{
+    uint32_t i, j;
+
+    if (mode == PVK_SHARING_MODE_EXCLUSIVE)
+        return 1;
+    if (mode != PVK_SHARING_MODE_CONCURRENT || count < 2) {
+        pvk_error("%s: sharingMode must be EXCLUSIVE, or CONCURRENT with at least 2 queue families\n", who);
+        return 0;
+    }
+    for (i = 0; i < count; i++) {
+        if (families[i] >= PVK_MAX_QUEUE_FAMILIES) {
+            pvk_error("%s: queue family %u does not exist\n", who, (unsigned)families[i]);
+            return 0;
+        }
+        for (j = 0; j < i; j++)
+            if (families[i] == families[j]) {
+                pvk_error("%s: queue family %u is named twice\n", who, (unsigned)families[i]);
+                return 0;
+            }
+    }
+    return 1;
+}
+
 PvkResult pvkCreateBuffer(PvkDevice device, const PvkBufferCreateInfo *info, PvkBuffer *buffer)
 {
     PvkBuffer buf;
 
     (void)device;
 
+    if (!pvk_sharing_check("pvkCreateBuffer", info->sharingMode, info->queueFamilyIndexCount, info->queueFamilyIndices))
+        return PVK_ERROR_VALIDATION_FAILED;
     buf = calloc(1, sizeof(struct PvkBuffer_T));
     if (!buf)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;

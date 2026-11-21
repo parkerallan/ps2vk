@@ -75,9 +75,12 @@ struct PvkSubmission {
 };
 
 /* One in-order queue. Chains wait in a ring and are started from the DMAC and vblank handlers once
- * the channel is free and their semaphores are signaled; the INTC_GS handler completes each chain. */
+ * the channel is free and their semaphores are signaled; the INTC_GS handler completes each chain,
+ * finding the queue and entry in the SIGNAL ID (entry | family << 8) it reads back from SIGLBLID. */
 struct PvkQueue_T {
     PvkDevice device;
+    uint32_t  family;       /* 0: VIF1 channel (PATH2), 1: GIF channel (PATH3) */
+    volatile u32 *chcr, *qwc, *tadr; /* the channel's registers */
     PvkFence  last;         /* fence of the newest submission; NULL = idle */
     struct PvkFence_T idle; /* stands in when a submission has no fence */
     struct PvkSubmission ring[PVK_MAX_PENDING_SUBMISSIONS];
@@ -87,9 +90,13 @@ struct PvkQueue_T {
 
 void      pvk_queue_wait_idle(PvkQueue queue);
 void      pvk_queue_kick(PvkQueue queue); /* interrupts disabled, or from a handler */
+/* Kicks every queue the device has: a completed chain or flip may unblock either. */
+void      pvk_device_kick(PvkDevice device);
+/* Waits for every queue and the swapchain's flips. */
+void      pvk_device_wait_idle(PvkDevice device);
 PvkResult pvk_fence_init(PvkFence fence, int signaled);
 void      pvk_fence_wait(PvkFence fence);
-PvkResult pvk_queue_init(PvkQueue queue);
+PvkResult pvk_queue_init(PvkQueue queue, uint32_t family);
 void      pvk_queue_shutdown(PvkQueue queue);
 /* Validates a wait (signal = 0) or signal list against the semaphores' balances, applying it when `apply`. */
 PvkResult pvk_semaphores_check(const char *who, uint32_t count, const PvkSemaphore *sems, int signal, int apply);
@@ -104,7 +111,9 @@ struct PvkVramRange {
 };
 
 struct PvkDevice_T {
-    struct PvkQueue_T queue;
+    struct PvkQueue_T queue;    /* graphics, family 0 */
+    struct PvkQueue_T transfer; /* family 1 */
+    int       families[PVK_MAX_QUEUE_FAMILIES]; /* asked for at pvkCreateDevice */
     PvkSwapchain swapchain;   /* the one swapchain, or NULL: pvk_queue_wait_idle drains its flips */
     PvkPhysicalDeviceFeatures features;
     uint32_t vramCount;       /* taken VRAM ranges, sorted by start: swapchain framebuffers and type 1 allocations */
@@ -195,6 +204,9 @@ struct PvkSwapchain_T {
     s32               vblankHandler;
     struct PvkImage_T images[PVK_MAX_SWAPCHAIN_IMAGES];
 };
+
+/* Validates a buffer's or image's sharing mode and queue family list. */
+int pvk_sharing_check(const char *who, PvkSharingMode mode, uint32_t count, const uint32_t *families);
 
 struct PvkBuffer_T {
     PvkDeviceMemory memory; /* bound with pvkBindBufferMemory, NULL until then */
@@ -325,6 +337,7 @@ struct PvkPipeline_T {
 struct PvkCommandPool_T {
     PvkDevice  device;
     uint32_t   flags;         /* PvkCommandPoolCreateFlagBits */
+    uint32_t   family;        /* queue family its command buffers are submitted to */
     qword_t   *block;         /* 64-byte aligned */
     uint32_t   qwords;        /* its size */
     uint32_t   used;          /* qwords below the top of the stack */
@@ -350,7 +363,7 @@ struct PvkCommandBuffer_T {
     int         used;         /* submitted or executed since it was recorded */
     struct PvkExecuted *executed; /* the secondaries a primary calls, checked at submit */
     uint32_t    executedCount, executedCap;
-    packet2_t   packet;       /* VIF1 DMA chain, inside the pool's block */
+    packet2_t   packet;       /* VIF1 (family 0) or GIF channel (family 1) DMA chain, inside the pool's block */
     uint32_t    signalQw;     /* qword of the GS SIGNAL at a primary's end; its ID is set at submit */
     PvkPipeline pipeline;
     PvkImageView colorView;   /* attachments of the current pvkCmdBeginRendering; NULL when inherited */

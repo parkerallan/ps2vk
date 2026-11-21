@@ -148,6 +148,8 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
 
     (void)device;
 
+    if (!pvk_sharing_check("pvkCreateImage", info->sharingMode, info->queueFamilyIndexCount, info->queueFamilyIndices))
+        return PVK_ERROR_VALIDATION_FAILED;
     if (!depth && !pvk_is_color_format(info->format)) {
         pvk_error("pvkCreateImage: format must be a color format (PVK_FORMAT_CT32/CT24/CT16/T8/T4) or a depth "
                   "format (PVK_FORMAT_Z32/Z24/Z16)\n");

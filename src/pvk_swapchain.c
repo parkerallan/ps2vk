@@ -66,7 +66,7 @@ static s32 vblank_handler(s32 cause)
     iSignalSema(sc->flipSema);
     for (i = 0; i < sc->imageCount; i++)
         acquire_signal(sc, (old + i) % sc->imageCount);
-    pvk_queue_kick(&sc->device->queue);
+    pvk_device_kick(sc->device);
 out:
     ExitHandler();
     return 0;
@@ -273,6 +273,10 @@ static PvkResult present_check(PvkQueue queue, const PvkPresentInfo *info)
 {
     PvkSwapchain sc;
 
+    if (queue->family != 0) {
+        pvk_error("pvkQueuePresent: only the graphics queue (family 0) presents\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     if (info->swapchainCount != 1) {
         pvk_error("pvkQueuePresent: swapchainCount must be 1; the device has one swapchain\n");
         return PVK_ERROR_VALIDATION_FAILED;

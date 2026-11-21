@@ -6,6 +6,9 @@
  * material color are push constants. The vertex shader computes the dot
  * product of normal and light per vertex; the lit intensity comes from a ramp
  * texture the GS looks up per pixel, so the day/night line stays a clean curve.
+ * The ramp is uploaded on the transfer queue (the GIF DMA channel, PATH3) and
+ * handed to the graphics queue with a semaphore and a pair of queue family
+ * ownership barriers, so the CPU never waits for the upload.
  * A specialization constant set when the pipeline is created switches the
  * lighting off, leaving the plain material color.
  */
@@ -191,10 +194,13 @@ int main(void)
     PvkDescriptorSet descriptorSet;
     PvkPipelineLayout layout;
     PvkPipeline pipeline;
-    PvkCommandPool commandPool;
-    PvkCommandBuffer cmd;
+    PvkCommandPool commandPool, transferPool;
+    PvkCommandBuffer cmd, uploadCmd;
     PvkFence fence;
-    PvkSemaphore imageAvailable, renderDone;
+    PvkSemaphore imageAvailable, renderDone, rampUploaded;
+    PvkQueue transferQueue;
+    PvkQueueFamilyProperties families[PVK_MAX_QUEUE_FAMILIES];
+    uint32_t familyCount = PVK_MAX_QUEUE_FAMILIES, graphicsFamily = ~0u, transferFamily = ~0u;
     void *mapped;
     Camera *camera;
     Light *light;
@@ -207,8 +213,26 @@ int main(void)
     PvkInstanceCreateInfo instanceInfo = { .applicationName = "lighting" };
     CHECK(pvkCreateInstance(&instanceInfo, &instance));
     CHECK(pvkEnumeratePhysicalDevices(instance, &physicalDeviceCount, &physicalDevice));
-    CHECK(pvkCreateDevice(physicalDevice, NULL, &device));
-    pvkGetDeviceQueue(device, &queue);
+    /* The graphics family draws (and presents); a family with TRANSFER but not GRAPHICS copies alongside it. */
+    pvkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &familyCount, families);
+    for (uint32_t i = 0; i < familyCount; i++) {
+        if (families[i].queueFlags & PVK_QUEUE_GRAPHICS_BIT && graphicsFamily == ~0u)
+            graphicsFamily = i;
+        else if (families[i].queueFlags & PVK_QUEUE_TRANSFER_BIT && transferFamily == ~0u)
+            transferFamily = i;
+    }
+    if (graphicsFamily == ~0u || transferFamily == ~0u) {
+        printf("lighting: no graphics or no transfer-only queue family\n");
+        return 1;
+    }
+    PvkDeviceQueueCreateInfo queueInfos[2] = {
+        { .queueFamilyIndex = graphicsFamily, .queueCount = 1 },
+        { .queueFamilyIndex = transferFamily, .queueCount = 1 },
+    };
+    PvkDeviceCreateInfo deviceInfo = { .queueCreateInfoCount = 2, .queueCreateInfos = queueInfos };
+    CHECK(pvkCreateDevice(physicalDevice, &deviceInfo, &device));
+    pvkGetDeviceQueue(device, graphicsFamily, 0, &queue);
+    pvkGetDeviceQueue(device, transferFamily, 0, &transferQueue);
 
     PvkSwapchainCreateInfo swapchainInfo = {
         .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_CT32, .imageCount = 2,
@@ -413,53 +437,63 @@ int main(void)
     };
     CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &pipeline));
 
-    PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0 };
+    /* A pool records for the queue family it was created for. */
+    PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0, .queueFamilyIndex = graphicsFamily };
     CHECK(pvkCreateCommandPool(device, &commandPoolInfo, &commandPool));
     PvkCommandBufferAllocateInfo cmdInfo = {
         .commandPool = commandPool, .level = PVK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
     };
     CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
+    PvkCommandPoolCreateInfo transferPoolInfo = { .flags = 0, .queueFamilyIndex = transferFamily };
+    CHECK(pvkCreateCommandPool(device, &transferPoolInfo, &transferPool));
+    PvkCommandBufferAllocateInfo uploadInfo = {
+        .commandPool = transferPool, .level = PVK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1,
+    };
+    CHECK(pvkAllocateCommandBuffers(device, &uploadInfo, &uploadCmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
     CHECK(pvkCreateSemaphore(device, NULL, &imageAvailable));
     CHECK(pvkCreateSemaphore(device, NULL, &renderDone));
+    CHECK(pvkCreateSemaphore(device, NULL, &rampUploaded));
     PvkCommandBufferBeginInfo beginInfo = { .flags = 0 };
 
-    /* Upload the ramp once, outside rendering, and wait for it.
-     * Vulkan needs a barrier before the upload and another between the upload and the first draw that uses the ramp. */
-    CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
-    /* Before the upload: the ramp is new, so there is nothing to wait for; UNDEFINED says so.
-     * On the PS2 this barrier records nothing. */
+    /* Upload the ramp on the transfer queue. The ramp is EXCLUSIVE to one queue family at a time, so
+     * the transfer queue releases it to the graphics family after the copy, and the first frame's
+     * command buffer acquires it before drawing; the semaphore orders the two submissions. */
+    CHECK(pvkBeginCommandBuffer(uploadCmd, &beginInfo));
+    /* Before the upload: the ramp is new, so there is nothing to wait for; UNDEFINED says so. */
     PvkImageMemoryBarrier toTransfer = {
         .dstAccessMask       = PVK_ACCESS_TRANSFER_WRITE_BIT,
         .oldLayout           = PVK_IMAGE_LAYOUT_UNDEFINED,
         .newLayout           = PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .srcQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED, /* one queue family: no handover */
+        .srcQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED, /* no handover yet */
         .dstQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED,
         .image               = ramp,
         .subresourceRange    = { .aspectMask = PVK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
     };
-    pvkCmdPipelineBarrier(cmd, PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, PVK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+    pvkCmdPipelineBarrier(uploadCmd, PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, PVK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                           0, NULL, 0, NULL, 1, &toTransfer);
     PvkBufferImageCopy copy = { .bufferOffset = 0, .rect = { 0, 0, RAMP_WIDTH, RAMP_HEIGHT } };
-    pvkCmdCopyBufferToImage(cmd, rampBuffer, ramp, &copy);
-    /* After the upload: the draws that use the ramp must not start until the upload is finished.
-     * On the PS2 this barrier records a VIF FLUSH and a GS TEXFLUSH. */
-    PvkImageMemoryBarrier toSampled = {
+    pvkCmdCopyBufferToImage(uploadCmd, rampBuffer, ramp, &copy);
+    /* Release: the transfer family's writes are done; the graphics family takes the ramp over.
+     * On the PS2 a transfer queue barrier records nothing: the GS takes the copies in order. */
+    PvkImageMemoryBarrier release = {
         .srcAccessMask       = PVK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask       = PVK_ACCESS_SHADER_READ_BIT,
+        .dstAccessMask       = 0,
         .oldLayout           = PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .newLayout           = PVK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .srcQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = PVK_QUEUE_FAMILY_IGNORED,
+        .srcQueueFamilyIndex = transferFamily,
+        .dstQueueFamilyIndex = graphicsFamily,
         .image               = ramp,
         .subresourceRange    = { .aspectMask = PVK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
     };
-    pvkCmdPipelineBarrier(cmd, PVK_PIPELINE_STAGE_TRANSFER_BIT, PVK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
-                          0, NULL, 0, NULL, 1, &toSampled);
-    CHECK(pvkEndCommandBuffer(cmd));
-    PvkSubmitInfo uploadSubmit = { .commandBufferCount = 1, .commandBuffers = &cmd };
-    CHECK(pvkQueueSubmit(queue, 1, &uploadSubmit, fence));
-    CHECK(pvkWaitForFences(device, 1, &fence));
+    pvkCmdPipelineBarrier(uploadCmd, PVK_PIPELINE_STAGE_TRANSFER_BIT, PVK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                          0, NULL, 0, NULL, 1, &release);
+    CHECK(pvkEndCommandBuffer(uploadCmd));
+    PvkSubmitInfo uploadSubmit = {
+        .commandBufferCount = 1, .commandBuffers = &uploadCmd,
+        .signalSemaphoreCount = 1, .signalSemaphores = &rampUploaded,
+    };
+    CHECK(pvkQueueSubmit(transferQueue, 1, &uploadSubmit, NULL));
 
     printf("lighting: running\n");
 
@@ -486,6 +520,22 @@ int main(void)
 
         CHECK(pvkResetCommandPool(device, commandPool, 0));
         CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
+        if (frame == 0) {
+            /* Acquire: the graphics family takes the ramp over before the first draw samples it.
+             * On the PS2 this barrier records a VIF FLUSHA and a GS TEXFLUSH. */
+            PvkImageMemoryBarrier acquire = {
+                .srcAccessMask       = 0,
+                .dstAccessMask       = PVK_ACCESS_SHADER_READ_BIT,
+                .oldLayout           = PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout           = PVK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .srcQueueFamilyIndex = transferFamily,
+                .dstQueueFamilyIndex = graphicsFamily,
+                .image               = ramp,
+                .subresourceRange    = { .aspectMask = PVK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1 },
+            };
+            pvkCmdPipelineBarrier(cmd, PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, PVK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                                  0, NULL, 0, NULL, 1, &acquire);
+        }
         PvkRenderingInfo rendering = {
             .renderArea = { 0, 0, WIDTH, HEIGHT },
             .colorAttachment = {
@@ -509,11 +559,14 @@ int main(void)
         pvkCmdEndRendering(cmd);
         CHECK(pvkEndCommandBuffer(cmd));
 
-        /* The draw waits for the image and signals renderDone; the present waits for renderDone. */
-        /* The chain waits whole, so the stage only documents what the wait protects: the color writes. */
-        PvkPipelineStageFlags waitStage = PVK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        /* The draw waits for the image (and, the first time, for the ramp upload) and signals renderDone;
+         * the present waits for renderDone. The chain waits whole, so each stage only documents what its
+         * wait protects: the color writes, and the texture reads. */
+        PvkSemaphore waits[2] = { imageAvailable, rampUploaded };
+        PvkPipelineStageFlags waitStages[2] = { PVK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                               PVK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT };
         PvkSubmitInfo submit = {
-            .waitSemaphoreCount   = 1, .waitSemaphores   = &imageAvailable, .waitDstStageMask = &waitStage,
+            .waitSemaphoreCount   = frame == 0 ? 2 : 1, .waitSemaphores = waits, .waitDstStageMask = waitStages,
             .commandBufferCount   = 1, .commandBuffers   = &cmd,
             .signalSemaphoreCount = 1, .signalSemaphores = &renderDone,
         };

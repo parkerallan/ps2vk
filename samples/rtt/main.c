@@ -185,8 +185,11 @@ int main(void)
     PvkInstanceCreateInfo instanceInfo = { .applicationName = "rtt" };
     CHECK(pvkCreateInstance(&instanceInfo, &instance));
     CHECK(pvkEnumeratePhysicalDevices(instance, &physicalDeviceCount, &physicalDevice));
-    CHECK(pvkCreateDevice(physicalDevice, NULL, &device));
-    pvkGetDeviceQueue(device, &queue);
+    /* Queue family 0 is the graphics queue (pvkGetPhysicalDeviceQueueFamilyProperties lists it). */
+    PvkDeviceQueueCreateInfo queueInfo = { .queueFamilyIndex = 0, .queueCount = 1 };
+    PvkDeviceCreateInfo deviceInfo = { .queueCreateInfoCount = 1, .queueCreateInfos = &queueInfo };
+    CHECK(pvkCreateDevice(physicalDevice, &deviceInfo, &device));
+    pvkGetDeviceQueue(device, 0, 0, &queue);
 
     PvkSwapchainCreateInfo swapchainInfo = {
         .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_CT32, .imageCount = 2,

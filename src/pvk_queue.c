@@ -1,5 +1,6 @@
-/* Queue submission, fences and semaphores: chains wait in a ring and are
- * started from interrupt handlers; a GS SIGNAL per chain, taken by an INTC_GS handler. */
+/* Queue submission, fences and semaphores: chains wait in a ring per queue and are
+ * started from interrupt handlers; a GS SIGNAL per chain, taken by an INTC_GS handler.
+ * The graphics queue owns the VIF1 channel (PATH2), the transfer queue the GIF channel (PATH3). */
 #include <stdlib.h>
 
 #include <dma_registers.h>
@@ -12,10 +13,17 @@
 #define D1_CHCR ((volatile u32 *)0x10009000)
 #define D1_QWC  ((volatile u32 *)0x10009020)
 #define D1_TADR ((volatile u32 *)0x10009030)
+#define D2_CHCR ((volatile u32 *)0x1000A000)
+#define D2_QWC  ((volatile u32 *)0x1000A020)
+#define D2_TADR ((volatile u32 *)0x1000A030)
+
+/* SIGNAL ID of a ring entry: the index, and the queue's family above it. */
+#define PVK_SIGNAL_ID(queue, index) ((uint32_t)(index) | (queue)->family << 8)
 
 static s32 gs_handler_id   = -1;
-static s32 dmac_handler_id = -1;
-static PvkQueue handler_queue;
+static s32 vif1_handler_id = -1;
+static s32 gif_handler_id  = -1;
+static PvkDevice handler_device;
 
 /* The head entry has finished: raises its semaphores and fence and frees it. */
 static void complete_head(PvkQueue queue)
@@ -74,30 +82,42 @@ void pvk_queue_kick(PvkQueue queue)
             complete_head(queue);
             continue;
         }
-        if (*D1_CHCR & 0x100 || !waits_signaled(e))
+        if (*queue->chcr & 0x100 || !waits_signaled(e))
             return;
         waits_consume(e);
         e->state = 2;
-        *D1_QWC  = 0;
-        *D1_TADR = DMA_SET_TADR((u32)e->cmd->packet.base, 0);
-        *D1_CHCR = DMA_SET_CHCR(1, 1, 0, 1, 0, 1, 0);
+        *queue->qwc  = 0;
+        *queue->tadr = DMA_SET_TADR((u32)e->cmd->packet.base, 0);
+        /* Chain mode; the tags carry VIF codes (TTE) on VIF1 only. */
+        *queue->chcr = DMA_SET_CHCR(1, 1, 0, queue->family == 0, 0, 1, 0);
         return;
     }
 }
 
-/* INTC_GS fires on SIGNAL: the oldest sent chain has finished drawing. */
+void pvk_device_kick(PvkDevice device)
+{
+    pvk_queue_kick(&device->queue);
+    if (device->families[1])
+        pvk_queue_kick(&device->transfer);
+}
+
+/* INTC_GS fires on SIGNAL: the oldest sent chain of the queue the ID names has finished. */
 static s32 gs_signal_handler(s32 cause)
 {
-    PvkQueue queue = handler_queue;
+    PvkDevice dev = handler_device;
 
     (void)cause;
     if (*GS_REG_CSR & 1) {
-        if (queue && queue->head != queue->tail && queue->ring[queue->head].state == 2)
-            complete_head(queue);
+        if (dev) {
+            uint32_t id = (uint32_t)*GS_REG_SIGLBLID;
+            PvkQueue queue = (id >> 8) & 1 ? &dev->transfer : &dev->queue;
+            if (queue->head != queue->tail && queue->ring[queue->head].state == 2)
+                complete_head(queue);
+        }
         /* Acknowledge, or the GS stalls at its next SIGNAL. */
         *GS_REG_CSR = 1;
-        if (queue)
-            pvk_queue_kick(queue);
+        if (dev)
+            pvk_device_kick(dev);
     }
     /* The kernel masks the event in IMR before calling handlers; unmask it for the next SIGNAL. */
     iGsPutIMR(iGsGetIMR() & ~GS_IMR_SIGMSK);
@@ -105,42 +125,62 @@ static s32 gs_signal_handler(s32 cause)
     return 0;
 }
 
-/* The VIF1 channel finished a chain: the next one may go while the GS draws this one. */
-static int dmac_handler(int channel)
+/* A channel finished a chain: the queue's next one may go while the GS takes this one. */
+static int vif1_handler(int channel)
 {
     (void)channel;
-    if (handler_queue)
-        pvk_queue_kick(handler_queue);
+    if (handler_device)
+        pvk_queue_kick(&handler_device->queue);
+    ExitHandler();
+    return 0;
+}
+
+static int gif_handler(int channel)
+{
+    (void)channel;
+    if (handler_device)
+        pvk_queue_kick(&handler_device->transfer);
     ExitHandler();
     return 0;
 }
 
 static void handlers_install(PvkQueue queue)
 {
-    handler_queue = queue;
-    if (gs_handler_id >= 0)
+    handler_device = queue->device;
+    if (queue->family == 1) {
+        gif_handler_id = AddDmacHandler(DMA_CHANNEL_GIF, gif_handler, 0);
+        EnableDmac(DMA_CHANNEL_GIF);
         return;
+    }
     *GS_REG_CSR = 1;
     gs_handler_id = AddIntcHandler(INTC_GS, gs_signal_handler, 0);
     EnableIntc(INTC_GS);
     /* Through the kernel, which keeps the shadow of the write-only IMR. */
     GsPutIMR(GsGetIMR() & ~GS_IMR_SIGMSK);
-    dmac_handler_id = AddDmacHandler(DMA_CHANNEL_VIF1, dmac_handler, 0);
+    vif1_handler_id = AddDmacHandler(DMA_CHANNEL_VIF1, vif1_handler, 0);
     EnableDmac(DMA_CHANNEL_VIF1);
 }
 
-static void handlers_remove(void)
+static void handlers_remove(PvkQueue queue)
 {
+    if (queue->family == 1) {
+        if (gif_handler_id < 0)
+            return;
+        DisableDmac(DMA_CHANNEL_GIF);
+        RemoveDmacHandler(DMA_CHANNEL_GIF, gif_handler_id);
+        gif_handler_id = -1;
+        return;
+    }
     if (gs_handler_id < 0)
         return;
     DisableDmac(DMA_CHANNEL_VIF1);
-    RemoveDmacHandler(DMA_CHANNEL_VIF1, dmac_handler_id);
+    RemoveDmacHandler(DMA_CHANNEL_VIF1, vif1_handler_id);
     GsPutIMR(GsGetIMR() | GS_IMR_SIGMSK);
     DisableIntc(INTC_GS);
     RemoveIntcHandler(INTC_GS, gs_handler_id);
     gs_handler_id   = -1;
-    dmac_handler_id = -1;
-    handler_queue   = NULL;
+    vif1_handler_id = -1;
+    handler_device  = NULL;
 }
 
 static s32 create_binary_sema(void)
@@ -162,7 +202,7 @@ PvkResult pvk_fence_init(PvkFence fence, int signaled)
     return PVK_SUCCESS;
 }
 
-PvkResult pvk_queue_init(PvkQueue queue)
+PvkResult pvk_queue_init(PvkQueue queue, uint32_t family)
 {
     if (pvk_fence_init(&queue->idle, 1) != PVK_SUCCESS)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
@@ -171,6 +211,10 @@ PvkResult pvk_queue_init(PvkQueue queue)
         DeleteSema(queue->idle.sema);
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
     }
+    queue->family = family;
+    queue->chcr   = family ? D2_CHCR : D1_CHCR;
+    queue->qwc    = family ? D2_QWC : D1_QWC;
+    queue->tadr   = family ? D2_TADR : D1_TADR;
     queue->head = queue->tail = 0;
     handlers_install(queue);
     return PVK_SUCCESS;
@@ -178,7 +222,7 @@ PvkResult pvk_queue_init(PvkQueue queue)
 
 void pvk_queue_shutdown(PvkQueue queue)
 {
-    handlers_remove();
+    handlers_remove(queue);
     DeleteSema(queue->room);
     DeleteSema(queue->idle.sema);
 }
@@ -196,14 +240,26 @@ void pvk_queue_wait_idle(PvkQueue queue)
     if (queue->last)
         pvk_fence_wait(queue->last);
     queue->last = NULL;
-    if (queue->device->swapchain)
+    if (queue->family == 0 && queue->device->swapchain)
         pvk_swapchain_wait_flips(queue->device->swapchain);
 }
 
-static PvkResult check_cmd(PvkCommandBuffer cmd)
+void pvk_device_wait_idle(PvkDevice device)
+{
+    pvk_queue_wait_idle(&device->queue);
+    if (device->families[1])
+        pvk_queue_wait_idle(&device->transfer);
+}
+
+static PvkResult check_cmd(PvkQueue queue, PvkCommandBuffer cmd)
 {
     uint32_t i;
 
+    if (cmd->pool->family != queue->family) {
+        pvk_error("pvkQueueSubmit: command buffer is from a pool of queue family %u, the queue is of family %u\n",
+                  (unsigned)cmd->pool->family, (unsigned)queue->family);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     if (cmd->level != PVK_COMMAND_BUFFER_LEVEL_PRIMARY) {
         pvk_error("pvkQueueSubmit: a secondary command buffer runs through pvkCmdExecuteCommands\n");
         return PVK_ERROR_VALIDATION_FAILED;
@@ -281,7 +337,7 @@ PvkResult pvkQueueSubmit(PvkQueue queue, uint32_t submitCount, const PvkSubmitIn
     for (s = 0; s < submitCount; s++) {
         const PvkSubmitInfo *si = &submits[s];
         for (c = 0; c < si->commandBufferCount; c++)
-            if ((res = check_cmd(si->commandBuffers[c])) != PVK_SUCCESS)
+            if ((res = check_cmd(queue, si->commandBuffers[c])) != PVK_SUCCESS)
                 return res;
         res = pvk_semaphores_check("pvkQueueSubmit", si->waitSemaphoreCount, si->waitSemaphores, 0, 0);
         if (res != PVK_SUCCESS)
@@ -343,7 +399,7 @@ PvkResult pvkQueueSubmit(PvkQueue queue, uint32_t submitCount, const PvkSubmitIn
             }
             if (cmd) {
                 cmd->used = 1;
-                cmd->packet.base[cmd->signalQw].dw[0] = GS_SET_SIGNAL((uint32_t)(e - queue->ring), 0xFFFFFFFF);
+                cmd->packet.base[cmd->signalQw].dw[0] = GS_SET_SIGNAL(PVK_SIGNAL_ID(queue, e - queue->ring), 0xFFFFFFFF);
             }
             queue->tail = (queue->tail + 1) % PVK_MAX_PENDING_SUBMISSIONS;
         }
@@ -384,6 +440,8 @@ void pvkDestroyFence(PvkDevice device, PvkFence fence)
     pvk_fence_wait(fence);
     if (device->queue.last == fence)
         device->queue.last = NULL;
+    if (device->transfer.last == fence)
+        device->transfer.last = NULL;
     DeleteSema(fence->sema);
     free(fence);
 }
@@ -432,6 +490,6 @@ void pvkDestroySemaphore(PvkDevice device, PvkSemaphore semaphore)
     if (!semaphore)
         return;
     /* A queued chain or flip may still name it. */
-    pvk_queue_wait_idle(&device->queue);
+    pvk_device_wait_idle(device);
     free(semaphore);
 }

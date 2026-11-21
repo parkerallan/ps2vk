@@ -95,13 +95,59 @@ void pvkGetPhysicalDeviceMemoryProperties(PvkPhysicalDevice physicalDevice, PvkP
     properties->memoryHeaps[1].flags = PVK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 }
 
+/* Family 0 feeds VIF1 (PATH2), family 1 the GIF channel (PATH3). */
+static const PvkQueueFamilyProperties queue_families[PVK_MAX_QUEUE_FAMILIES] = {
+    { PVK_QUEUE_GRAPHICS_BIT | PVK_QUEUE_TRANSFER_BIT, 1, 0, { 1, 1, 1 } },
+    { PVK_QUEUE_TRANSFER_BIT, 1, 0, { 1, 1, 1 } },
+};
+
+void pvkGetPhysicalDeviceQueueFamilyProperties(PvkPhysicalDevice physicalDevice, uint32_t *count,
+                                               PvkQueueFamilyProperties *properties)
+{
+    uint32_t i;
+
+    (void)physicalDevice;
+    if (!properties) {
+        *count = PVK_MAX_QUEUE_FAMILIES;
+        return;
+    }
+    if (*count > PVK_MAX_QUEUE_FAMILIES)
+        *count = PVK_MAX_QUEUE_FAMILIES;
+    for (i = 0; i < *count; i++)
+        properties[i] = queue_families[i];
+}
+
 PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreateInfo *info, PvkDevice *device)
 {
     PvkDevice dev;
+    int families[PVK_MAX_QUEUE_FAMILIES] = { 0 };
+    uint32_t i;
 
     (void)physicalDevice;
 
-    if (info && info->enabledFeatures && info->enabledFeatures->robustBufferAccess &&
+    if (!info || !info->queueCreateInfoCount) {
+        pvk_error("pvkCreateDevice: queueCreateInfos must name at least one queue family\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    for (i = 0; i < info->queueCreateInfoCount; i++) {
+        const PvkDeviceQueueCreateInfo *q = &info->queueCreateInfos[i];
+        if (q->queueFamilyIndex >= PVK_MAX_QUEUE_FAMILIES) {
+            pvk_error("pvkCreateDevice: queue family %u does not exist; 0 is graphics, 1 transfer\n",
+                      (unsigned)q->queueFamilyIndex);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (families[q->queueFamilyIndex]) {
+            pvk_error("pvkCreateDevice: queue family %u is named twice\n", (unsigned)q->queueFamilyIndex);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (q->queueCount != 1) {
+            pvk_error("pvkCreateDevice: queue family %u has 1 queue, %u asked for\n",
+                      (unsigned)q->queueFamilyIndex, (unsigned)q->queueCount);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        families[q->queueFamilyIndex] = 1;
+    }
+    if (info->enabledFeatures && info->enabledFeatures->robustBufferAccess &&
         !supported_features.robustBufferAccess) {
         pvk_error("pvkCreateDevice: robustBufferAccess is not supported\n");
         return PVK_ERROR_FEATURE_NOT_PRESENT;
@@ -110,20 +156,29 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
     dev = calloc(1, sizeof(struct PvkDevice_T));
     if (!dev)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
-    dev->queue.device = dev;
-    if (info && info->enabledFeatures)
+    dev->queue.device    = dev;
+    dev->transfer.device = dev;
+    for (i = 0; i < PVK_MAX_QUEUE_FAMILIES; i++)
+        dev->families[i] = families[i];
+    if (info->enabledFeatures)
         dev->features = *info->enabledFeatures;
     /* Reset the GIF: the BIOS (OSDSYS) leaves it busy, which stalls the first
      * VIF1 DIRECT transfer forever (ps2gl does the same in glutInit). */
     GIF_REG_CTRL = 1;
 
-    /* GIF (PATH3) is used for one-off setup, VIF1 for command buffers. */
+    /* VIF1 carries the graphics queue's chains, the GIF channel (PATH3) the transfer queue's. */
     dma_channel_initialize(DMA_CHANNEL_GIF, NULL, 0);
     dma_channel_initialize(DMA_CHANNEL_VIF1, NULL, 0);
     dma_channel_fast_waits(DMA_CHANNEL_GIF);
     dma_channel_fast_waits(DMA_CHANNEL_VIF1);
 
-    if (pvk_queue_init(&dev->queue) != PVK_SUCCESS) {
+    /* The graphics queue always exists: its INTC_GS handler completes both queues' chains. */
+    if (pvk_queue_init(&dev->queue, 0) != PVK_SUCCESS) {
+        free(dev);
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (families[1] && pvk_queue_init(&dev->transfer, 1) != PVK_SUCCESS) {
+        pvk_queue_shutdown(&dev->queue);
         free(dev);
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
     }
@@ -137,18 +192,30 @@ void pvkDestroyDevice(PvkDevice device)
     if (!device)
         return;
     pvkDeviceWaitIdle(device);
+    if (device->families[1])
+        pvk_queue_shutdown(&device->transfer);
     pvk_queue_shutdown(&device->queue);
     free(device);
 }
 
-void pvkGetDeviceQueue(PvkDevice device, PvkQueue *queue)
+void pvkGetDeviceQueue(PvkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, PvkQueue *queue)
 {
-    *queue = &device->queue;
+    *queue = NULL;
+    if (queueFamilyIndex >= PVK_MAX_QUEUE_FAMILIES || !device->families[queueFamilyIndex]) {
+        pvk_error("pvkGetDeviceQueue: queue family %u was not asked for at pvkCreateDevice\n",
+                  (unsigned)queueFamilyIndex);
+        return;
+    }
+    if (queueIndex != 0) {
+        pvk_error("pvkGetDeviceQueue: queue family %u has 1 queue, index %u asked for\n",
+                  (unsigned)queueFamilyIndex, (unsigned)queueIndex);
+        return;
+    }
+    *queue = queueFamilyIndex ? &device->transfer : &device->queue;
 }
 
 PvkResult pvkDeviceWaitIdle(PvkDevice device)
 {
-    pvk_queue_wait_idle(&device->queue);
-    dma_channel_wait(DMA_CHANNEL_GIF, 0);
+    pvk_device_wait_idle(device);
     return PVK_SUCCESS;
 }
