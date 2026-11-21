@@ -267,7 +267,7 @@ static PvkResult make_pipeline(PvkDevice device, const PvkGraphicsPipelineCreate
                                                                             : PVK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         info.colorBlend.attachment.colorBlendOp        = PVK_BLEND_OP_ADD;
     }
-    return pvkCreateGraphicsPipeline(device, &info, pipeline);
+    return pvkCreateGraphicsPipeline(device, NULL, &info, pipeline);
 }
 
 int main(void)

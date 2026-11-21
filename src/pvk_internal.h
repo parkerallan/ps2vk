@@ -318,12 +318,25 @@ struct PvkVertexBinding {
     uint32_t chunk;           /* most vertices per UNPACK code, a multiple of align */
 };
 
+/* One patched copy of a vertex shader's VU1 code, shared by the pipelines
+ * whose patching came out identical and by the cache that holds it. */
+struct PvkProgram {
+    const PvkShaderCode *vs;
+    uint32_t *code;
+    uint32_t *codeEnd;
+    uint32_t  refs;           /* pipelines and caches referring to it */
+    struct PvkProgram *next;  /* next in its cache */
+};
+
+struct PvkPipelineCache_T {
+    struct PvkProgram *programs;
+};
+
 struct PvkPipeline_T {
     const PvkShaderCode *vs;
     const PvkShaderCode *fs;
     PvkPipelineLayout    layout;
-    uint32_t *code;           /* copy of vs's VU1 code with the input conversions patched in */
-    uint32_t *codeEnd;
+    struct PvkProgram *program; /* its VU1 code: vs's with the input conversions and specialization constants patched in */
     uint32_t samplerSet;      /* when fs->textured: set index and bindings[] slot of its sampler2D */
     uint32_t samplerSlot;
     uint32_t uniformSlots[PVK_MAX_UNIFORM_BLOCKS]; /* bindings[] slot of each vs->uniformBlocks[] entry in its set layout */
@@ -385,6 +398,7 @@ struct PvkCommandBuffer_T {
     packet2_t   packet;       /* VIF1 (family 0) or GIF channel (family 1) DMA chain, inside the pool's block */
     uint32_t    signalQw;     /* qword of the GS SIGNAL at a primary's end; its ID is set at submit */
     PvkPipeline pipeline;
+    const struct PvkProgram *program; /* the program last uploaded to VU1 in this recording, or NULL */
     PvkImageView colorView;   /* attachments of the current pvkCmdBeginRendering; NULL when inherited */
     PvkImageView depthView;   /* or NULL */
     int         inherits;     /* a secondary with RENDER_PASS_CONTINUE: draws into the primary's attachments */

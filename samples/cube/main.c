@@ -446,7 +446,7 @@ int main(void)
         .rasterization  = { .cullMode = PVK_CULL_MODE_BACK_BIT, .frontFace = PVK_FRONT_FACE_CLOCKWISE },
         .depthStencil   = { .depthTestEnable = 1, .depthWriteEnable = 1, .depthCompareOp = PVK_COMPARE_OP_LESS },
     };
-    CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &pipeline));
+    CHECK(pvkCreateGraphicsPipeline(device, NULL, &pipelineInfo, &pipeline));
 
     /* A pool records for the queue it was created for. */
     PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0, .queueFamilyIndex = graphicsFamily };

@@ -1055,6 +1055,8 @@ typedef struct PvkPipelineLayout_T *PvkPipelineLayout;
 typedef struct PvkDescriptorSetLayout_T *PvkDescriptorSetLayout;
 /** @brief A vertex shader (VU1 code) plus GS state, created ahead of time. */
 typedef struct PvkPipeline_T      *PvkPipeline;
+/** @brief Holds the VU1 programs of the pipelines created through it, so pipelines with the same program share one copy (see PvkPipelineCacheCreateInfo). */
+typedef struct PvkPipelineCache_T *PvkPipelineCache;
 
 /** @brief Shader stages. The values are bits, so they can be ORed into a stage mask. */
 typedef enum PvkShaderStage {
@@ -1475,6 +1477,26 @@ typedef struct PvkPipelineShaderStageCreateInfo {
     const PvkSpecializationInfo *specializationInfo; /**< Values for the shader's specialization constants, or NULL to keep every default. Only a vertex shader has any. */
 } PvkPipelineShaderStageCreateInfo;
 
+/**
+ * @brief Parameters for pvkCreatePipelineCache().
+ *
+ * A pipeline's VU1 program is its vertex shader's code with the vertex input
+ * formats and specialization constants patched in. Pipelines created through
+ * one cache whose patched programs come out identical share one copy of the
+ * program, and pvkCmdBindPipeline() skips the upload to VU1 program memory when
+ * the program the command buffer last uploaded is that same copy. A program
+ * stays in EE RAM for as long as the cache or a pipeline refers to it, so a
+ * cache may be destroyed before the pipelines made with it. There is no
+ * program data to carry between runs (every program is patched from code in
+ * the ELF), so initialData is accepted and ignored, as Vulkan allows for
+ * cache data an implementation does not recognize.
+ */
+typedef struct PvkPipelineCacheCreateInfo {
+    uint32_t    flags;           /**< 0. */
+    size_t      initialDataSize; /**< Bytes in initialData, or 0. */
+    const void *initialData;     /**< Ignored. */
+} PvkPipelineCacheCreateInfo;
+
 /** @brief Parameters for pvkCreateGraphicsPipeline(). */
 typedef struct PvkGraphicsPipelineCreateInfo {
     uint32_t                       stageCount;     /**< Number of entries in stages: 2. */
@@ -1526,15 +1548,35 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  * each input's format needs patched in, so float inputs cost nothing, and
  * each input's load pointed at its binding's per-vertex or per-instance
  * stream. The vertex stage's specialization constants are written into that
- * copy too (see PvkSpecializationInfo).
+ * copy too (see PvkSpecializationInfo). When cache is not NULL and already
+ * holds a program identical to that copy, the pipeline shares the cached one
+ * (see PvkPipelineCacheCreateInfo).
  *
  * @param device The device.
+ * @param cache Cache the pipeline's program is looked up in and added to, or NULL.
  * @param info Pipeline parameters.
  * @param[out] pipeline The new pipeline.
  * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED, PVK_ERROR_FORMAT_NOT_SUPPORTED,
  *         PVK_ERROR_FEATURE_NOT_PRESENT, PVK_ERROR_INVALID_SHADER or PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
-PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineCreateInfo *info, PvkPipeline *pipeline);
+PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, const PvkGraphicsPipelineCreateInfo *info,
+                                    PvkPipeline *pipeline);
+
+/**
+ * @brief Creates a pipeline cache.
+ * @param device The device.
+ * @param info Cache parameters. May be NULL.
+ * @param[out] cache The new cache, empty.
+ * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ */
+PvkResult pvkCreatePipelineCache(PvkDevice device, const PvkPipelineCacheCreateInfo *info, PvkPipelineCache *cache);
+
+/**
+ * @brief Destroys a pipeline cache. Pipelines created through it stay valid.
+ * @param device The device.
+ * @param cache Cache to destroy.
+ */
+void      pvkDestroyPipelineCache(PvkDevice device, PvkPipelineCache cache);
 
 /**
  * @brief Destroys a pipeline.

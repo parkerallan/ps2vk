@@ -167,6 +167,7 @@ int main(void)
     PvkDeviceMemory depthMemory, targetMemory, targetDepthMemory, vertexMemory, indexMemory;
     PvkShaderModule vs, colorFs, textureFs;
     PvkDescriptorSetLayout setLayout;
+    PvkPipelineCache pipelineCache;
     PvkDescriptorPool descriptorPool;
     PvkDescriptorSet descriptorSet;
     PvkPipelineLayout layout;
@@ -324,6 +325,11 @@ int main(void)
     };
     pvkUpdateDescriptorSets(device, 1, &write);
 
+    /* Both pipelines go through one cache: they patch the same vertex shader the
+     * same way, so the second shares the first's VU1 program and its bind skips the upload. */
+    PvkPipelineCacheCreateInfo pipelineCacheInfo = { .flags = 0 };
+    CHECK(pvkCreatePipelineCache(device, &pipelineCacheInfo, &pipelineCache));
+
     /* The inner cube's pipeline draws into the target: its viewport and depth
      * format are the target's. The outer cube's pipeline draws on screen. */
     PvkPipelineShaderStageCreateInfo stages[] = {
@@ -344,11 +350,11 @@ int main(void)
         .rasterization  = { .cullMode = PVK_CULL_MODE_BACK_BIT, .frontFace = PVK_FRONT_FACE_CLOCKWISE },
         .depthStencil   = { .depthTestEnable = 1, .depthWriteEnable = 1, .depthCompareOp = PVK_COMPARE_OP_LESS },
     };
-    CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &innerPipeline));
+    CHECK(pvkCreateGraphicsPipeline(device, pipelineCache, &pipelineInfo, &innerPipeline));
     stages[1].module = textureFs;
     pipelineInfo.viewport = (PvkViewport){ 0.0f, 0.0f, WIDTH, HEIGHT, 0.0f, 1.0f };
     pipelineInfo.depthAttachmentFormat = PVK_FORMAT_Z24;
-    CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &outerPipeline));
+    CHECK(pvkCreateGraphicsPipeline(device, pipelineCache, &pipelineInfo, &outerPipeline));
 
     PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0 };
     CHECK(pvkCreateCommandPool(device, &commandPoolInfo, &commandPool));

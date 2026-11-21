@@ -148,7 +148,7 @@ int main(void)
         .topology       = PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         .viewport       = { 0.0f, 0.0f, WIDTH, HEIGHT, 0.0f, 1.0f },
     };
-    CHECK(pvkCreateGraphicsPipeline(device, &pipelineInfo, &pipeline));
+    CHECK(pvkCreateGraphicsPipeline(device, NULL, &pipelineInfo, &pipeline));
 
     PvkCommandPoolCreateInfo commandPoolInfo = { .flags = 0 };
     CHECK(pvkCreateCommandPool(device, &commandPoolInfo, &commandPool));

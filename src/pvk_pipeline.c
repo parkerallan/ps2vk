@@ -562,12 +562,17 @@ static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const 
                   vs->name);
         return PVK_ERROR_INVALID_SHADER;
     }
-    p->code = memalign(16, words * 4);
-    if (!p->code)
+    p->program = calloc(1, sizeof(*p->program));
+    if (!p->program)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
-    memcpy(p->code, vs->vu1CodeStart, words * 4);
-    p->codeEnd = p->code + words;
-    blk = p->code + (vs->vu1Convert - vs->vu1CodeStart);
+    p->program->vs   = vs;
+    p->program->refs = 1;
+    p->program->code = memalign(16, words * 4);
+    if (!p->program->code)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    memcpy(p->program->code, vs->vu1CodeStart, words * 4);
+    p->program->codeEnd = p->program->code + words;
+    blk = p->program->code + (vs->vu1Convert - vs->vu1CodeStart);
 
     for (i = 0; i < vs->inputCount; i++) {
         uint32_t *load = blk - 2 * (vs->inputCount - i);
@@ -604,9 +609,9 @@ static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const 
             pvk_error("pipeline: vertex shader '%s' has a run-time index clamp outside its code\n", vs->name);
             return PVK_ERROR_INVALID_SHADER;
         }
-        vu_nop(p->code + (c - vs->vu1CodeStart));
-        vu_nop(p->code + (c - vs->vu1CodeStart) + 2);
-        vu_nop(p->code + (c - vs->vu1CodeStart) + 4);
+        vu_nop(p->program->code + (c - vs->vu1CodeStart));
+        vu_nop(p->program->code + (c - vs->vu1CodeStart) + 2);
+        vu_nop(p->program->code + (c - vs->vu1CodeStart) + 4);
     }
     return PVK_SUCCESS;
 }
@@ -677,11 +682,39 @@ static PvkResult specialize(PvkPipeline p, const PvkSpecializationInfo *info)
                           "which VU1 cannot represent\n", (unsigned)e->constantID, vs->name);
                 return PVK_ERROR_VALIDATION_FAILED;
             }
-            memcpy(p->code + (c->vu1Word - vs->vu1CodeStart), &v, sizeof(v));
+            memcpy(p->program->code + (c->vu1Word - vs->vu1CodeStart), &v, sizeof(v));
             break;
         }
     }
     return PVK_SUCCESS;
+}
+
+static void program_release(struct PvkProgram *prog)
+{
+    if (!prog || --prog->refs)
+        return;
+    free(prog->code);
+    free(prog);
+}
+
+/* Replaces the pipeline's freshly patched program with the cache's identical
+ * one when there is one, else adds the pipeline's to the cache. */
+static void program_intern(PvkPipeline p, PvkPipelineCache cache)
+{
+    struct PvkProgram *mine = p->program, *c;
+    size_t bytes = (size_t)(mine->codeEnd - mine->code) * 4;
+
+    for (c = cache->programs; c; c = c->next) {
+        if (c->vs == mine->vs && (size_t)(c->codeEnd - c->code) * 4 == bytes && !memcmp(c->code, mine->code, bytes)) {
+            program_release(mine);
+            c->refs++;
+            p->program = c;
+            return;
+        }
+    }
+    mine->refs++;
+    mine->next      = cache->programs;
+    cache->programs = mine;
 }
 
 static uint32_t max_batch_vertices(const PvkPipeline p, uint32_t step)
@@ -707,7 +740,8 @@ static const struct {
     [PVK_PRIMITIVE_TOPOLOGY_SPRITE_LIST]    = { PRIM_SPRITE, 2, 0, 0 },
 };
 
-PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineCreateInfo *info, PvkPipeline *pipeline)
+PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, const PvkGraphicsPipelineCreateInfo *info,
+                                    PvkPipeline *pipeline)
 {
     const PvkShaderCode *vs = NULL, *fs = NULL;
     const PvkSpecializationInfo *vsSpec = NULL;
@@ -771,6 +805,8 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, const PvkGraphicsPipelineC
         pvkDestroyPipeline(device, p);
         return res;
     }
+    if (cache)
+        program_intern(p, cache);
     /* A vertex shader with a texture coordinate output stores ST before RGBAQ, XYZ2. */
     p->outputQwords = vs->texcoordOutputLocation >= 0 ? PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED : PVK_VU1_OUTPUT_PER_VERTEX;
     p->primStep     = topologies[info->topology].step;
@@ -808,6 +844,40 @@ void pvkDestroyPipeline(PvkDevice device, PvkPipeline pipeline)
     (void)device;
     if (!pipeline)
         return;
-    free(pipeline->code);
+    program_release(pipeline->program);
     free(pipeline);
+}
+
+PvkResult pvkCreatePipelineCache(PvkDevice device, const PvkPipelineCacheCreateInfo *info, PvkPipelineCache *cache)
+{
+    PvkPipelineCache c;
+
+    (void)device;
+    if (info && info->flags) {
+        pvk_error("pvkCreatePipelineCache: flags must be 0\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (info && info->initialDataSize && !info->initialData) {
+        pvk_error("pvkCreatePipelineCache: initialDataSize without initialData\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    c = calloc(1, sizeof(*c));
+    if (!c)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    *cache = c;
+    return PVK_SUCCESS;
+}
+
+void pvkDestroyPipelineCache(PvkDevice device, PvkPipelineCache cache)
+{
+    struct PvkProgram *prog, *next;
+
+    (void)device;
+    if (!cache)
+        return;
+    for (prog = cache->programs; prog; prog = next) {
+        next = prog->next;
+        program_release(prog);
+    }
+    free(cache);
 }

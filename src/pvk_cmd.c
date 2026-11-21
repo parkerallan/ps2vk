@@ -212,6 +212,7 @@ void pvkFreeCommandBuffers(PvkDevice device, PvkCommandPool pool, uint32_t count
 static void cmd_reset_state(PvkCommandBuffer cmd)
 {
     cmd->pipeline     = NULL;
+    cmd->program      = NULL;
     cmd->gsStateDirty = 0;
     cmd->uniformsDirty = 0;
     memset(cmd->sets, 0, sizeof(cmd->sets));
@@ -1099,8 +1100,8 @@ void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkComman
 
 void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
 {
-    u32 *start = (u32 *)pipeline->code;
-    u32 *end   = (u32 *)pipeline->codeEnd;
+    u32 *start = (u32 *)pipeline->program->code;
+    u32 *end   = (u32 *)pipeline->program->codeEnd;
     float context[PVK_VU1_CONTEXT_QWORDS * 4];
     uint32_t i;
 
@@ -1109,9 +1110,13 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
     if (!cmd_reserve(cmd, packet2_utils_get_packet_size_for_program(start, end) + 8))
         return;
 
-    /* Upload the vertex shader (VIF waits for VU1 to stop first), then the
-     * per-pipeline constants, with the command buffer's viewport when it is dynamic. */
-    packet2_vif_add_micro_program(&cmd->packet, 0, start, end);
+    /* Upload the vertex shader (VIF waits for VU1 to stop first), or only wait when this
+     * recording already uploaded the program; then the per-pipeline constants. */
+    if (cmd->program == pipeline->program)
+        cmd_flush(cmd);
+    else
+        packet2_vif_add_micro_program(&cmd->packet, 0, start, end);
+    cmd->program = pipeline->program;
 
     memcpy(context, pipeline->context, sizeof(context));
     if (pipeline->dynamic & (1u << PVK_DYNAMIC_STATE_VIEWPORT) && cmd->dynamicSet & (1u << PVK_DYNAMIC_STATE_VIEWPORT)) {
