@@ -5,6 +5,79 @@
 
 #include "pvk_internal.h"
 
+static PvkSwapchain handler_swapchain;
+
+/* Nonzero when nothing shows the image and no queued flip will. */
+static int image_free(PvkSwapchain sc, uint32_t image)
+{
+    uint32_t i;
+
+    if (sc->displayed == image)
+        return 0;
+    for (i = sc->flipHead; i != sc->flipTail; i = (i + 1) % PVK_MAX_PENDING_FLIPS)
+        if (sc->flips[i].image == image)
+            return 0;
+    return 1;
+}
+
+/* Completes an acquire whose image came free. Interrupts disabled, or from the handler. */
+static void acquire_signal(PvkSwapchain sc, uint32_t image)
+{
+    struct PvkAcquire *a = &sc->acquires[image];
+
+    if (!a->pending || !image_free(sc, image))
+        return;
+    a->pending = 0;
+    if (a->semaphore)
+        a->semaphore->count++;
+    if (a->fence) {
+        a->fence->pending  = 0;
+        a->fence->signaled = 1;
+        iSignalSema(a->fence->sema);
+    }
+}
+
+/* INTC_VBLANK_S: flips to the oldest queued present once its semaphores are signaled. */
+static s32 vblank_handler(s32 cause)
+{
+    PvkSwapchain sc = handler_swapchain;
+    struct PvkFlip *f;
+    uint32_t i, old;
+
+    (void)cause;
+    if (!sc || sc->flipHead == sc->flipTail)
+        goto out;
+    /* Flip on even fields only (CSR.FIELD), so both fields show one frame. */
+    if (sc->interlaced && ((*GS_REG_CSR >> 13) & 1))
+        goto out;
+    f = &sc->flips[sc->flipHead];
+    for (i = 0; i < f->waitCount; i++)
+        if (f->waits[i]->count <= 0)
+            goto out;
+    for (i = 0; i < f->waitCount; i++)
+        f->waits[i]->count--;
+    {
+        const framebuffer_t *fb = &sc->images[f->image].fb;
+        graph_set_framebuffer_filtered(fb->address, fb->width, fb->psm, 0, 0);
+    }
+    old           = sc->displayed;
+    sc->displayed = f->image;
+    sc->flipHead  = (sc->flipHead + 1) % PVK_MAX_PENDING_FLIPS;
+    iSignalSema(sc->flipSema);
+    for (i = 0; i < sc->imageCount; i++)
+        acquire_signal(sc, (old + i) % sc->imageCount);
+    pvk_queue_kick(&sc->device->queue);
+out:
+    ExitHandler();
+    return 0;
+}
+
+void pvk_swapchain_wait_flips(PvkSwapchain swapchain)
+{
+    while (swapchain->flipHead != swapchain->flipTail)
+        WaitSema(swapchain->flipSema);
+}
+
 /* Sets the video mode; interlaced modes are field mode over a full-height framebuffer. */
 static PvkResult set_display_mode(PvkSwapchain sc, PvkDisplayMode displayMode)
 {
@@ -56,9 +129,20 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
     if (!sc)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
 
+    sc->device     = device;
     sc->width      = info->width;
     sc->height     = info->height;
     sc->imageCount = info->imageCount;
+    {
+        ee_sema_t sema = { 0 };
+        sema.init_count = 0;
+        sema.max_count  = 1;
+        sc->flipSema = CreateSema(&sema);
+        if (sc->flipSema < 0) {
+            free(sc);
+            return PVK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
 
     for (i = 0; i < sc->imageCount; i++) {
         framebuffer_t *fb = &sc->images[i].fb;
@@ -68,6 +152,7 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
             pvk_error("out of GS memory for swapchain image %u\n", (unsigned)i);
             while (i--)
                 pvk_vram_free(device, sc->images[i].fb.address);
+            DeleteSema(sc->flipSema);
             free(sc);
             return PVK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
@@ -92,7 +177,13 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
     }
 
     /* Image 0 is on screen, so the first image to render into is 1. */
+    sc->displayed = 0;
     sc->nextImage = 1;
+
+    handler_swapchain = sc;
+    sc->vblankHandler = AddIntcHandler(INTC_VBLANK_S, vblank_handler, 0);
+    EnableIntc(INTC_VBLANK_S);
+    device->swapchain = sc;
 
     *swapchain = sc;
     return PVK_SUCCESS;
@@ -104,8 +195,16 @@ void pvkDestroySwapchain(PvkDevice device, PvkSwapchain swapchain)
 
     if (!swapchain)
         return;
+    if (device->swapchain == swapchain) {
+        pvk_queue_wait_idle(&device->queue);
+        DisableIntc(INTC_VBLANK_S);
+        RemoveIntcHandler(INTC_VBLANK_S, swapchain->vblankHandler);
+        handler_swapchain = NULL;
+        device->swapchain = NULL;
+    }
     for (i = 0; i < swapchain->imageCount; i++)
         pvk_vram_free(device, swapchain->images[i].fb.address);
+    DeleteSema(swapchain->flipSema);
     free(swapchain);
 }
 
@@ -125,28 +224,97 @@ PvkResult pvkGetSwapchainImages(PvkDevice device, PvkSwapchain swapchain, uint32
     return PVK_SUCCESS;
 }
 
-PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint32_t *imageIndex)
+PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint64_t timeout, PvkSemaphore semaphore,
+                              PvkFence fence, uint32_t *imageIndex)
 {
+    uint32_t image = swapchain->nextImage;
+    struct PvkAcquire *a = &swapchain->acquires[image];
+    PvkResult res;
+
     (void)device;
-    *imageIndex = swapchain->nextImage;
+
+    if (!semaphore && !fence) {
+        pvk_error("pvkAcquireNextImage: a semaphore or a fence is needed to know when the image is free\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (semaphore && (res = pvk_semaphores_check("pvkAcquireNextImage", 1, &semaphore, 1, 0)) != PVK_SUCCESS)
+        return res;
+    if (fence && (fence->pending || fence->signaled)) {
+        pvk_error("pvkAcquireNextImage: fence is %s\n", fence->pending ? "in use" : "signaled; reset it first");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (a->pending) {
+        pvk_error("pvkAcquireNextImage: every image is acquired already; present one first\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+
+    DI();
+    /* Nothing queued will take it off the screen: nothing to wait for. */
+    if (swapchain->displayed == image && swapchain->flipHead == swapchain->flipTail) {
+        EI();
+        return timeout ? PVK_TIMEOUT : PVK_NOT_READY;
+    }
+    if (semaphore)
+        pvk_semaphores_check("pvkAcquireNextImage", 1, &semaphore, 1, 1);
+    if (fence)
+        fence->pending = 1;
+    a->pending   = 1;
+    a->semaphore = semaphore;
+    a->fence     = fence;
+    acquire_signal(swapchain, image);
+    EI();
+
+    swapchain->nextImage = (image + 1) % swapchain->imageCount;
+    *imageIndex = image;
     return PVK_SUCCESS;
 }
 
-PvkResult pvkQueuePresent(PvkQueue queue, PvkSwapchain swapchain, uint32_t imageIndex)
+static PvkResult present_check(PvkQueue queue, const PvkPresentInfo *info)
 {
-    const framebuffer_t *fb = &swapchain->images[imageIndex].fb;
+    PvkSwapchain sc;
 
-    /* No semaphores yet: make sure rendering into the image has finished. */
-    pvkDeviceWaitIdle(queue->device);
-
-    graph_wait_vsync();
-    if (swapchain->interlaced) {
-        /* Flip on even fields only (CSR.FIELD), so both fields show one frame. */
-        while ((*GS_REG_CSR >> 13) & 1)
-            graph_wait_vsync();
+    if (info->swapchainCount != 1) {
+        pvk_error("pvkQueuePresent: swapchainCount must be 1; the device has one swapchain\n");
+        return PVK_ERROR_VALIDATION_FAILED;
     }
-    graph_set_framebuffer_filtered(fb->address, fb->width, fb->psm, 0, 0);
+    sc = info->swapchains[0];
+    if (sc != queue->device->swapchain) {
+        pvk_error("pvkQueuePresent: the swapchain was not created on this queue's device\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (info->imageIndices[0] >= sc->imageCount) {
+        pvk_error("pvkQueuePresent: image index %u is out of range\n", (unsigned)info->imageIndices[0]);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    return pvk_semaphores_check("pvkQueuePresent", info->waitSemaphoreCount, info->waitSemaphores, 0, 0);
+}
 
-    swapchain->nextImage = (imageIndex + 1) % swapchain->imageCount;
+PvkResult pvkQueuePresent(PvkQueue queue, const PvkPresentInfo *info)
+{
+    PvkSwapchain sc;
+    struct PvkFlip *f;
+    uint32_t i;
+    PvkResult res;
+
+    res = present_check(queue, info);
+    if (info->results && info->swapchainCount)
+        info->results[0] = res;
+    if (res != PVK_SUCCESS)
+        return res;
+    sc = info->swapchains[0];
+    pvk_semaphores_check("pvkQueuePresent", info->waitSemaphoreCount, info->waitSemaphores, 0, 1);
+
+    /* Room for one flip per image; the vblank handler frees them. */
+    while ((sc->flipTail + 1) % PVK_MAX_PENDING_FLIPS == sc->flipHead)
+        WaitSema(sc->flipSema);
+
+    f        = &sc->flips[sc->flipTail];
+    f->image = info->imageIndices[0];
+    for (i = 0; i < info->waitSemaphoreCount; i++)
+        f->waits[i] = info->waitSemaphores[i];
+    f->waitCount = info->waitSemaphoreCount;
+    DI();
+    sc->flipTail = (sc->flipTail + 1) % PVK_MAX_PENDING_FLIPS;
+    EI();
     return PVK_SUCCESS;
 }

@@ -28,6 +28,7 @@
 /* VU1 input memory a batch can fill, after the header. */
 #define PVK_BATCH_INPUT_QWORDS (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER)
 #define PVK_MAX_SWAPCHAIN_IMAGES 2
+#define PVK_MAX_PENDING_FLIPS (PVK_MAX_SWAPCHAIN_IMAGES + 1)
 
 #define pvk_error(...) printf("ps2vk: " __VA_ARGS__)
 
@@ -43,26 +44,57 @@ struct PvkInstance_T {
 /* What pvkGetPhysicalDeviceProperties reports; every size check reads it. */
 extern const PvkPhysicalDeviceLimits pvk_limits;
 
-/* Signaled by the GS SIGNAL at the end of the submission it was passed to. */
+/* Signaled by the GS SIGNAL at the end of the submission it was passed to,
+ * or by the vblank handler when an acquired swapchain image leaves the screen. */
 struct PvkFence_T {
-    s32          sema;      /* EE semaphore the INTC_GS handler releases */
-    volatile int pending;   /* submitted, its SIGNAL not seen yet */
+    s32          sema;      /* EE semaphore the handler releases */
+    volatile int pending;   /* submitted or given to an acquire, not signaled yet */
     volatile int signaled;
 };
 
-/* One in-order queue. Submissions run back to back on the VIF1 channel; each
- * ends with a GS SIGNAL carrying its fence, so any number can be in flight. */
+/* Binary semaphore. `count` is the GPU-side state: raised by the completing handler, lowered when the
+ * waiting operation starts. `balance` is the same bookkeeping at API-call time, for validation. */
+struct PvkSemaphore_T {
+    volatile int count;
+    int          balance;
+};
+
+#define PVK_MAX_SUBMIT_SEMAPHORES  4
+#define PVK_MAX_PENDING_SUBMISSIONS 8
+
+/* One command buffer's chain, queued on the VIF1 channel. Its SIGNAL
+ * carries the ring index; the INTC_GS handler frees it. */
+struct PvkSubmission {
+    PvkCommandBuffer cmd;                               /* NULL: a batch of semaphore operations alone */
+    PvkFence     fence;                                 /* of the last chain of the batch, else NULL */
+    PvkSemaphore waits[PVK_MAX_SUBMIT_SEMAPHORES];      /* of the first chain of a submit */
+    uint32_t     waitCount;
+    PvkSemaphore signals[PVK_MAX_SUBMIT_SEMAPHORES];    /* of the last chain of a submit */
+    uint32_t     signalCount;
+    volatile int state;                                 /* 0 free, 1 queued, 2 chain sent */
+};
+
+/* One in-order queue. Chains wait in a ring and are started from the DMAC and vblank handlers once
+ * the channel is free and their semaphores are signaled; the INTC_GS handler completes each chain. */
 struct PvkQueue_T {
     PvkDevice device;
     PvkFence  last;         /* fence of the newest submission; NULL = idle */
     struct PvkFence_T idle; /* stands in when a submission has no fence */
+    struct PvkSubmission ring[PVK_MAX_PENDING_SUBMISSIONS];
+    volatile uint32_t head, tail; /* ring[head..tail) are in flight */
+    s32       room;         /* EE semaphore released whenever a ring entry frees */
 };
 
 void      pvk_queue_wait_idle(PvkQueue queue);
+void      pvk_queue_kick(PvkQueue queue); /* interrupts disabled, or from a handler */
 PvkResult pvk_fence_init(PvkFence fence, int signaled);
 void      pvk_fence_wait(PvkFence fence);
-void      pvk_gs_signal_install(void);
-void      pvk_gs_signal_remove(void);
+PvkResult pvk_queue_init(PvkQueue queue);
+void      pvk_queue_shutdown(PvkQueue queue);
+/* Validates a wait (signal = 0) or signal list against the semaphores' balances, applying it when `apply`. */
+PvkResult pvk_semaphores_check(const char *who, uint32_t count, const PvkSemaphore *sems, int signal, int apply);
+/* Sleeps until every queued present has flipped. */
+void      pvk_swapchain_wait_flips(PvkSwapchain swapchain);
 
 #define PVK_MAX_VRAM_ALLOCATIONS 64
 
@@ -73,6 +105,7 @@ struct PvkVramRange {
 
 struct PvkDevice_T {
     struct PvkQueue_T queue;
+    PvkSwapchain swapchain;   /* the one swapchain, or NULL: pvk_queue_wait_idle drains its flips */
     PvkPhysicalDeviceFeatures features;
     uint32_t vramCount;       /* taken VRAM ranges, sorted by start: swapchain framebuffers and type 1 allocations */
     struct PvkVramRange vram[PVK_MAX_VRAM_ALLOCATIONS];
@@ -134,11 +167,32 @@ float pvk_depth_max(PvkFormat format);
 /* The VU1 context's viewport scale and offset qwords (8 floats) for a viewport and depth format. */
 void pvk_viewport_context(const PvkViewport *vp, PvkFormat depthFormat, float *ctx);
 
+/* A queued pvkQueuePresent: the vblank handler flips to `image` once its semaphores are signaled. */
+struct PvkFlip {
+    uint32_t     image;
+    PvkSemaphore waits[PVK_MAX_SUBMIT_SEMAPHORES];
+    uint32_t     waitCount;
+};
+
+/* A pvkAcquireNextImage whose image is still on screen or has a flip queued onto it. */
+struct PvkAcquire {
+    int          pending;
+    PvkSemaphore semaphore;
+    PvkFence     fence;
+};
+
 struct PvkSwapchain_T {
+    PvkDevice         device;
     uint32_t          width, height;
     uint32_t          imageCount;
     uint32_t          nextImage;
     int               interlaced;  /* flip only on even fields, so both fields show one frame */
+    volatile uint32_t displayed;   /* image DISPFB points at */
+    struct PvkFlip    flips[PVK_MAX_PENDING_FLIPS];
+    volatile uint32_t flipHead, flipTail;
+    struct PvkAcquire acquires[PVK_MAX_SWAPCHAIN_IMAGES];
+    s32               flipSema;    /* released by the vblank handler after each flip */
+    s32               vblankHandler;
     struct PvkImage_T images[PVK_MAX_SWAPCHAIN_IMAGES];
 };
 

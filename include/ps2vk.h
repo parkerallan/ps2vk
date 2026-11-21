@@ -26,6 +26,8 @@ extern "C" {
 /** @brief Result codes. */
 typedef enum PvkResult {
     PVK_SUCCESS                        = 0,           /**< The call succeeded. */
+    PVK_NOT_READY                      = 1,           /**< pvkAcquireNextImage() with timeout 0: no image is free and none will be until a present. */
+    PVK_TIMEOUT                        = 2,           /**< pvkAcquireNextImage() with a timeout: the same, so waiting would not help. */
     PVK_INCOMPLETE                     = 5,           /**< The array given was too small for every result. */
     PVK_ERROR_OUT_OF_HOST_MEMORY       = -1,          /**< EE main RAM allocation failed. */
     PVK_ERROR_OUT_OF_DEVICE_MEMORY     = -2,          /**< Not enough GS VRAM. */
@@ -133,6 +135,28 @@ typedef struct PvkPhysicalDevice_T *PvkPhysicalDevice;
 typedef struct PvkDevice_T        *PvkDevice;
 /** @brief Where command buffers are submitted. The device has exactly one. */
 typedef struct PvkQueue_T         *PvkQueue;
+/**
+ * @brief Lets the CPU wait until a submission has finished drawing, or an acquired swapchain image is free.
+ *
+ * Each submission ends with a GS FINISH and a GS SIGNAL whose ID names its
+ * fence. The SIGNAL raises INTC_GS; the handler marks the fence signaled and
+ * releases an EE semaphore, so a waiting thread sleeps instead of polling.
+ * A fence given to pvkAcquireNextImage() is signaled the same way by the
+ * vblank handler when the image leaves the screen.
+ */
+typedef struct PvkFence_T         *PvkFence;
+/**
+ * @brief Orders one queue operation after another without the CPU.
+ *
+ * Binary: a submission or an acquire signals it, and one later submission or
+ * present waits for it, which resets it. The wait holds the waiting
+ * operation back, not the CPU: a submission waiting on one stays in the
+ * queue's ring and is started by an interrupt handler the moment the signal
+ * arrives, the INTC_GS SIGNAL handler for a submission's signal or the
+ * INTC_VBLANK_S handler for an acquire's; a present waiting on one is a
+ * DISPFB write the vblank handler holds until the signal.
+ */
+typedef struct PvkSemaphore_T     *PvkSemaphore;
 
 /** @brief Parameters for pvkCreateInstance(). */
 typedef struct PvkInstanceCreateInfo {
@@ -789,25 +813,60 @@ void      pvkDestroySwapchain(PvkDevice device, PvkSwapchain swapchain);
 PvkResult pvkGetSwapchainImages(PvkDevice device, PvkSwapchain swapchain, uint32_t *count, PvkImage *images);
 
 /**
- * @brief Returns the index of the image to render into next (the one not on screen).
+ * @brief Picks the image to render into next and arranges a signal for when it is free.
+ *
+ * The images are taken in turn, so the index is known at once and the call
+ * never sleeps. The image is free when DISPFB no longer points at it and no
+ * queued present will point it there; the semaphore and fence are signaled
+ * at that moment by the INTC_VBLANK_S handler that performs the flip, or
+ * before the call returns if the image is free already. One acquire can be
+ * outstanding per image.
+ *
  * @param device The device.
  * @param swapchain The swapchain.
+ * @param timeout Nanoseconds to wait for an index. An index is always known
+ *                at once or never until a present, so the call never sleeps;
+ *                the value only picks the result for the latter case.
+ * @param semaphore Semaphore to signal when the image is free, or NULL.
+ * @param fence Unsignaled fence not in use, to signal when the image is free, or NULL.
  * @param[out] imageIndex Index into the images from pvkGetSwapchainImages().
- * @return PVK_SUCCESS.
+ * @return PVK_SUCCESS; PVK_NOT_READY (timeout 0) or PVK_TIMEOUT (any other
+ *         timeout) if the image is on screen and no present is queued to
+ *         replace it, so nothing would ever signal; or
+ *         PVK_ERROR_VALIDATION_FAILED if semaphore and fence are both NULL,
+ *         the semaphore is signaled or has a signal pending, the fence is
+ *         signaled or in use, or the image is acquired already.
  */
-PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint32_t *imageIndex);
+PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint64_t timeout, PvkSemaphore semaphore,
+                              PvkFence fence, uint32_t *imageIndex);
+
+/** @brief Parameters for pvkQueuePresent(). */
+typedef struct PvkPresentInfo {
+    uint32_t            waitSemaphoreCount; /**< Number of entries in waitSemaphores, at most 4. */
+    const PvkSemaphore *waitSemaphores;     /**< Semaphores that must be signaled before the flip; each is reset by the wait. */
+    uint32_t            swapchainCount;     /**< Number of entries in swapchains, imageIndices and results: 1, the device has one swapchain. */
+    const PvkSwapchain *swapchains;         /**< The device's swapchain. */
+    const uint32_t     *imageIndices;       /**< Image to show. */
+    PvkResult          *results;            /**< Written with the result for each swapchain, or NULL. */
+} PvkPresentInfo;
 
 /**
- * @brief Shows an image on the TV.
+ * @brief Queues an image to be shown on the TV.
  *
- * Waits for rendering to finish, waits for vsync, then points the display at the image.
+ * Returns at once. At the first vertical blank (even field in an interlaced
+ * mode) at which its wait semaphores are all signaled, the INTC_VBLANK_S
+ * handler points DISPFB at the image; the image that leaves the screen is
+ * then free for the acquire waiting on it. Up to 2 presents can be queued,
+ * and the call sleeps while there are that many.
  *
  * @param queue The queue.
- * @param swapchain The swapchain.
- * @param imageIndex Image to show.
- * @return PVK_SUCCESS.
+ * @param info What to show and what to wait for.
+ * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if swapchainCount is
+ *         not 1, the swapchain is not the device's, the image index is out
+ *         of range, there are more than 4 wait semaphores, or a wait
+ *         semaphore has no signal pending.
  */
-PvkResult pvkQueuePresent(PvkQueue queue, PvkSwapchain swapchain, uint32_t imageIndex);
+PvkResult pvkQueuePresent(PvkQueue queue, const PvkPresentInfo *info);
 
 /** @} */
 
@@ -2008,42 +2067,103 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t insta
  * @{
  */
 
-/**
- * @brief Lets the CPU wait until a submission has finished drawing.
- *
- * Each submission ends with a GS FINISH and a GS SIGNAL whose ID names its
- * fence. The SIGNAL raises INTC_GS; the handler marks the fence signaled and
- * releases an EE semaphore, so a waiting thread sleeps instead of polling.
- */
-typedef struct PvkFence_T         *PvkFence;
 
 /** @brief Parameters for pvkCreateFence(). May be NULL. */
 typedef struct PvkFenceCreateInfo {
     uint32_t signaled; /**< Nonzero to create the fence already signaled. */
 } PvkFenceCreateInfo;
 
+/** @brief Parameters for pvkCreateSemaphore(). May be NULL. */
+typedef struct PvkSemaphoreCreateInfo {
+    uint32_t flags; /**< Reserved; 0. */
+} PvkSemaphoreCreateInfo;
+
 /**
- * @brief Sends a command buffer to the hardware.
+ * @brief Points in the hardware's processing of a command buffer.
  *
- * Writes the CPU cache back to RAM and starts DMA on the VIF1 channel. The
- * channel takes one chain at a time, so this waits until the previous
- * submission's chain has been read; the GS may still be drawing it. Any
- * number of submissions can be in flight; each is tracked by its fence.
- * A submission without a fence uses one the queue keeps, so it waits for the
- * previous fenceless submission to finish first.
+ * A command buffer is one VIF1 DMA chain that the GS consumes in order, and
+ * a wait holds back the start of that chain. So every stage maps to the same
+ * point, the chain's DMA start, and a wait at any stage is a wait at the
+ * start; the values are kept so a mask reads as in a Vulkan program.
+ */
+typedef enum PvkPipelineStageFlagBits {
+    PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT             = 0x00000001, /**< The chain's DMA start. */
+    PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT           = 0x00000002, /**< Same point. */
+    PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT            = 0x00000004, /**< Same point: the VIF unpacks vertices as the chain runs. */
+    PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT           = 0x00000008, /**< Same point: VU1 runs as the chain runs. */
+    PVK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT         = 0x00000080, /**< Same point: GS register state set by the chain. */
+    PVK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT    = 0x00000100, /**< Same point: GS TEST. */
+    PVK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT     = 0x00000200, /**< Same point: GS TEST. */
+    PVK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT = 0x00000400, /**< Same point: GS FRAME writes. */
+    PVK_PIPELINE_STAGE_TRANSFER_BIT                = 0x00001000, /**< Same point: image copies in the chain. */
+    PVK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT          = 0x00002000, /**< Same point. */
+    PVK_PIPELINE_STAGE_ALL_GRAPHICS_BIT            = 0x00008000, /**< Same point. */
+    PVK_PIPELINE_STAGE_ALL_COMMANDS_BIT            = 0x00010000  /**< Same point. */
+} PvkPipelineStageFlagBits;
+/** @brief Bitmask of PvkPipelineStageFlagBits. */
+typedef uint32_t PvkPipelineStageFlags;
+
+/** @brief One batch of command buffers for pvkQueueSubmit(). */
+typedef struct PvkSubmitInfo {
+    uint32_t                waitSemaphoreCount;   /**< Number of entries in waitSemaphores and waitDstStageMask, at most 4. */
+    const PvkSemaphore     *waitSemaphores;       /**< Semaphores that must be signaled before the first command buffer's chain starts; each is reset by the wait. */
+    const PvkPipelineStageFlags *waitDstStageMask; /**< Stage at which each wait takes effect: every stage is the chain's DMA start. */
+    uint32_t                commandBufferCount;   /**< Number of entries in commandBuffers; 0 submits only the semaphore operations. */
+    const PvkCommandBuffer *commandBuffers;       /**< Primary command buffers, run in order. */
+    uint32_t                signalSemaphoreCount; /**< Number of entries in signalSemaphores, at most 4. */
+    const PvkSemaphore     *signalSemaphores;     /**< Semaphores signaled when the last command buffer has finished drawing. */
+} PvkSubmitInfo;
+
+/**
+ * @brief Queues command buffers for the hardware.
+ *
+ * Writes the CPU cache back to RAM and places each command buffer's VIF1 DMA
+ * chain in the queue's ring of 8. Chains are started in ring order by the
+ * DMAC and vblank interrupt handlers, each as soon as the channel is free
+ * and its wait semaphores are signaled, so the GS may still be drawing the
+ * chain before it. The call sleeps only while the ring is full. Each chain
+ * ends with a GS SIGNAL; its INTC_GS handler signals the submit's semaphores
+ * after the submit's last chain and the fence after the last chain of the
+ * call. A batch with no command buffer takes one ring entry too: its waits
+ * are consumed and its signals and the fence raised once every earlier
+ * entry has finished. A submission without a fence uses one the queue
+ * keeps, so it waits for the previous fenceless submission to finish first.
  *
  * @param queue The queue.
- * @param cmd A primary command buffer that has finished recording.
- * @param fence Unsignaled fence not in use by another submission, to signal
- *              when drawing finishes; or NULL.
- * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if the command buffer is
+ * @param submitCount Number of entries in submits.
+ * @param submits The batches, run in order.
+ * @param fence Unsignaled fence not in use by another submission or acquire,
+ *              to signal when the last command buffer finishes drawing; or NULL.
+ * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if a command buffer is
  *         secondary, still recording, failed to record, holds no recording
  *         (never recorded, or its pool was reset since), was recorded with
  *         PVK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT and submitted before,
  *         executes a secondary command buffer that was recorded again or
- *         lost its recording since, or if the fence is signaled or in use.
+ *         lost its recording since; if a batch has more than 4 semaphores
+ *         in a list; if a wait semaphore has no signal
+ *         pending or a signal semaphore is signaled or has one pending; or
+ *         if the fence is signaled or in use.
  */
-PvkResult pvkQueueSubmit(PvkQueue queue, PvkCommandBuffer cmd, PvkFence fence);
+PvkResult pvkQueueSubmit(PvkQueue queue, uint32_t submitCount, const PvkSubmitInfo *submits, PvkFence fence);
+
+/**
+ * @brief Creates a semaphore, unsignaled.
+ * @param device The device.
+ * @param info Semaphore parameters, or NULL.
+ * @param[out] semaphore The new semaphore.
+ * @return PVK_SUCCESS or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ */
+PvkResult pvkCreateSemaphore(PvkDevice device, const PvkSemaphoreCreateInfo *info, PvkSemaphore *semaphore);
+
+/**
+ * @brief Destroys a semaphore.
+ *
+ * Waits until the queue is idle first, since a queued chain or present may still name it.
+ *
+ * @param device The device.
+ * @param semaphore Semaphore to destroy.
+ */
+void      pvkDestroySemaphore(PvkDevice device, PvkSemaphore semaphore);
 
 /**
  * @brief Creates a fence.

@@ -35,6 +35,7 @@ int main(void)
     PvkCommandPool commandPool;
     PvkCommandBuffer cmd;
     PvkFence fence;
+    PvkSemaphore imageAvailable, renderDone;
     uint32_t frame = 0;
 
     PvkInstanceCreateInfo instanceInfo = { .applicationName = "clear" };
@@ -74,6 +75,8 @@ int main(void)
     };
     CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
+    CHECK(pvkCreateSemaphore(device, NULL, &imageAvailable));
+    CHECK(pvkCreateSemaphore(device, NULL, &renderDone));
     PvkCommandBufferBeginInfo beginInfo = { .flags = 0 };
 
     printf("clear: running\n");
@@ -82,7 +85,11 @@ int main(void)
         uint32_t imageIndex;
         float t = (float)(frame % 120) / 120.0f;
 
-        CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
+        /* The command buffer is re-recorded below, so the previous frame must be done with it. */
+        CHECK(pvkWaitForFences(device, 1, &fence));
+        CHECK(pvkResetFences(device, 1, &fence));
+        /* imageAvailable is signaled when the image leaves the screen; the draw waits for it. */
+        CHECK(pvkAcquireNextImage(device, swapchain, UINT64_MAX, imageAvailable, NULL, &imageIndex));
 
         CHECK(pvkResetCommandPool(device, commandPool, 0));
         CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
@@ -98,10 +105,20 @@ int main(void)
         pvkCmdEndRendering(cmd);
         CHECK(pvkEndCommandBuffer(cmd));
 
-        CHECK(pvkResetFences(device, 1, &fence));
-        CHECK(pvkQueueSubmit(queue, cmd, fence));
-        CHECK(pvkWaitForFences(device, 1, &fence));
-        CHECK(pvkQueuePresent(queue, swapchain, imageIndex));
+        /* The draw waits for the image and signals renderDone; the present waits for renderDone. */
+        /* The chain waits whole, so the stage only documents what the wait protects: the color writes. */
+        PvkPipelineStageFlags waitStage = PVK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        PvkSubmitInfo submit = {
+            .waitSemaphoreCount   = 1, .waitSemaphores   = &imageAvailable, .waitDstStageMask = &waitStage,
+            .commandBufferCount   = 1, .commandBuffers   = &cmd,
+            .signalSemaphoreCount = 1, .signalSemaphores = &renderDone,
+        };
+        CHECK(pvkQueueSubmit(queue, 1, &submit, fence));
+        PvkPresentInfo present = {
+            .waitSemaphoreCount = 1, .waitSemaphores = &renderDone,
+            .swapchainCount     = 1, .swapchains     = &swapchain, .imageIndices = &imageIndex,
+        };
+        CHECK(pvkQueuePresent(queue, &present));
     }
 
     return 0;

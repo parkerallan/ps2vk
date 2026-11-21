@@ -174,6 +174,7 @@ int main(void)
     PvkCommandPool commandPool;
     PvkCommandBuffer cmd;
     PvkFence fence;
+    PvkSemaphore imageAvailable, renderDone;
     void *mapped;
     static Vertex vertices[24];
     static uint16_t indices[36];
@@ -353,6 +354,8 @@ int main(void)
     };
     CHECK(pvkAllocateCommandBuffers(device, &cmdInfo, &cmd));
     CHECK(pvkCreateFence(device, NULL, &fence));
+    CHECK(pvkCreateSemaphore(device, NULL, &imageAvailable));
+    CHECK(pvkCreateSemaphore(device, NULL, &renderDone));
     PvkCommandBufferBeginInfo beginInfo = { .flags = 0 };
 
     /* The target is square; the display is 4:3 whatever the pixel count. */
@@ -368,7 +371,11 @@ int main(void)
         cube_mvp(innerMvp, innerProj, (float)frame * 0.05f, (float)frame * 0.031f, -3.2f);
         cube_mvp(outerMvp, outerProj, (float)frame * 0.01f, 0.5f + sinf((float)frame * 0.007f) * 0.4f, -4.0f);
 
-        CHECK(pvkAcquireNextImage(device, swapchain, &imageIndex));
+        /* The command buffer is re-recorded below, so the previous frame must be done with it. */
+        CHECK(pvkWaitForFences(device, 1, &fence));
+        CHECK(pvkResetFences(device, 1, &fence));
+        /* imageAvailable is signaled when the image leaves the screen; the draw waits for it. */
+        CHECK(pvkAcquireNextImage(device, swapchain, UINT64_MAX, imageAvailable, NULL, &imageIndex));
 
         CHECK(pvkResetCommandPool(device, commandPool, 0));
         CHECK(pvkBeginCommandBuffer(cmd, &beginInfo));
@@ -420,10 +427,20 @@ int main(void)
 
         CHECK(pvkEndCommandBuffer(cmd));
 
-        CHECK(pvkResetFences(device, 1, &fence));
-        CHECK(pvkQueueSubmit(queue, cmd, fence));
-        CHECK(pvkWaitForFences(device, 1, &fence));
-        CHECK(pvkQueuePresent(queue, swapchain, imageIndex));
+        /* The draw waits for the image and signals renderDone; the present waits for renderDone. */
+        /* The chain waits whole, so the stage only documents what the wait protects: the color writes. */
+        PvkPipelineStageFlags waitStage = PVK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        PvkSubmitInfo submit = {
+            .waitSemaphoreCount   = 1, .waitSemaphores   = &imageAvailable, .waitDstStageMask = &waitStage,
+            .commandBufferCount   = 1, .commandBuffers   = &cmd,
+            .signalSemaphoreCount = 1, .signalSemaphores = &renderDone,
+        };
+        CHECK(pvkQueueSubmit(queue, 1, &submit, fence));
+        PvkPresentInfo present = {
+            .waitSemaphoreCount = 1, .waitSemaphores = &renderDone,
+            .swapchainCount     = 1, .swapchains     = &swapchain, .imageIndices = &imageIndex,
+        };
+        CHECK(pvkQueuePresent(queue, &present));
     }
 
     return 0;
