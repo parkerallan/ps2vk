@@ -1407,8 +1407,18 @@ typedef enum PvkBlendOp {
     PVK_BLEND_OP_MAX              = 4  /**< Not supported. */
 } PvkBlendOp;
 
+/** @brief Color channels of the color attachment. */
+typedef enum PvkColorComponentFlagBits {
+    PVK_COLOR_COMPONENT_R_BIT = 0x00000001, /**< Red. */
+    PVK_COLOR_COMPONENT_G_BIT = 0x00000002, /**< Green. */
+    PVK_COLOR_COMPONENT_B_BIT = 0x00000004, /**< Blue. */
+    PVK_COLOR_COMPONENT_A_BIT = 0x00000008  /**< Alpha. */
+} PvkColorComponentFlagBits;
+/** @brief Bitmask of PvkColorComponentFlagBits. */
+typedef uint32_t PvkColorComponentFlags;
+
 /**
- * @brief Blending of the color attachment.
+ * @brief Blending and channel writes of the color attachment.
  *
  * The equation src * srcColorBlendFactor (op) dst * dstColorBlendFactor is
  * rewritten into the GS's (A - B) * C + D at pipeline creation; combinations
@@ -1416,18 +1426,31 @@ typedef enum PvkBlendOp {
  * ones do: alpha blending (SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ADD), additive
  * (SRC_ALPHA or ONE, ONE, ADD) and subtractive (SRC_ALPHA, ONE,
  * REVERSE_SUBTRACT). The GS has no alpha blending: the attachment's alpha is
- * always the fragment's alpha. All zeros means no blending.
+ * always the fragment's alpha.
+ *
+ * colorWriteMask names the channels a draw writes; the others keep the
+ * attachment's values, and 0 writes no color at all (depth is still written).
+ * A clear by pvkCmdBeginRendering() ignores the mask. The GS FRAME register
+ * holds the mask (FBMSK, a set bit protects that bit of every pixel) next to
+ * the attachment's address, which a secondary command buffer recorded with
+ * PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT does not know. So
+ * pvkCmdBeginRendering() keeps a GIF packet holding FRAME_1 and FRAME_2 in
+ * VU1 memory, the first draw with another mask overwrites only the packet's
+ * FBMSK word (a masked VIF UNPACK) and runs a VU1 routine that sends the
+ * packet to the GS (XGKICK). Such a secondary puts the masks back to all
+ * channels at its end.
  */
 typedef struct PvkPipelineColorBlendAttachmentState {
     uint32_t       blendEnable;         /**< Nonzero to blend. GS PRIM.ABE. */
     PvkBlendFactor srcColorBlendFactor; /**< Factor on the fragment's color. */
     PvkBlendFactor dstColorBlendFactor; /**< Factor on the framebuffer's color. */
     PvkBlendOp     colorBlendOp;        /**< How the two products combine. */
+    PvkColorComponentFlags colorWriteMask; /**< Channels the draws write; 0 writes none. GS FRAME.FBMSK. */
 } PvkPipelineColorBlendAttachmentState;
 
 /** @brief Blend state of a pipeline. */
 typedef struct PvkPipelineColorBlendStateCreateInfo {
-    PvkPipelineColorBlendAttachmentState attachment;        /**< Blending of the single color attachment. */
+    PvkPipelineColorBlendAttachmentState attachment;        /**< Blending and write mask of the single color attachment. */
     float                                blendConstants[4]; /**< Only [3] is used, by the CONSTANT_ALPHA factors, as GS ALPHA.FIX (0..1, 1 = 128). Ignored when PVK_DYNAMIC_STATE_BLEND_CONSTANTS is dynamic. */
 } PvkPipelineColorBlendStateCreateInfo;
 
@@ -1519,7 +1542,7 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none. Sets the depth range the viewport maps to. */
     PvkPipelineRasterizationStateCreateInfo rasterization; /**< Back-face culling. */
     PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth test and write control. */
-    PvkPipelineColorBlendStateCreateInfo   colorBlend;   /**< Blending with the color attachment. */
+    PvkPipelineColorBlendStateCreateInfo   colorBlend;   /**< Blending with the color attachment and the channels written. */
     PvkPipelineDynamicStateCreateInfo      dynamicState; /**< State set while recording instead of here. */
 } PvkGraphicsPipelineCreateInfo;
 
@@ -1547,7 +1570,10 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  * settings, culling, depth test and blend equation. A depth test needs a
  * depthAttachmentFormat, the comparison must be one the GS can do (see
  * PvkCompareOp) and the blend factors must fit the GS equation (see
- * PvkPipelineColorBlendAttachmentState). The states listed in dynamicState
+ * PvkPipelineColorBlendAttachmentState), and colorWriteMask may hold only
+ * PvkColorComponentFlagBits. A vertex shader of more than 2044 VU1
+ * instructions is rejected with PVK_ERROR_INVALID_SHADER: the last 4 of
+ * VU1's 2048 hold the frame routine. The states listed in dynamicState
  * are read from the command buffer instead (see PvkDynamicState). Every
  * vertex shader input needs an attribute in a declared binding (see
  * PvkVertexInputBinding); the pipeline
@@ -2058,6 +2084,9 @@ void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkComman
  * one pass when both ask for it. The color attachment may be a swapchain
  * image or any level of a PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT texture; the
  * pipelines drawn with it should have a viewport of that level's size.
+ * Also loads VU1 with the frame packet (GS FRAME_1 and FRAME_2) and the
+ * routine that sends the packet, which a color write mask change uses (see
+ * PvkPipelineColorBlendAttachmentState).
  *
  * @param cmd The command buffer.
  * @param info Target images, render area and load operations.

@@ -58,6 +58,61 @@ static void cmd_close_direct(PvkCommandBuffer cmd, qword_t *end)
     packet2_chain_close_tag(&cmd->packet);
 }
 
+/* VU1 code, lower then upper word per pair: XGKICKs the frame packet and stops. */
+static const u32 frame_routine[8] __attribute__((aligned(16))) = {
+    0x10010000u | PVK_VU1_FRAME_ADDR, 0x000002FFu, /* iaddiu VI01,VI00,frame | NOP */
+    0x80000EFCu,                      0x000002FFu, /* xgkick VI01            | NOP */
+    0x8000033Cu,                      0x400002FFu, /* NOP                    | NOP[E] */
+    0x8000033Cu,                      0x000002FFu, /* NOP                    | NOP */
+};
+
+/* The frame routine and the frame packet for VU1: a GIF tag, FRAME_1 and FRAME_2 with FBMSK 0. */
+static void cmd_frame_packet(PvkCommandBuffer cmd, const framebuffer_t *fb)
+{
+    u64 tag = GIF_SET_TAG(2, 1, 0, 0, GIF_FLG_PACKED, 1);
+    u32 frame = (u32)GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, 0);
+    uint32_t c;
+
+    packet2_vif_add_micro_program(&cmd->packet, PVK_VU1_FRAME_ROUTINE, (u32 *)frame_routine, (u32 *)frame_routine + 8);
+    packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_FRAME_ADDR, 0);
+    packet2_add_u32(&cmd->packet, (u32)tag);
+    packet2_add_u32(&cmd->packet, (u32)(tag >> 32));
+    packet2_add_u32(&cmd->packet, GIF_REG_AD);
+    packet2_add_u32(&cmd->packet, 0);
+    for (c = 0; c < 2; c++) {
+        packet2_add_u32(&cmd->packet, frame);
+        packet2_add_u32(&cmd->packet, 0);
+        packet2_add_u32(&cmd->packet, GS_REG_FRAME_1 + c);
+        packet2_add_u32(&cmd->packet, 0);
+        cmd->fbmsk[c] = 0;
+    }
+    packet2_utils_vu_close_unpack(&cmd->packet);
+}
+
+/* Chain qwords cmd_frame_mask() uses. */
+#define PVK_FRAME_MASK_QWORDS 3
+
+/* Writes `fbmsk` over the FBMSK word of FRAME_1 or FRAME_2 in VU1's frame packet and runs
+ * the frame routine. The word with the attachment's address stays, so a secondary can do it. */
+static void cmd_frame_mask(PvkCommandBuffer cmd, uint32_t ctxt, uint32_t fbmsk)
+{
+    packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+    packet2_vif_flush(&cmd->packet, 0);
+    packet2_vif_stcycl(&cmd->packet, 0, 0x0101, 0);
+    /* STMASK: of a qword's x, y, z, w only y (the A+D data's upper word) is written. */
+    packet2_add_u32(&cmd->packet, MAKE_VIF_CODE(0, 0, P2_VIF_STMASK, 0));
+    packet2_add_u32(&cmd->packet, 0xF3F3F3F3u);
+    packet2_vif_open_unpack(&cmd->packet, P2_UNPACK_S_32, PVK_VU1_FRAME_ADDR + 1 + ctxt, 0, 1, 1, 0);
+    packet2_add_u32(&cmd->packet, fbmsk);
+    packet2_vif_close_unpack_manual(&cmd->packet, 1);
+    packet2_vif_mscal(&cmd->packet, PVK_VU1_FRAME_ROUTINE, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_chain_close_tag(&cmd->packet);
+    cmd->fbmsk[ctxt] = fbmsk;
+}
+
 /* Open a CNT tag on the GIF channel (PATH3); GS packets are written at the returned pointer. */
 static qword_t *cmd_open_gif(PvkCommandBuffer cmd)
 {
@@ -303,6 +358,8 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
     cmd->inheritedDepthFormat = inherit ? inherit->depthAttachmentFormat : PVK_FORMAT_UNDEFINED;
     cmd->secondaryContents = 0;
     cmd->rendering    = cmd->inherits;
+    cmd->fbmsk[0]     = 0; /* a secondary inside the primary's rendering starts with all channels written */
+    cmd->fbmsk[1]     = 0;
     cmd->failed       = 0;
     cmd->recording    = 1;
 
@@ -320,11 +377,17 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
 PvkResult pvkEndCommandBuffer(PvkCommandBuffer cmd)
 {
     qword_t *q;
+    uint32_t c;
 
     if (cmd->rendering && !cmd->inherits) {
         pvk_error("pvkEndCommandBuffer inside pvkCmdBeginRendering/pvkCmdEndRendering\n");
         cmd->failed = 1;
     }
+
+    /* Inside the primary's rendering: leave FRAME_1 and FRAME_2 writing all channels again. */
+    for (c = 0; cmd->inherits && c < 2; c++)
+        if (cmd->fbmsk[c] && cmd_reserve(cmd, PVK_FRAME_MASK_QWORDS))
+            cmd_frame_mask(cmd, c, 0);
 
     if (cmd->level == PVK_COMMAND_BUFFER_LEVEL_SECONDARY) {
         /* Back to the primary's chain after the CALL tag that came here. */
@@ -534,12 +597,12 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
         }
     }
 
-    if (!cmd_reserve(cmd, 48 + (clearColor || clearDepth ? 5 + 2 * clear_strips(&info->renderArea) : 0)))
+    if (!cmd_reserve(cmd, 56 + (clearColor || clearDepth ? 5 + 2 * clear_strips(&info->renderArea) : 0)))
         return;
 
     /* Both GS register sets point at the attachments: context 1 writes depth,
      * context 2 (ZBUF_2.ZMSK = 1) does not. A pipeline picks one with PRIM.CTXT,
-     * so draws never write FRAME or ZBUF and need not know the addresses. */
+     * so draws never write ZBUF or FRAME's address and need not know the addresses. */
     z.enable  = depthImage != NULL;
     z.method  = ZTEST_METHOD_ALLPASS;
     z.address = depthImage ? depthImage->fb.address : 0;
@@ -560,6 +623,7 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
         q = gs_ad(q, GS_SET_ZBUF(z.address >> 11, z.zsm, z.mask), GS_REG_ZBUF_1);
     }
     cmd_close_direct(cmd, q);
+    cmd_frame_packet(cmd, &fb);
 
     cmd->colorView    = colorView;
     cmd->depthView    = depthView;
@@ -603,7 +667,7 @@ static int cmd_scissor(PvkCommandBuffer cmd, const framebuffer_t *fb, const char
  * PRIM.CTXT picks, plus TEX0, TEXA, TEX1, CLAMP and the MIPTBPs for the image and sampler
  * in the bound descriptor set when the pipeline samples one. Sent before the first draw
  * after pvkCmdBeginRendering, pvkCmdBindPipeline, pvkCmdBindDescriptorSets or a dynamic
- * scissor or blend constant change. FRAME and ZBUF stay as pvkCmdBeginRendering set them. */
+ * scissor or blend constant change. ZBUF stays as pvkCmdBeginRendering set it. */
 static void cmd_gs_state(PvkCommandBuffer cmd, const PvkRect2D *scissor)
 {
     const PvkPipeline p = cmd->pipeline;
@@ -1460,8 +1524,11 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
     if (!cmd_scissor(cmd, cmd->inherits ? NULL : &fb, name, &scissor))
         return 0; /* nothing may be written */
     if (cmd->gsStateDirty) {
-        if (!cmd_reserve(cmd, PVK_GS_STATE_QWORDS))
+        if (!cmd_reserve(cmd, PVK_GS_STATE_QWORDS + PVK_FRAME_MASK_QWORDS))
             return 0;
+        /* The pipeline's color write mask, when its GS context holds another. */
+        if (cmd->fbmsk[p->zmsk] != p->fbmsk)
+            cmd_frame_mask(cmd, p->zmsk, p->fbmsk);
         cmd_gs_state(cmd, &scissor);
     }
     return !p->cullAll; /* FRONT_AND_BACK: every triangle is discarded, so nothing to send */

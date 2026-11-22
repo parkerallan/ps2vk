@@ -102,6 +102,17 @@ static PvkResult setup_blend(PvkPipeline p, const PvkGraphicsPipelineCreateInfo 
     int a, b, c, d;
     float k;
 
+    if (bs->colorWriteMask & ~0xFu) {
+        pvk_error("pipeline: colorWriteMask 0x%x has bits that are no PvkColorComponentFlagBits\n",
+                  (unsigned)bs->colorWriteMask);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    /* FBMSK protects the bits it sets: a byte per channel the mask leaves out. */
+    p->fbmsk = (bs->colorWriteMask & PVK_COLOR_COMPONENT_R_BIT ? 0 : 0x000000FFu)
+             | (bs->colorWriteMask & PVK_COLOR_COMPONENT_G_BIT ? 0 : 0x0000FF00u)
+             | (bs->colorWriteMask & PVK_COLOR_COMPONENT_B_BIT ? 0 : 0x00FF0000u)
+             | (bs->colorWriteMask & PVK_COLOR_COMPONENT_A_BIT ? 0 : 0xFF000000u);
+
     p->alpha = GS_SET_ALPHA(0, 2, 2, 1, 0x80);
     if (!bs->blendEnable)
         return PVK_SUCCESS;
@@ -560,6 +571,11 @@ static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const 
         vs->vu1Convert + 2 * (2 + 4 * vs->inputCount) > vs->vu1CodeEnd) {
         pvk_error("pipeline: vertex shader '%s' has no input conversion block; rebuild it with this shaderc\n",
                   vs->name);
+        return PVK_ERROR_INVALID_SHADER;
+    }
+    if (words / 2 > PVK_VU1_FRAME_ROUTINE) {
+        pvk_error("pipeline: vertex shader '%s' is %u VU1 instructions; micro memory holds %u\n", vs->name,
+                  (unsigned)(words / 2), (unsigned)PVK_VU1_FRAME_ROUTINE);
         return PVK_ERROR_INVALID_SHADER;
     }
     p->program = calloc(1, sizeof(*p->program));

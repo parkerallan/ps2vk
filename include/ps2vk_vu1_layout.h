@@ -4,6 +4,8 @@
  *
  *   0   context: viewport scale, viewport offset, color scale, culling (per pipeline)
  *   4   push constants: 8 qwords = 128 bytes, written by pvkCmdPushConstants
+ *   12  frame: a GIF tag, GS FRAME_1 and FRAME_2 (A+D), filled by pvkCmdBeginRendering;
+ *       a color write mask change rewrites an FBMSK word and XGKICKs the packet
  *   16  uniform buffers: 64 qwords = 1 KB; the vertex shader's uniform blocks,
  *       placed by shaderc in (set, binding) order, each filled from the buffer
  *       in the bound descriptor set before the first draw after a bind
@@ -31,6 +33,9 @@
 #define PVK_VU1_PUSH_ADDR         4
 #define PVK_VU1_PUSH_QWORDS       8   /* PVK_MAX_PUSH_CONSTANT_BYTES / 16 */
 
+#define PVK_VU1_FRAME_ADDR        12
+#define PVK_VU1_FRAME_QWORDS      3
+
 #define PVK_VU1_UNIFORM_ADDR      16
 #define PVK_VU1_UNIFORM_QWORDS    64  /* PVK_MAX_UNIFORM_BYTES / 16 */
 
@@ -57,5 +62,9 @@
 #define PVK_VU1_TEXCOORD_REG      19
 
 #define PVK_VU1_MEMORY_QWORDS     1024
+
+/* VU1 micro memory, in instruction pairs; the last 4 hold the routine that XGKICKs the frame packet. */
+#define PVK_VU1_MICRO_PAIRS       2048
+#define PVK_VU1_FRAME_ROUTINE     2044
 
 #endif /* PS2VK_VU1_LAYOUT_H */

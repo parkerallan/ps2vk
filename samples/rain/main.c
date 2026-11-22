@@ -354,6 +354,8 @@ int main(void)
         .attributeCount = 2,
         .attributes     = attributes,
         .viewport       = { 0.0f, 0.0f, WIDTH, HEIGHT, 0.0f, 1.0f },
+        .colorBlend     = { .attachment = { .colorWriteMask = PVK_COLOR_COMPONENT_R_BIT | PVK_COLOR_COMPONENT_G_BIT
+                                                             | PVK_COLOR_COMPONENT_B_BIT | PVK_COLOR_COMPONENT_A_BIT } },
         .scissor        = { 0, 0, WIDTH, HEIGHT },
     };
     CHECK(make_pipeline(device, &pipelineInfo, PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, BLEND_NONE,  &skyPipe));

@@ -359,6 +359,7 @@ struct PvkPipeline_T {
     uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */
     uint32_t zmsk;            /* GS context it draws in: 2 (ZBUF_2.ZMSK = 1) when it writes no depth, else 1 */
     u64      alpha;           /* GS ALPHA */
+    uint32_t fbmsk;           /* GS FRAME.FBMSK: the bits of the channels colorWriteMask leaves out */
     int      blendFix;        /* ALPHA.C = FIX: the blend constants' alpha */
     uint32_t dynamic;         /* 1 << PvkDynamicState for each state set while recording */
     PvkRect2D scissor;        /* static scissor; zero size = the attachment level */
@@ -405,6 +406,7 @@ struct PvkCommandBuffer_T {
     PvkFormat   inheritedDepthFormat;
     int         secondaryContents; /* the rendering takes its draws from pvkCmdExecuteCommands only */
     int         gsStateDirty; /* TEST/ALPHA/SCISSOR/TEX0 must be re-sent before the next draw */
+    uint32_t    fbmsk[2];     /* FBMSK the GS holds in FRAME_1 and FRAME_2 */
     int         uniformsDirty; /* the uniform blocks' buffers must be sent to VU1 before the next draw */
     PvkDescriptorSet sets[PVK_MAX_DESCRIPTOR_SETS]; /* bound with pvkCmdBindDescriptorSets, or NULL */
     PvkBuffer   vertexBuffers[PVK_MAX_VERTEX_BINDINGS]; /* bound with pvkCmdBindVertexBuffers, or NULL */
