@@ -538,8 +538,8 @@ int main(void)
     };
     CHECK(pvkQueueSubmit(transferQueue, 1, &uploadSubmit, NULL));
 
-    /* The display is 4:3 whatever the pixel count. */
-    mat_perspective(proj, 60.0f * 3.14159265f / 180.0f, 4.0f / 3.0f, 0.5f, 10.0f);
+    /* For a 16:9 TV, which stretches the 640x448 picture to that shape. */
+    mat_perspective(proj, 60.0f * 3.14159265f / 180.0f, 16.0f / 9.0f, 0.5f, 10.0f);
 
     printf("cube: running\n");
 

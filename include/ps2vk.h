@@ -879,9 +879,9 @@ typedef struct PvkSwapchain_T     *PvkSwapchain;
  */
 typedef enum PvkDisplayMode {
     PVK_DISPLAY_MODE_AUTO = 0, /**< The console's region: NTSC or PAL, interlaced. */
-    PVK_DISPLAY_MODE_NTSC,     /**< 480i: 640x448, 60 fields a second. */
-    PVK_DISPLAY_MODE_PAL,      /**< 576i: 640x512, 50 fields a second. */
-    PVK_DISPLAY_MODE_480P      /**< 480p: 640x448 progressive, 60 frames a second. */
+    PVK_DISPLAY_MODE_NTSC,     /**< 480i: up to 448 lines, 60 fields a second; non-interlaced (240p) for an image of at most 224 lines. */
+    PVK_DISPLAY_MODE_PAL,      /**< 576i: up to 512 lines, 50 fields a second; non-interlaced (288p) for an image of at most 256 lines. */
+    PVK_DISPLAY_MODE_480P      /**< 480p: up to 480 lines progressive, 60 frames a second. */
 } PvkDisplayMode;
 
 /**
@@ -900,10 +900,30 @@ typedef enum PvkPresentMode {
     PVK_PRESENT_MODE_FIFO_RELAXED = 3  /**< FIFO, but a present that becomes ready after a vblank that had none to show is shown at once. */
 } PvkPresentMode;
 
-/** @brief Parameters for pvkCreateSwapchain(). */
+/**
+ * @brief Parameters for pvkCreateSwapchain().
+ *
+ * The size is free within what the display mode shows. The GS DISPLAY
+ * register magnifies the image by whole factors, MAGH up to 16 and MAGV up
+ * to 4, as far as the TV picture has room, and centers the result; what is
+ * left over stays black. Both GS read circuits (DISPFB1, DISPFB2) start at
+ * the image's first line.
+ *
+ * | displayMode | Width | Height | TV picture |
+ * | --- | --- | --- | --- |
+ * | NTSC | multiple of 64, up to 2048 | up to 448 | 2560 VCK units wide, 448 lines |
+ * | PAL | multiple of 64, up to 2048 | up to 512 | 2560 VCK units wide, 512 lines |
+ * | 480P | multiple of 64, up to 1408 | up to 480 | 1440 VCK units wide, 480 lines |
+ *
+ * In NTSC and PAL an image higher than one field (224 or 256 lines) is shown
+ * interlaced, one image per two fields. A lower image is shown
+ * non-interlaced, the whole image every vblank, so presents can follow each
+ * other at 60 or 50 a second. 16:9 works in every display mode: a program
+ * for a 16:9 TV gives its projection a 16:9 aspect.
+ */
 typedef struct PvkSwapchainCreateInfo {
-    uint32_t       width;       /**< Width in pixels, e.g. 640. */
-    uint32_t       height;      /**< Height in pixels, e.g. 448. */
+    uint32_t       width;       /**< Width in pixels: a multiple of 64 (GS FRAME.FBW), up to the display mode's limit. */
+    uint32_t       height;      /**< Height in pixels, up to the display mode's lines. */
     PvkFormat      format;      /**< Must be PVK_FORMAT_CT32. */
     uint32_t       imageCount;  /**< 2 or 3 framebuffers; each takes width x height x 4 bytes of the 4 MB GS VRAM in whole 8 KB pages. */
     PvkDisplayMode displayMode; /**< Video mode; 0 is PVK_DISPLAY_MODE_AUTO. */
@@ -921,8 +941,10 @@ typedef struct PvkSwapchainCreateInfo {
  * @param device The device.
  * @param info Swapchain parameters.
  * @param[out] swapchain The new swapchain.
- * @return PVK_SUCCESS, PVK_ERROR_FORMAT_NOT_SUPPORTED, PVK_ERROR_FEATURE_NOT_PRESENT,
- *         PVK_ERROR_OUT_OF_DEVICE_MEMORY or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ * @return PVK_SUCCESS, PVK_ERROR_FORMAT_NOT_SUPPORTED, PVK_ERROR_FEATURE_NOT_PRESENT
+ *         (an image count, present mode, display mode or size the swapchain
+ *         cannot have), PVK_ERROR_OUT_OF_DEVICE_MEMORY or
+ *         PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
 PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *info, PvkSwapchain *swapchain);
 

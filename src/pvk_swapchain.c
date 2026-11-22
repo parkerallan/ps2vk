@@ -25,7 +25,7 @@ static void acquire_signal(PvkSwapchain sc, uint32_t image)
 {
     struct PvkAcquire *a = &sc->acquires[image];
 
-    if (!a->pending || !image_free(sc, image))
+    if (!a->pending || a->flipsLeft)
         return;
     a->pending = 0;
     if (a->semaphore)
@@ -37,13 +37,16 @@ static void acquire_signal(PvkSwapchain sc, uint32_t image)
     }
 }
 
-/* Signals every acquire whose image came free. Interrupts disabled, or from a handler. */
-static void acquires_signal(PvkSwapchain sc)
+/* A present went on screen: every waiting acquire is one flip closer, and may complete. */
+static void acquires_flipped(PvkSwapchain sc)
 {
     uint32_t i;
 
-    for (i = 0; i < sc->imageCount; i++)
+    for (i = 0; i < sc->imageCount; i++) {
+        if (sc->acquires[i].pending && sc->acquires[i].flipsLeft)
+            sc->acquires[i].flipsLeft--;
         acquire_signal(sc, i);
+    }
 }
 
 /* Nonzero when the queued present at `index` has its semaphores signaled, counting
@@ -65,6 +68,17 @@ static int flip_ready(PvkSwapchain sc, uint32_t index)
     return 1;
 }
 
+/* Points both GS read circuits (DISPFB1, DISPFB2) at the image's first line. */
+static void show_image(PvkSwapchain sc, uint32_t image)
+{
+    const framebuffer_t *fb = &sc->images[image].fb;
+    u64 dispfb = GS_SET_DISPFB(fb->address >> 11, fb->width >> 6, fb->psm, 0, 0);
+
+    *GS_REG_DISPFB1 = dispfb;
+    *GS_REG_DISPFB2 = dispfb;
+    sc->displayed   = image;
+}
+
 /* Takes the oldest queued present off the queue, lowering its semaphores; with `show`,
  * DISPFB points at its image, without, the image is free again (MAILBOX replaced it). */
 static void flip_take(PvkSwapchain sc, int show)
@@ -75,14 +89,13 @@ static void flip_take(PvkSwapchain sc, int show)
     for (i = 0; i < f->waitCount; i++)
         f->waits[i]->count--;
     if (show) {
-        const framebuffer_t *fb = &sc->images[f->image].fb;
-        graph_set_framebuffer_filtered(fb->address, fb->width, fb->psm, 0, 0);
-        sc->displayed = f->image;
-        sc->late      = 0;
+        show_image(sc, f->image);
+        sc->late = 0;
     }
     sc->flipHead = (sc->flipHead + 1) % PVK_MAX_PENDING_FLIPS;
     iSignalSema(sc->flipSema);
-    acquires_signal(sc);
+    if (show)
+        acquires_flipped(sc);
 }
 
 int pvk_swapchain_pump(PvkSwapchain sc)
@@ -138,38 +151,69 @@ void pvk_swapchain_wait_flips(PvkSwapchain swapchain)
         WaitSema(swapchain->flipSema);
 }
 
-/* Sets the video mode; interlaced modes are field mode over a full-height framebuffer. */
-static PvkResult set_display_mode(PvkSwapchain sc, PvkDisplayMode displayMode)
+/* A display mode's video signal: libgraph's mode, the picture's width in VCK units, its lines
+ * per field, DISPLAY.DX and DY of a non-interlaced picture, and whether it has two fields. */
+struct Signal {
+    int mode, vck, lines, x, y, fields;
+};
+
+static int signal_of(PvkDisplayMode displayMode, struct Signal *s)
 {
-    int interlace, mode, ffmd;
+    static const struct Signal ntsc = { GRAPH_MODE_NTSC, 2560, 224, 652, 26, 1 };
+    static const struct Signal pal  = { GRAPH_MODE_PAL, 2560, 256, 680, 37, 1 };
+    static const struct Signal p480 = { GRAPH_MODE_HDTV_480P, 1440, 480, 232, 35, 0 };
 
     switch (displayMode) {
-    case PVK_DISPLAY_MODE_AUTO:
-        interlace = GRAPH_MODE_INTERLACED; mode = graph_get_region(); ffmd = GRAPH_MODE_FIELD;
-        break;
-    case PVK_DISPLAY_MODE_NTSC:
-        interlace = GRAPH_MODE_INTERLACED; mode = GRAPH_MODE_NTSC; ffmd = GRAPH_MODE_FIELD;
-        break;
-    case PVK_DISPLAY_MODE_PAL:
-        interlace = GRAPH_MODE_INTERLACED; mode = GRAPH_MODE_PAL; ffmd = GRAPH_MODE_FIELD;
-        break;
-    case PVK_DISPLAY_MODE_480P:
-        interlace = GRAPH_MODE_NONINTERLACED; mode = GRAPH_MODE_HDTV_480P; ffmd = GRAPH_MODE_FRAME;
-        break;
-    default:
-        pvk_error("swapchain displayMode %d is not a PvkDisplayMode\n", (int)displayMode);
+    case PVK_DISPLAY_MODE_AUTO: *s = graph_get_region() == GRAPH_MODE_PAL ? pal : ntsc; return 1;
+    case PVK_DISPLAY_MODE_NTSC: *s = ntsc; return 1;
+    case PVK_DISPLAY_MODE_PAL:  *s = pal;  return 1;
+    case PVK_DISPLAY_MODE_480P: *s = p480; return 1;
+    default:                    return 0;
+    }
+}
+
+/* Checks the size against the display mode and works out GS DISPLAY: the image magnified by
+ * whole factors (MAGH up to 16, MAGV up to 4) as far as the picture has room, and centered. */
+static PvkResult display_setup(PvkSwapchain sc, const PvkSwapchainCreateInfo *info)
+{
+    struct Signal s;
+    uint32_t w = info->width, h = info->height, maxWidth, lines, magh, magv, dy;
+
+    if (!signal_of(info->displayMode, &s)) {
+        pvk_error("swapchain displayMode %d is not a PvkDisplayMode\n", (int)info->displayMode);
         return PVK_ERROR_FEATURE_NOT_PRESENT;
     }
-    sc->interlaced = interlace == GRAPH_MODE_INTERLACED;
-    sc->vblankNs   = mode == GRAPH_MODE_PAL ? 20000000u : 16683350u; /* 50 Hz, 59.94 Hz */
-
-    /* What graph_initialize does, with the mode chosen here (no flicker filter). */
-    graph_set_mode(interlace, mode, ffmd, 0);
-    graph_set_screen(0, 0, (int)sc->width, (int)sc->height);
-    graph_set_bgcolor(0, 0, 0);
-    graph_set_framebuffer_filtered(sc->images[0].fb.address, (int)sc->width, GS_PSM_32, 0, 0);
-    graph_enable_output();
+    /* An image of at most one field's lines is shown non-interlaced: the whole image every vblank. */
+    sc->interlaced = s.fields && h > (uint32_t)s.lines;
+    lines    = sc->interlaced ? 2 * (uint32_t)s.lines : (uint32_t)s.lines;
+    maxWidth = (uint32_t)s.vck < pvk_limits.maxFramebufferWidth ? (uint32_t)s.vck : pvk_limits.maxFramebufferWidth;
+    if (!w || w % 64 || w > maxWidth || !h || h > lines) {
+        pvk_error("swapchain size %ux%u: this display mode shows a width that is a multiple of 64 up to %u "
+                  "and a height up to %u\n", (unsigned)w, (unsigned)h, (unsigned)maxWidth,
+                  (unsigned)(s.fields ? 2 * s.lines : s.lines));
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    magh = (uint32_t)s.vck / w > 16 ? 16 : (uint32_t)s.vck / w;
+    magv = lines / h > 4 ? 4 : lines / h;
+    /* Two fields: DY counts lines of both, and an even offset keeps line 0 in the even field. */
+    dy = sc->interlaced ? (uint32_t)(s.y - 1) * 2 + ((lines - h * magv) / 2 & ~1u) : (uint32_t)s.y + (lines - h * magv) / 2;
+    sc->display   = GS_SET_DISPLAY((uint32_t)s.x + ((uint32_t)s.vck - w * magh) / 2, dy, magh - 1, magv - 1,
+                                   w * magh - 1, h * magv - 1);
+    sc->graphMode = s.mode;
+    sc->vblankNs  = s.mode == GRAPH_MODE_PAL ? 20000000u : 16683350u; /* 50 Hz, 59.94 Hz */
     return PVK_SUCCESS;
+}
+
+/* Sets the video signal (no flicker filter) and DISPLAY, and shows image 0. */
+static void display_apply(PvkSwapchain sc)
+{
+    graph_set_mode(sc->interlaced ? GRAPH_MODE_INTERLACED : GRAPH_MODE_NONINTERLACED, sc->graphMode,
+                   sc->interlaced ? GRAPH_MODE_FIELD : GRAPH_MODE_FRAME, 0);
+    *GS_REG_DISPLAY1 = sc->display;
+    *GS_REG_DISPLAY2 = sc->display;
+    graph_set_bgcolor(0, 0, 0);
+    show_image(sc, 0);
+    graph_enable_output();
 }
 
 PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *info, PvkSwapchain *swapchain)
@@ -206,6 +250,13 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
     sc->imageCount = info->imageCount;
     sc->presentMode = info->presentMode;
     {
+        PvkResult res = display_setup(sc, info);
+        if (res != PVK_SUCCESS) {
+            free(sc);
+            return res;
+        }
+    }
+    {
         ee_sema_t sema = { 0 };
         sema.init_count = 0;
         sema.max_count  = 1;
@@ -239,17 +290,8 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
         pvk_image_texture_params(&sc->images[i]);
     }
 
-    /* Sets the video mode and shows image 0. */
-    {
-        PvkResult res = set_display_mode(sc, info->displayMode);
-        if (res != PVK_SUCCESS) {
-            pvkDestroySwapchain(device, sc);
-            return res;
-        }
-    }
-
     /* Image 0 is on screen, so the first image to render into is 1. */
-    sc->displayed = 0;
+    display_apply(sc);
     sc->nextImage = 1;
 
     handler_swapchain = sc;
@@ -310,14 +352,16 @@ static uint32_t pick_free(PvkSwapchain sc)
 }
 
 /* The image that comes free first when presents are shown in order: the one on screen after one
- * more flip, then the queued ones in turn. Skips those handed out already; imageCount if none. */
-static uint32_t pick_next_free(PvkSwapchain sc)
+ * flip, then the queued ones in turn. Skips those handed out; imageCount if none. Sets *flips. */
+static uint32_t pick_next_free(PvkSwapchain sc, uint32_t *flips)
 {
-    uint32_t image = sc->displayed, i;
+    uint32_t image = sc->displayed, i, n = 1;
 
-    for (i = sc->flipHead; i != sc->flipTail; i = (i + 1) % PVK_MAX_PENDING_FLIPS) {
-        if (!sc->acquired[image])
+    for (i = sc->flipHead; i != sc->flipTail; i = (i + 1) % PVK_MAX_PENDING_FLIPS, n++) {
+        if (!sc->acquired[image]) {
+            *flips = n;
             return image;
+        }
         image = sc->flips[i].image;
     }
     return sc->imageCount;
@@ -326,7 +370,7 @@ static uint32_t pick_next_free(PvkSwapchain sc)
 PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint64_t timeout, PvkSemaphore semaphore,
                               PvkFence fence, uint32_t *imageIndex)
 {
-    uint32_t image, start = swapchain->vblanks;
+    uint32_t image, flips = 0, start = swapchain->vblanks;
     struct PvkAcquire *a;
     PvkResult res;
 
@@ -359,7 +403,7 @@ PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint64_t
         }
         if (swapchain->presentMode != PVK_PRESENT_MODE_MAILBOX) {
             /* Presents are shown in order, so the next image to come free is known now. */
-            image = pick_next_free(swapchain);
+            image = pick_next_free(swapchain, &flips);
             if (image < swapchain->imageCount)
                 break;
             EI();
@@ -380,6 +424,7 @@ PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint64_t
     if (fence)
         fence->pending = 1;
     a->pending   = 1;
+    a->flipsLeft = flips;
     a->semaphore = semaphore;
     a->fence     = fence;
     swapchain->acquired[image] = 1;

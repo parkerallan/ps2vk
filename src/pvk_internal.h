@@ -207,9 +207,10 @@ struct PvkFlip {
     uint32_t     waitCount;
 };
 
-/* A pvkAcquireNextImage whose image is still on screen or has a flip queued onto it. */
+/* A pvkAcquireNextImage whose image is still on screen or has an older present queued. */
 struct PvkAcquire {
     int          pending;
+    uint32_t     flipsLeft; /* presents still to be shown before the image is free */
     PvkSemaphore semaphore;
     PvkFence     fence;
 };
@@ -221,6 +222,8 @@ struct PvkSwapchain_T {
     uint32_t          nextImage;   /* where the search for a free image starts */
     PvkPresentMode    presentMode;
     int               interlaced;  /* flip only on even fields, so both fields show one frame */
+    int               graphMode;   /* libgraph's GRAPH_MODE_* of the video signal */
+    u64               display;     /* GS DISPLAY: where on the TV picture the image goes, and its magnification */
     uint32_t          vblankNs;    /* nanoseconds between two vblanks */
     volatile uint32_t vblanks;     /* counted by the vblank handler */
     volatile int      late;        /* a vblank passed with no present ready (FIFO_RELAXED flips at once) */
