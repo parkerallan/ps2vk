@@ -1731,16 +1731,17 @@ static void batch_indices(PvkCommandBuffer cmd, uint32_t dest, const uint16_t *p
     packet2_chain_close_tag(&cmd->packet);
 }
 
-void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
-                uint32_t firstInstance)
+/* pvkCmdDraw, reporting errors under `name`. */
+static void draw(PvkCommandBuffer cmd, const char *name, uint32_t vertexCount, uint32_t instanceCount,
+                 uint32_t firstVertex, uint32_t firstInstance)
 {
     PvkPipeline p = cmd->pipeline;
     uint32_t done, idone, k = 1, b;
 
-    if (!draw_ready(cmd, "pvkCmdDraw") || !draw_instances(cmd, "pvkCmdDraw", firstInstance, instanceCount))
+    if (!draw_ready(cmd, name) || !draw_instances(cmd, name, firstInstance, instanceCount))
         return;
     if ((uint64_t)firstVertex + vertexCount > stream_slots(cmd, 0)) {
-        pvk_error("pvkCmdDraw reads past the end of a vertex buffer\n");
+        pvk_error("%s reads past the end of a vertex buffer\n", name);
         cmd->failed = 1;
         return;
     }
@@ -1820,8 +1821,9 @@ static void indexed_plan(const PvkPipeline p, const uint16_t *idx, uint32_t inde
     }
 }
 
-void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
-                       int32_t vertexOffset, uint32_t firstInstance)
+/* pvkCmdDrawIndexed, reporting errors under `name`. */
+static void draw_indexed(PvkCommandBuffer cmd, const char *name, uint32_t indexCount, uint32_t instanceCount,
+                         uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
     PvkPipeline p = cmd->pipeline;
     const uint16_t *idx;
@@ -1829,16 +1831,15 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t insta
     uint32_t vertexSlots, done, idone, k = 1, i, j;
     int single;
 
-    if (!draw_ready(cmd, "pvkCmdDrawIndexed")
-        || !draw_instances(cmd, "pvkCmdDrawIndexed", firstInstance, instanceCount))
+    if (!draw_ready(cmd, name) || !draw_instances(cmd, name, firstInstance, instanceCount))
         return;
     if (!cmd->indexBuffer) {
-        pvk_error("pvkCmdDrawIndexed needs an index buffer bound with pvkCmdBindIndexBuffer\n");
+        pvk_error("%s needs an index buffer bound with pvkCmdBindIndexBuffer\n", name);
         cmd->failed = 1;
         return;
     }
     if (cmd->indexOffset + (size_t)(firstIndex + indexCount) * 2 > cmd->indexBuffer->size) {
-        pvk_error("pvkCmdDrawIndexed reads past the end of the index buffer\n");
+        pvk_error("%s reads past the end of the index buffer\n", name);
         cmd->failed = 1;
         return;
     }
@@ -1866,7 +1867,7 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t insta
                 for (i = 0; i < total; i++) {
                     first = (int64_t)batch_index(b.pre, b.c, idx + done, i) + vertexOffset;
                     if (first < 0 || first >= (int64_t)vertexSlots) {
-                        pvk_error("pvkCmdDrawIndexed: index %u + vertexOffset %d is outside the vertex buffer\n",
+                        pvk_error("%s: index %u + vertexOffset %d is outside the vertex buffer\n", name,
                                   (unsigned)batch_index(b.pre, b.c, idx + done, i), (int)vertexOffset);
                         cmd->failed = 1;
                         return;
@@ -1890,7 +1891,7 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t insta
 
             first = (int64_t)b.lo + vertexOffset;
             if (first < 0 || (int64_t)b.hi + vertexOffset >= (int64_t)vertexSlots) {
-                pvk_error("pvkCmdDrawIndexed: indices %u..%u + vertexOffset %d reach outside the vertex buffer\n",
+                pvk_error("%s: indices %u..%u + vertexOffset %d reach outside the vertex buffer\n", name,
                           (unsigned)b.lo, (unsigned)b.hi, (int)vertexOffset);
                 cmd->failed = 1;
                 return;
@@ -1909,5 +1910,97 @@ void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t insta
             batch_end(cmd, fi, k, at);
             done += b.n;
         }
+    }
+}
+
+void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
+                uint32_t firstInstance)
+{
+    draw(cmd, "pvkCmdDraw", vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
+                       int32_t vertexOffset, uint32_t firstInstance)
+{
+    draw_indexed(cmd, "pvkCmdDrawIndexed", indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+}
+
+/* Checks an indirect call's buffer range and features; returns the first command or NULL. */
+static const uint8_t *indirect_commands(PvkCommandBuffer cmd, const char *name, PvkBuffer buffer, size_t offset,
+                                        uint32_t drawCount, uint32_t stride, size_t commandSize)
+{
+    if (!buffer || !buffer->data) {
+        pvk_error("%s needs a buffer bound to memory\n", name);
+        goto fail;
+    }
+    if (offset % 4) {
+        pvk_error("%s: offset %u is not a multiple of 4\n", name, (unsigned)offset);
+        goto fail;
+    }
+    if (drawCount > 1) {
+        if (!cmd->device->features.multiDrawIndirect) {
+            pvk_error("%s: drawCount %u needs the multiDrawIndirect feature\n", name, (unsigned)drawCount);
+            goto fail;
+        }
+        if (stride % 4 || stride < commandSize) {
+            pvk_error("%s: stride %u is not a multiple of 4 of at least %u\n", name, (unsigned)stride,
+                      (unsigned)commandSize);
+            goto fail;
+        }
+    }
+    if (drawCount && offset + (size_t)(drawCount - 1) * stride + commandSize > buffer->size) {
+        pvk_error("%s reads past the end of the buffer\n", name);
+        goto fail;
+    }
+    return (const uint8_t *)buffer->data + offset;
+fail:
+    cmd->failed = 1;
+    return NULL;
+}
+
+/* A nonzero firstInstance in a command needs the drawIndirectFirstInstance feature. */
+static int indirect_first_instance(PvkCommandBuffer cmd, const char *name, uint32_t firstInstance)
+{
+    if (firstInstance && !cmd->device->features.drawIndirectFirstInstance) {
+        pvk_error("%s: firstInstance %u needs the drawIndirectFirstInstance feature\n", name, (unsigned)firstInstance);
+        cmd->failed = 1;
+        return 0;
+    }
+    return 1;
+}
+
+void pvkCmdDrawIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, uint32_t drawCount, uint32_t stride)
+{
+    const uint8_t *at = indirect_commands(cmd, "pvkCmdDrawIndirect", buffer, offset, drawCount, stride,
+                                          sizeof(PvkDrawIndirectCommand));
+    uint32_t i;
+
+    if (!at || !draw_ready(cmd, "pvkCmdDrawIndirect"))
+        return;
+    for (i = 0; i < drawCount && !cmd->failed; i++, at += stride) {
+        PvkDrawIndirectCommand c;
+        memcpy(&c, at, sizeof c);
+        if (!indirect_first_instance(cmd, "pvkCmdDrawIndirect", c.firstInstance))
+            return;
+        draw(cmd, "pvkCmdDrawIndirect", c.vertexCount, c.instanceCount, c.firstVertex, c.firstInstance);
+    }
+}
+
+void pvkCmdDrawIndexedIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, uint32_t drawCount,
+                               uint32_t stride)
+{
+    const uint8_t *at = indirect_commands(cmd, "pvkCmdDrawIndexedIndirect", buffer, offset, drawCount, stride,
+                                          sizeof(PvkDrawIndexedIndirectCommand));
+    uint32_t i;
+
+    if (!at || !draw_ready(cmd, "pvkCmdDrawIndexedIndirect"))
+        return;
+    for (i = 0; i < drawCount && !cmd->failed; i++, at += stride) {
+        PvkDrawIndexedIndirectCommand c;
+        memcpy(&c, at, sizeof c);
+        if (!indirect_first_instance(cmd, "pvkCmdDrawIndexedIndirect", c.firstInstance))
+            return;
+        draw_indexed(cmd, "pvkCmdDrawIndexedIndirect", c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset,
+                     c.firstInstance);
     }
 }

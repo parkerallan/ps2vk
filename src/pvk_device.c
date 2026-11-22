@@ -23,6 +23,7 @@ const PvkPhysicalDeviceLimits pvk_limits = {
     .maxFramebufferWidth                 = 2048,
     .maxFramebufferHeight                = 2048,
     .maxColorAttachments                 = 1,
+    .maxDrawIndirectCount                = 0xffffffffu,
     .minUniformBufferOffsetAlignment     = 16,
     .minMemoryMapAlignment               = 64,
     .maxSamplerLodBias                   = 127.9375f,
@@ -35,7 +36,9 @@ const PvkPhysicalDeviceLimits pvk_limits = {
 };
 
 static const PvkPhysicalDeviceFeatures supported_features = {
-    .robustBufferAccess = 1,
+    .robustBufferAccess        = 1,
+    .multiDrawIndirect         = 1,
+    .drawIndirectFirstInstance = 1,
 };
 
 PvkResult pvkCreateInstance(const PvkInstanceCreateInfo *info, PvkInstance *instance)
@@ -149,10 +152,16 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
         }
         families[q->queueFamilyIndex] = 1;
     }
-    if (info->enabledFeatures && info->enabledFeatures->robustBufferAccess &&
-        !supported_features.robustBufferAccess) {
-        pvk_error("pvkCreateDevice: robustBufferAccess is not supported\n");
-        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    if (info->enabledFeatures) {
+        const PvkPhysicalDeviceFeatures *f = info->enabledFeatures;
+        const char *missing = f->robustBufferAccess && !supported_features.robustBufferAccess ? "robustBufferAccess"
+                            : f->multiDrawIndirect && !supported_features.multiDrawIndirect ? "multiDrawIndirect"
+                            : f->drawIndirectFirstInstance && !supported_features.drawIndirectFirstInstance
+                                ? "drawIndirectFirstInstance" : NULL;
+        if (missing) {
+            pvk_error("pvkCreateDevice: %s is not supported\n", missing);
+            return PVK_ERROR_FEATURE_NOT_PRESENT;
+        }
     }
 
     dev = calloc(1, sizeof(struct PvkDevice_T));

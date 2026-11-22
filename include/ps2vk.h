@@ -208,6 +208,7 @@ typedef enum PvkPhysicalDeviceType {
  * | viewportBoundsRange | -1024 to 3071 | XYOFFSET puts pixel 0 at 1024 of 4096 |
  * | maxFramebufferWidth, maxFramebufferHeight | 2048 | FRAME.FBW in 64-pixel units, DISPLAY height |
  * | maxColorAttachments | 1 | one FRAME register |
+ * | maxDrawIndirectCount | 4294967295 | the EE reads each command when the draw is recorded |
  * | minUniformBufferOffsetAlignment, minMemoryMapAlignment | 16, 64 | a VIF UNPACK qword, a cache line |
  * | maxSamplerLodBias | 127.9375 | TEX1.K is signed 7.4 fixed point |
  * | maxSamplerAnisotropy | 1 | none |
@@ -234,6 +235,7 @@ typedef struct PvkPhysicalDeviceLimits {
     uint32_t maxFramebufferWidth;                 /**< Widest color or depth attachment. */
     uint32_t maxFramebufferHeight;                /**< Tallest color or depth attachment. */
     uint32_t maxColorAttachments;                 /**< Color attachments of one rendering pass. */
+    uint32_t maxDrawIndirectCount;                /**< Largest drawCount of pvkCmdDrawIndirect() and pvkCmdDrawIndexedIndirect(). */
     size_t   minUniformBufferOffsetAlignment;     /**< Alignment of PvkDescriptorBufferInfo::offset. */
     size_t   minMemoryMapAlignment;               /**< Alignment of what pvkMapMemory() returns. */
     float    maxSamplerLodBias;                   /**< Largest magnitude of PvkSamplerCreateInfo::mipLodBias. */
@@ -269,10 +271,15 @@ typedef struct PvkPhysicalDeviceProperties {
  * into a block array (see PvkShaderUniformBlock) is clamped to the array, so
  * an index past the end reads the last element; the PS2 pays 3 to 4 VU1
  * instructions per indexed read for it. Off, such a read takes whatever VU1
- * memory follows the array, undefined.
+ * memory follows the array, undefined. With multiDrawIndirect an indirect
+ * draw takes a drawCount above 1; with drawIndirectFirstInstance an indirect
+ * command's firstInstance may be nonzero. The EE reads every command, so both
+ * cost nothing on the PS2.
  */
 typedef struct PvkPhysicalDeviceFeatures {
-    uint32_t robustBufferAccess; /**< Nonzero: run-time indices into block arrays are clamped. */
+    uint32_t robustBufferAccess;       /**< Nonzero: run-time indices into block arrays are clamped. */
+    uint32_t multiDrawIndirect;        /**< Nonzero: pvkCmdDrawIndirect() and pvkCmdDrawIndexedIndirect() take a drawCount above 1. */
+    uint32_t drawIndirectFirstInstance; /**< Nonzero: an indirect command's firstInstance may be nonzero. */
 } PvkPhysicalDeviceFeatures;
 
 /** @brief Properties of a memory heap. */
@@ -2222,6 +2229,65 @@ void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCou
  */
 void pvkCmdDrawIndexed(PvkCommandBuffer cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
                        int32_t vertexOffset, uint32_t firstInstance);
+
+/** @brief One draw read by pvkCmdDrawIndirect(): the parameters of pvkCmdDraw(), in its order. */
+typedef struct PvkDrawIndirectCommand {
+    uint32_t vertexCount;   /**< Number of vertices to draw. */
+    uint32_t instanceCount; /**< Number of instances; 0 draws nothing. */
+    uint32_t firstVertex;   /**< Index of the first vertex. */
+    uint32_t firstInstance; /**< Index of the first instance; 0 unless the device has PvkPhysicalDeviceFeatures::drawIndirectFirstInstance. */
+} PvkDrawIndirectCommand;
+
+/** @brief One draw read by pvkCmdDrawIndexedIndirect(): the parameters of pvkCmdDrawIndexed(), in its order. */
+typedef struct PvkDrawIndexedIndirectCommand {
+    uint32_t indexCount;    /**< Number of indices to draw. */
+    uint32_t instanceCount; /**< Number of instances; 0 draws nothing. */
+    uint32_t firstIndex;    /**< Position of the first index in the index buffer. */
+    int32_t  vertexOffset;  /**< Added to every index before it selects a vertex. */
+    uint32_t firstInstance; /**< Index of the first instance; 0 unless the device has PvkPhysicalDeviceFeatures::drawIndirectFirstInstance. */
+} PvkDrawIndexedIndirectCommand;
+
+/**
+ * @brief Draws with parameters read from a buffer: drawCount PvkDrawIndirectCommand
+ * structures starting at offset, each stride bytes after the previous.
+ *
+ * Each command is drawn as pvkCmdDraw() with its four values would be, in
+ * order, so it needs what pvkCmdDraw() needs. The EE reads the commands when
+ * this call is recorded and builds the VU1 batches from them, so the buffer's
+ * contents at record time are what is drawn, and the buffer is free again
+ * when the call returns. (Deviation from Vulkan, where the GPU reads the
+ * buffer when the command buffer executes: VU1 cannot read a count and start
+ * a draw itself.) A drawCount above 1 needs
+ * PvkPhysicalDeviceFeatures::multiDrawIndirect and a stride that is a
+ * multiple of 4 and at least sizeof(PvkDrawIndirectCommand); drawCount 0
+ * draws nothing.
+ *
+ * @param cmd The command buffer.
+ * @param buffer Buffer holding the commands; bound to memory.
+ * @param offset Byte offset of the first command; a multiple of 4.
+ * @param drawCount Number of commands; at most PvkPhysicalDeviceLimits::maxDrawIndirectCount.
+ * @param stride Bytes from one command to the next; ignored when drawCount is 0 or 1.
+ */
+void pvkCmdDrawIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, uint32_t drawCount, uint32_t stride);
+
+/**
+ * @brief Draws with the bound index buffer and parameters read from a buffer: drawCount
+ * PvkDrawIndexedIndirectCommand structures starting at offset, each stride bytes after the previous.
+ *
+ * Each command is drawn as pvkCmdDrawIndexed() with its five values would
+ * be, in order, so it needs what pvkCmdDrawIndexed() needs. The commands
+ * are read when this call is recorded, as in pvkCmdDrawIndirect(), and the
+ * same rules apply to drawCount and stride, with
+ * sizeof(PvkDrawIndexedIndirectCommand) as the least stride.
+ *
+ * @param cmd The command buffer.
+ * @param buffer Buffer holding the commands; bound to memory.
+ * @param offset Byte offset of the first command; a multiple of 4.
+ * @param drawCount Number of commands; at most PvkPhysicalDeviceLimits::maxDrawIndirectCount.
+ * @param stride Bytes from one command to the next; ignored when drawCount is 0 or 1.
+ */
+void pvkCmdDrawIndexedIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, uint32_t drawCount,
+                               uint32_t stride);
 
 /** @} */
 
