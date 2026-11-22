@@ -20,7 +20,7 @@ static int image_free(PvkSwapchain sc, uint32_t image)
     return 1;
 }
 
-/* Completes an acquire whose image came free. Interrupts disabled, or from the handler. */
+/* Completes an acquire whose image came free. Interrupts disabled, or from a handler. */
 static void acquire_signal(PvkSwapchain sc, uint32_t image)
 {
     struct PvkAcquire *a = &sc->acquires[image];
@@ -37,35 +37,95 @@ static void acquire_signal(PvkSwapchain sc, uint32_t image)
     }
 }
 
-/* INTC_VBLANK_S: flips to the oldest queued present once its semaphores are signaled. */
+/* Signals every acquire whose image came free. Interrupts disabled, or from a handler. */
+static void acquires_signal(PvkSwapchain sc)
+{
+    uint32_t i;
+
+    for (i = 0; i < sc->imageCount; i++)
+        acquire_signal(sc, i);
+}
+
+/* Nonzero when the queued present at `index` has its semaphores signaled, counting
+ * one signal for each older queued present that waits for the same semaphore. */
+static int flip_ready(PvkSwapchain sc, uint32_t index)
+{
+    const struct PvkFlip *f = &sc->flips[index];
+    uint32_t i, j, k;
+
+    for (i = 0; i < f->waitCount; i++) {
+        int need = 1;
+
+        for (j = sc->flipHead; j != index; j = (j + 1) % PVK_MAX_PENDING_FLIPS)
+            for (k = 0; k < sc->flips[j].waitCount; k++)
+                need += sc->flips[j].waits[k] == f->waits[i];
+        if (f->waits[i]->count < need)
+            return 0;
+    }
+    return 1;
+}
+
+/* Takes the oldest queued present off the queue, lowering its semaphores; with `show`,
+ * DISPFB points at its image, without, the image is free again (MAILBOX replaced it). */
+static void flip_take(PvkSwapchain sc, int show)
+{
+    struct PvkFlip *f = &sc->flips[sc->flipHead];
+    uint32_t i;
+
+    for (i = 0; i < f->waitCount; i++)
+        f->waits[i]->count--;
+    if (show) {
+        const framebuffer_t *fb = &sc->images[f->image].fb;
+        graph_set_framebuffer_filtered(fb->address, fb->width, fb->psm, 0, 0);
+        sc->displayed = f->image;
+        sc->late      = 0;
+    }
+    sc->flipHead = (sc->flipHead + 1) % PVK_MAX_PENDING_FLIPS;
+    iSignalSema(sc->flipSema);
+    acquires_signal(sc);
+}
+
+int pvk_swapchain_pump(PvkSwapchain sc)
+{
+    int did = 0;
+
+    while (sc->flipHead != sc->flipTail && flip_ready(sc, sc->flipHead)) {
+        uint32_t next = (sc->flipHead + 1) % PVK_MAX_PENDING_FLIPS;
+
+        if (sc->presentMode == PVK_PRESENT_MODE_MAILBOX) {
+            /* A newer present that is ready too replaces the oldest. */
+            if (next == sc->flipTail || !flip_ready(sc, next))
+                break;
+            flip_take(sc, 0);
+        } else if (sc->presentMode == PVK_PRESENT_MODE_IMMEDIATE
+                   || (sc->presentMode == PVK_PRESENT_MODE_FIFO_RELAXED && sc->late)) {
+            flip_take(sc, 1);
+        } else {
+            break;
+        }
+        did = 1;
+    }
+    return did;
+}
+
+/* INTC_VBLANK_S: shows the oldest queued present once its semaphores are signaled. */
 static s32 vblank_handler(s32 cause)
 {
     PvkSwapchain sc = handler_swapchain;
-    struct PvkFlip *f;
-    uint32_t i, old;
 
     (void)cause;
-    if (!sc || sc->flipHead == sc->flipTail)
+    if (!sc)
         goto out;
+    sc->vblanks++;
     /* Flip on even fields only (CSR.FIELD), so both fields show one frame. */
-    if (sc->interlaced && ((*GS_REG_CSR >> 13) & 1))
-        goto out;
-    f = &sc->flips[sc->flipHead];
-    for (i = 0; i < f->waitCount; i++)
-        if (f->waits[i]->count <= 0)
-            goto out;
-    for (i = 0; i < f->waitCount; i++)
-        f->waits[i]->count--;
-    {
-        const framebuffer_t *fb = &sc->images[f->image].fb;
-        graph_set_framebuffer_filtered(fb->address, fb->width, fb->psm, 0, 0);
+    if (!(sc->interlaced && ((*GS_REG_CSR >> 13) & 1)) && sc->presentMode != PVK_PRESENT_MODE_IMMEDIATE) {
+        if (sc->flipHead != sc->flipTail && flip_ready(sc, sc->flipHead))
+            flip_take(sc, 1);
+        else
+            sc->late = 1;
     }
-    old           = sc->displayed;
-    sc->displayed = f->image;
-    sc->flipHead  = (sc->flipHead + 1) % PVK_MAX_PENDING_FLIPS;
+    /* Wakes a pvkAcquireNextImage that counts vblanks against its timeout. */
     iSignalSema(sc->flipSema);
-    for (i = 0; i < sc->imageCount; i++)
-        acquire_signal(sc, (old + i) % sc->imageCount);
     pvk_device_kick(sc->device);
 out:
     ExitHandler();
@@ -101,6 +161,7 @@ static PvkResult set_display_mode(PvkSwapchain sc, PvkDisplayMode displayMode)
         return PVK_ERROR_FEATURE_NOT_PRESENT;
     }
     sc->interlaced = interlace == GRAPH_MODE_INTERLACED;
+    sc->vblankNs   = mode == GRAPH_MODE_PAL ? 20000000u : 16683350u; /* 50 Hz, 59.94 Hz */
 
     /* What graph_initialize does, with the mode chosen here (no flicker filter). */
     graph_set_mode(interlace, mode, ffmd, 0);
@@ -120,8 +181,18 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
         pvk_error("swapchain format must be PVK_FORMAT_CT32\n");
         return PVK_ERROR_FORMAT_NOT_SUPPORTED;
     }
-    if (info->imageCount != 2) {
-        pvk_error("swapchain imageCount must be 2\n");
+    if (info->imageCount < 2 || info->imageCount > PVK_MAX_SWAPCHAIN_IMAGES) {
+        pvk_error("swapchain imageCount must be 2 or %d\n", PVK_MAX_SWAPCHAIN_IMAGES);
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    switch (info->presentMode) {
+    case PVK_PRESENT_MODE_IMMEDIATE:
+    case PVK_PRESENT_MODE_MAILBOX:
+    case PVK_PRESENT_MODE_FIFO:
+    case PVK_PRESENT_MODE_FIFO_RELAXED:
+        break;
+    default:
+        pvk_error("swapchain presentMode %d is not a PvkPresentMode\n", (int)info->presentMode);
         return PVK_ERROR_FEATURE_NOT_PRESENT;
     }
 
@@ -133,6 +204,7 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
     sc->width      = info->width;
     sc->height     = info->height;
     sc->imageCount = info->imageCount;
+    sc->presentMode = info->presentMode;
     {
         ee_sema_t sema = { 0 };
         sema.init_count = 0;
@@ -224,11 +296,38 @@ PvkResult pvkGetSwapchainImages(PvkDevice device, PvkSwapchain swapchain, uint32
     return PVK_SUCCESS;
 }
 
+/* An image nothing shows, no queued present will show and no acquire handed out, or imageCount. */
+static uint32_t pick_free(PvkSwapchain sc)
+{
+    uint32_t i;
+
+    for (i = 0; i < sc->imageCount; i++) {
+        uint32_t image = (sc->nextImage + i) % sc->imageCount;
+        if (!sc->acquired[image] && image_free(sc, image))
+            return image;
+    }
+    return sc->imageCount;
+}
+
+/* The image that comes free first when presents are shown in order: the one on screen after one
+ * more flip, then the queued ones in turn. Skips those handed out already; imageCount if none. */
+static uint32_t pick_next_free(PvkSwapchain sc)
+{
+    uint32_t image = sc->displayed, i;
+
+    for (i = sc->flipHead; i != sc->flipTail; i = (i + 1) % PVK_MAX_PENDING_FLIPS) {
+        if (!sc->acquired[image])
+            return image;
+        image = sc->flips[i].image;
+    }
+    return sc->imageCount;
+}
+
 PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint64_t timeout, PvkSemaphore semaphore,
                               PvkFence fence, uint32_t *imageIndex)
 {
-    uint32_t image = swapchain->nextImage;
-    struct PvkAcquire *a = &swapchain->acquires[image];
+    uint32_t image, start = swapchain->vblanks;
+    struct PvkAcquire *a;
     PvkResult res;
 
     (void)device;
@@ -243,17 +342,39 @@ PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint64_t
         pvk_error("pvkAcquireNextImage: fence is %s\n", fence->pending ? "in use" : "signaled; reset it first");
         return PVK_ERROR_VALIDATION_FAILED;
     }
-    if (a->pending) {
-        pvk_error("pvkAcquireNextImage: every image is acquired already; present one first\n");
-        return PVK_ERROR_VALIDATION_FAILED;
-    }
 
-    DI();
-    /* Nothing queued will take it off the screen: nothing to wait for. */
-    if (swapchain->displayed == image && swapchain->flipHead == swapchain->flipTail) {
+    /* A signal nobody waited for would end the next wait on the fence early. */
+    while (fence && PollSema(fence->sema) >= 0)
+        ;
+
+    for (;;) {
+        DI();
+        image = pick_free(swapchain);
+        if (image < swapchain->imageCount)
+            break;
+        /* Nothing queued will free an image: nothing to wait for. */
+        if (swapchain->flipHead == swapchain->flipTail) {
+            EI();
+            return timeout ? PVK_TIMEOUT : PVK_NOT_READY;
+        }
+        if (swapchain->presentMode != PVK_PRESENT_MODE_MAILBOX) {
+            /* Presents are shown in order, so the next image to come free is known now. */
+            image = pick_next_free(swapchain);
+            if (image < swapchain->imageCount)
+                break;
+            EI();
+            pvk_error("pvkAcquireNextImage: every image is acquired already; present one first\n");
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
         EI();
-        return timeout ? PVK_TIMEOUT : PVK_NOT_READY;
+        /* MAILBOX: a flip or a replaced present frees an image, whichever is first; sleep until then. */
+        if (!timeout)
+            return PVK_NOT_READY;
+        if (timeout != UINT64_MAX && (uint64_t)(swapchain->vblanks - start) * swapchain->vblankNs >= timeout)
+            return PVK_TIMEOUT;
+        WaitSema(swapchain->flipSema);
     }
+    a = &swapchain->acquires[image];
     if (semaphore)
         pvk_semaphores_check("pvkAcquireNextImage", 1, &semaphore, 1, 1);
     if (fence)
@@ -261,6 +382,7 @@ PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint64_t
     a->pending   = 1;
     a->semaphore = semaphore;
     a->fence     = fence;
+    swapchain->acquired[image] = 1;
     acquire_signal(swapchain, image);
     EI();
 
@@ -290,6 +412,10 @@ static PvkResult present_check(PvkQueue queue, const PvkPresentInfo *info)
         pvk_error("pvkQueuePresent: image index %u is out of range\n", (unsigned)info->imageIndices[0]);
         return PVK_ERROR_VALIDATION_FAILED;
     }
+    if (!sc->acquired[info->imageIndices[0]]) {
+        pvk_error("pvkQueuePresent: image %u was not acquired with pvkAcquireNextImage\n", (unsigned)info->imageIndices[0]);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     return pvk_semaphores_check("pvkQueuePresent", info->waitSemaphoreCount, info->waitSemaphores, 0, 0);
 }
 
@@ -308,7 +434,7 @@ PvkResult pvkQueuePresent(PvkQueue queue, const PvkPresentInfo *info)
     sc = info->swapchains[0];
     pvk_semaphores_check("pvkQueuePresent", info->waitSemaphoreCount, info->waitSemaphores, 0, 1);
 
-    /* Room for one flip per image; the vblank handler frees them. */
+    /* Room for one flip per image; flips and replaced presents free them. */
     while ((sc->flipTail + 1) % PVK_MAX_PENDING_FLIPS == sc->flipHead)
         WaitSema(sc->flipSema);
 
@@ -318,7 +444,10 @@ PvkResult pvkQueuePresent(PvkQueue queue, const PvkPresentInfo *info)
         f->waits[i] = info->waitSemaphores[i];
     f->waitCount = info->waitSemaphoreCount;
     DI();
+    sc->acquired[f->image] = 0;
     sc->flipTail = (sc->flipTail + 1) % PVK_MAX_PENDING_FLIPS;
+    /* IMMEDIATE, a late FIFO_RELAXED present or a MAILBOX replacement may act on it now. */
+    pvk_device_kick(sc->device);
     EI();
     return PVK_SUCCESS;
 }

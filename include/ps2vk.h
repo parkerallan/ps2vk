@@ -26,8 +26,8 @@ extern "C" {
 /** @brief Result codes. */
 typedef enum PvkResult {
     PVK_SUCCESS                        = 0,           /**< The call succeeded. */
-    PVK_NOT_READY                      = 1,           /**< pvkAcquireNextImage() with timeout 0: no image is free and none will be until a present. */
-    PVK_TIMEOUT                        = 2,           /**< pvkAcquireNextImage() with a timeout: the same, so waiting would not help. */
+    PVK_NOT_READY                      = 1,           /**< pvkAcquireNextImage() with timeout 0: no image is free. */
+    PVK_TIMEOUT                        = 2,           /**< pvkAcquireNextImage() with a timeout: no image came free in that time, or none will until a present. */
     PVK_INCOMPLETE                     = 5,           /**< The array given was too small for every result. */
     PVK_ERROR_OUT_OF_HOST_MEMORY       = -1,          /**< EE main RAM allocation failed. */
     PVK_ERROR_OUT_OF_DEVICE_MEMORY     = -2,          /**< Not enough GS VRAM. */
@@ -884,20 +884,39 @@ typedef enum PvkDisplayMode {
     PVK_DISPLAY_MODE_480P      /**< 480p: 640x448 progressive, 60 frames a second. */
 } PvkDisplayMode;
 
+/**
+ * @brief When a presented image goes on screen.
+ *
+ * A present is ready once its wait semaphores are signaled. FIFO and
+ * FIFO_RELAXED show every present, in order; IMMEDIATE shows every present
+ * too, but mid-picture, so the TV can show parts of two images (tearing).
+ * MAILBOX never tears and never makes drawing wait for the vblank: with 3
+ * images one is on screen, one waits for the vblank and the third is free.
+ */
+typedef enum PvkPresentMode {
+    PVK_PRESENT_MODE_IMMEDIATE    = 0, /**< DISPFB is written as soon as the present is ready, from the INTC_GS handler that signals its semaphore or from pvkQueuePresent() itself. */
+    PVK_PRESENT_MODE_MAILBOX      = 1, /**< At the vblank, DISPFB takes the newest ready present; an older ready present is dropped when a newer one becomes ready, and its image is free at once. */
+    PVK_PRESENT_MODE_FIFO         = 2, /**< At each vblank (even field in an interlaced mode), DISPFB takes the oldest present if ready. */
+    PVK_PRESENT_MODE_FIFO_RELAXED = 3  /**< FIFO, but a present that becomes ready after a vblank that had none to show is shown at once. */
+} PvkPresentMode;
+
 /** @brief Parameters for pvkCreateSwapchain(). */
 typedef struct PvkSwapchainCreateInfo {
     uint32_t       width;       /**< Width in pixels, e.g. 640. */
     uint32_t       height;      /**< Height in pixels, e.g. 448. */
     PvkFormat      format;      /**< Must be PVK_FORMAT_CT32. */
-    uint32_t       imageCount;  /**< Must be 2. */
+    uint32_t       imageCount;  /**< 2 or 3 framebuffers; each takes width x height x 4 bytes of the 4 MB GS VRAM in whole 8 KB pages. */
     PvkDisplayMode displayMode; /**< Video mode; 0 is PVK_DISPLAY_MODE_AUTO. */
+    PvkPresentMode presentMode; /**< When a presented image goes on screen; 0 is PVK_PRESENT_MODE_IMMEDIATE. */
 } PvkSwapchainCreateInfo;
 
 /**
  * @brief Allocates the swapchain framebuffers in GS VRAM and turns on video output.
  *
  * Image 0 is shown first, so the first image to render into is image 1. The
- * video mode is set from PvkSwapchainCreateInfo::displayMode.
+ * video mode is set from PvkSwapchainCreateInfo::displayMode. Three 640x448
+ * images take 3.4 MB of VRAM, which leaves no room for a depth buffer of
+ * that size.
  *
  * @param device The device.
  * @param info Swapchain parameters.
@@ -930,27 +949,30 @@ PvkResult pvkGetSwapchainImages(PvkDevice device, PvkSwapchain swapchain, uint32
 /**
  * @brief Picks the image to render into next and arranges a signal for when it is free.
  *
- * The images are taken in turn, so the index is known at once and the call
- * never sleeps. The image is free when DISPFB no longer points at it and no
- * queued present will point it there; the semaphore and fence are signaled
- * at that moment by the INTC_VBLANK_S handler that performs the flip, or
- * before the call returns if the image is free already. One acquire can be
- * outstanding per image.
+ * An image is free when DISPFB does not point at it, no queued present will
+ * point DISPFB at it and no acquire has handed it out. A free image is
+ * returned with the semaphore and fence signaled before the call returns.
+ * With none free, FIFO, FIFO_RELAXED and IMMEDIATE show presents in order,
+ * so the image that comes free first is known: its index is returned at
+ * once and the semaphore and fence are signaled by the handler that performs
+ * the flip. In MAILBOX either a flip or a replaced present frees an image
+ * first, so the call sleeps until one does.
  *
  * @param device The device.
  * @param swapchain The swapchain.
- * @param timeout Nanoseconds to wait for an index. An index is always known
- *                at once or never until a present, so the call never sleeps;
- *                the value only picks the result for the latter case.
+ * @param timeout Nanoseconds a MAILBOX swapchain may sleep for a free image,
+ *                counted in vblanks; UINT64_MAX for no limit, 0 to never
+ *                sleep. The other modes never sleep.
  * @param semaphore Semaphore to signal when the image is free, or NULL.
  * @param fence Unsignaled fence not in use, to signal when the image is free, or NULL.
  * @param[out] imageIndex Index into the images from pvkGetSwapchainImages().
  * @return PVK_SUCCESS; PVK_NOT_READY (timeout 0) or PVK_TIMEOUT (any other
- *         timeout) if the image is on screen and no present is queued to
- *         replace it, so nothing would ever signal; or
- *         PVK_ERROR_VALIDATION_FAILED if semaphore and fence are both NULL,
- *         the semaphore is signaled or has a signal pending, the fence is
- *         signaled or in use, or the image is acquired already.
+ *         timeout) if no image is free and no present is queued, so nothing
+ *         would ever free one, or if a MAILBOX swapchain had no free image
+ *         within the timeout; or PVK_ERROR_VALIDATION_FAILED if semaphore
+ *         and fence are both NULL, the semaphore is signaled or has a signal
+ *         pending, the fence is signaled or in use, or every image is
+ *         acquired already.
  */
 PvkResult pvkAcquireNextImage(PvkDevice device, PvkSwapchain swapchain, uint64_t timeout, PvkSemaphore semaphore,
                               PvkFence fence, uint32_t *imageIndex);
@@ -968,19 +990,20 @@ typedef struct PvkPresentInfo {
 /**
  * @brief Queues an image to be shown on the TV.
  *
- * Returns at once. At the first vertical blank (even field in an interlaced
- * mode) at which its wait semaphores are all signaled, the INTC_VBLANK_S
- * handler points DISPFB at the image; the image that leaves the screen is
- * then free for the acquire waiting on it. Up to 2 presents can be queued,
- * and the call sleeps while there are that many.
+ * Returns at once. Once its wait semaphores are all signaled, DISPFB is
+ * pointed at the image when the swapchain's PvkPresentMode says: at a
+ * vertical blank (even field in an interlaced mode) by the INTC_VBLANK_S
+ * handler, or at once. The image that leaves the screen is then free for
+ * the acquire waiting on it. One present per image can be queued, and the
+ * call sleeps while there are that many.
  *
  * @param queue The graphics queue (family 0); the transfer queue does not present.
  * @param info What to show and what to wait for.
  * @return PVK_SUCCESS, or PVK_ERROR_VALIDATION_FAILED if the queue is not
  *         the graphics queue, swapchainCount is
  *         not 1, the swapchain is not the device's, the image index is out
- *         of range, there are more than 4 wait semaphores, or a wait
- *         semaphore has no signal pending.
+ *         of range or was not acquired, there are more than 4 wait
+ *         semaphores, or a wait semaphore has no signal pending.
  */
 PvkResult pvkQueuePresent(PvkQueue queue, const PvkPresentInfo *info);
 

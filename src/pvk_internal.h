@@ -27,7 +27,7 @@
 
 /* VU1 input memory a batch can fill, after the header. */
 #define PVK_BATCH_INPUT_QWORDS (PVK_VU1_OUTPUT_ADDR - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER)
-#define PVK_MAX_SWAPCHAIN_IMAGES 2
+#define PVK_MAX_SWAPCHAIN_IMAGES 3
 #define PVK_MAX_PENDING_FLIPS (PVK_MAX_SWAPCHAIN_IMAGES + 1)
 
 #define pvk_error(...) printf("ps2vk: " __VA_ARGS__)
@@ -88,6 +88,9 @@ struct PvkQueue_T {
     s32       room;         /* EE semaphore released whenever a ring entry frees */
 };
 
+/* Sleeps until every submitted chain has run; queued presents may still wait for their vblank. */
+void      pvk_queue_wait_chains(PvkQueue queue);
+/* The same, and until every queued present is on screen. */
 void      pvk_queue_wait_idle(PvkQueue queue);
 void      pvk_queue_kick(PvkQueue queue); /* interrupts disabled, or from a handler */
 /* Kicks every queue the device has: a completed chain or flip may unblock either. */
@@ -102,6 +105,8 @@ void      pvk_queue_shutdown(PvkQueue queue);
 PvkResult pvk_semaphores_check(const char *who, uint32_t count, const PvkSemaphore *sems, int signal, int apply);
 /* Sleeps until every queued present has flipped. */
 void      pvk_swapchain_wait_flips(PvkSwapchain swapchain);
+/* Flips or drops the queued presents that need no vblank; nonzero if one was. Interrupts disabled, or from a handler. */
+int       pvk_swapchain_pump(PvkSwapchain swapchain);
 
 #define PVK_MAX_VRAM_ALLOCATIONS 64
 
@@ -195,7 +200,7 @@ float pvk_depth_max(PvkFormat format);
 /* The VU1 context's viewport scale and offset qwords (8 floats) for a viewport and depth format. */
 void pvk_viewport_context(const PvkViewport *vp, PvkFormat depthFormat, float *ctx);
 
-/* A queued pvkQueuePresent: the vblank handler flips to `image` once its semaphores are signaled. */
+/* A queued pvkQueuePresent: `image` is shown once its semaphores are signaled, when the present mode says. */
 struct PvkFlip {
     uint32_t     image;
     PvkSemaphore waits[PVK_MAX_SUBMIT_SEMAPHORES];
@@ -213,8 +218,13 @@ struct PvkSwapchain_T {
     PvkDevice         device;
     uint32_t          width, height;
     uint32_t          imageCount;
-    uint32_t          nextImage;
+    uint32_t          nextImage;   /* where the search for a free image starts */
+    PvkPresentMode    presentMode;
     int               interlaced;  /* flip only on even fields, so both fields show one frame */
+    uint32_t          vblankNs;    /* nanoseconds between two vblanks */
+    volatile uint32_t vblanks;     /* counted by the vblank handler */
+    volatile int      late;        /* a vblank passed with no present ready (FIFO_RELAXED flips at once) */
+    int               acquired[PVK_MAX_SWAPCHAIN_IMAGES]; /* handed out by an acquire, not presented yet */
     volatile uint32_t displayed;   /* image DISPFB points at */
     struct PvkFlip    flips[PVK_MAX_PENDING_FLIPS];
     volatile uint32_t flipHead, flipTail;

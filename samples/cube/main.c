@@ -273,6 +273,7 @@ int main(void)
 
     PvkSwapchainCreateInfo swapchainInfo = {
         .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_CT32, .imageCount = 2,
+        .presentMode = PVK_PRESENT_MODE_FIFO,
         .displayMode = PVK_DISPLAY_MODE_NTSC,
     };
     CHECK(pvkCreateSwapchain(device, &swapchainInfo, &swapchain));

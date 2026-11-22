@@ -96,9 +96,12 @@ void pvk_queue_kick(PvkQueue queue)
 
 void pvk_device_kick(PvkDevice device)
 {
-    pvk_queue_kick(&device->queue);
-    if (device->families[1])
-        pvk_queue_kick(&device->transfer);
+    /* A flip frees an image, which may start a chain; a completed entry may ready a present. */
+    do {
+        pvk_queue_kick(&device->queue);
+        if (device->families[1])
+            pvk_queue_kick(&device->transfer);
+    } while (device->swapchain && pvk_swapchain_pump(device->swapchain));
 }
 
 /* The EE COP0 Count register: one tick per EE clock. */
@@ -249,11 +252,16 @@ void pvk_fence_wait(PvkFence fence)
     WaitSema(fence->sema);
 }
 
-void pvk_queue_wait_idle(PvkQueue queue)
+void pvk_queue_wait_chains(PvkQueue queue)
 {
     if (queue->last)
         pvk_fence_wait(queue->last);
     queue->last = NULL;
+}
+
+void pvk_queue_wait_idle(PvkQueue queue)
+{
+    pvk_queue_wait_chains(queue);
     if (queue->family == 0 && queue->device->swapchain)
         pvk_swapchain_wait_flips(queue->device->swapchain);
 }

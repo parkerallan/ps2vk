@@ -182,7 +182,7 @@ void pvkDestroyCommandPool(PvkDevice device, PvkCommandPool pool)
     if (!pool)
         return;
     (void)device;
-    pvk_queue_wait_idle(pool_queue(pool));
+    pvk_queue_wait_chains(pool_queue(pool));
     for (cmd = pool->buffers; cmd; cmd = next) {
         next = cmd->next;
         free(cmd->executed);
@@ -202,7 +202,7 @@ PvkResult pvkResetCommandPool(PvkDevice device, PvkCommandPool pool, uint32_t fl
         pvk_error("pvkResetCommandPool: a command buffer of the pool is recording\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
-    pvk_queue_wait_idle(pool_queue(pool));
+    pvk_queue_wait_chains(pool_queue(pool));
     for (cmd = pool->buffers; cmd; cmd = cmd->next)
         cmd->size = 0;
     pool->used = 0;
@@ -320,7 +320,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
                       "PVK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT\n");
             return PVK_ERROR_VALIDATION_FAILED;
         }
-        pvk_queue_wait_idle(pool_queue(pool));
+        pvk_queue_wait_chains(pool_queue(pool));
         if (cmd->start + cmd->size == pool->used)
             pool->used = cmd->start;
         cmd->size = 0;
