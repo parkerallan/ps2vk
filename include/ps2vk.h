@@ -1771,12 +1771,53 @@ void      pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const P
 /** @brief A recorded list of commands: a DMA chain in main RAM, for VIF1 (graphics family) or the GIF channel (transfer family). */
 typedef struct PvkCommandBuffer_T *PvkCommandBuffer;
 
-/** @brief What happens to an image's contents when rendering begins. */
+/**
+ * @brief What pvkCmdBeginRendering() does with the pixels an attachment already holds.
+ *
+ * A rendering pass is every draw between pvkCmdBeginRendering() and
+ * pvkCmdEndRendering(). An attachment is an image the pass draws into: the
+ * color image or the depth image. The application picks one load op per
+ * attachment.
+ *
+ * | Value     | What ps2vk sends to the GS                   | Pixels in the image when the first draw runs                       |
+ * | --------- | -------------------------------------------- | ------------------------------------------------------------------ |
+ * | LOAD      | Nothing                                      | The pixels the image held before the pass                          |
+ * | CLEAR     | Sprites that fill renderArea with clearValue | clearValue inside renderArea, the old pixels outside renderArea    |
+ * | DONT_CARE | Nothing                                      | Not specified: the application promises to draw over every pixel   |
+ * | NONE      | Nothing                                      | Not specified: the application promises the pass draws no pixel    |
+ *
+ * The GS writes each pixel into VRAM when the pixel is drawn, so keeping the
+ * old pixels costs nothing and only CLEAR sends data.
+ */
 typedef enum PvkAttachmentLoadOp {
-    PVK_ATTACHMENT_LOAD_OP_LOAD      = 0, /**< Keep the existing contents. */
-    PVK_ATTACHMENT_LOAD_OP_CLEAR     = 1, /**< Fill with the clear color. */
-    PVK_ATTACHMENT_LOAD_OP_DONT_CARE = 2  /**< Contents are undefined. */
+    PVK_ATTACHMENT_LOAD_OP_LOAD      = 0,         /**< Keep the pixels the image held before the pass. */
+    PVK_ATTACHMENT_LOAD_OP_CLEAR     = 1,         /**< Fill renderArea with clearValue. */
+    PVK_ATTACHMENT_LOAD_OP_DONT_CARE = 2,         /**< The old pixels are not needed. */
+    PVK_ATTACHMENT_LOAD_OP_NONE      = 1000400000 /**< The pass does not use the image. */
 } PvkAttachmentLoadOp;
+
+/**
+ * @brief Whether the application needs an attachment's pixels after pvkCmdEndRendering().
+ *
+ * The application picks one store op per attachment.
+ *
+ * | Value     | What ps2vk sends to the GS | Pixels in the image after the pass                                 |
+ * | --------- | -------------------------- | ------------------------------------------------------------------ |
+ * | STORE     | Nothing                    | The pixels the pass drew                                           |
+ * | DONT_CARE | Nothing                    | Not specified: the application promises never to read the pixels   |
+ * | NONE      | Nothing                    | The pixels the image held before the pass, when the pass drew none |
+ *
+ * STORE is required for an image that is presented with pvkQueuePresent(),
+ * sampled as a texture, or drawn on by a later pass with
+ * PVK_ATTACHMENT_LOAD_OP_LOAD. The GS writes each pixel into VRAM when the
+ * pixel is drawn, so nothing is left to save when the pass ends and no
+ * store op sends data.
+ */
+typedef enum PvkAttachmentStoreOp {
+    PVK_ATTACHMENT_STORE_OP_STORE     = 0,         /**< The pixels the pass drew are needed after the pass. */
+    PVK_ATTACHMENT_STORE_OP_DONT_CARE = 1,         /**< The pixels are not needed after the pass. */
+    PVK_ATTACHMENT_STORE_OP_NONE      = 1000301000 /**< The pass does not draw into the image. */
+} PvkAttachmentStoreOp;
 
 /**
  * @brief The memory command buffers are recorded into.
@@ -1892,11 +1933,12 @@ typedef union PvkClearValue {
     PvkClearDepthStencilValue depthStencil; /**< For the depth attachment. */
 } PvkClearValue;
 
-/** @brief An image to render into and how to start it. */
+/** @brief One attachment of a rendering pass: the image, the load op, the store op and the clear value. */
 typedef struct PvkRenderingAttachmentInfo {
-    PvkImageView        imageView;  /**< A one-level view of the target: a swapchain image or a PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT image for color, a depth image for depth; NULL for no attachment. */
-    PvkAttachmentLoadOp loadOp;     /**< What to do with its contents first. */
-    PvkClearValue       clearValue; /**< Value used when loadOp is CLEAR. */
+    PvkImageView         imageView;  /**< A one-level view of the target: a swapchain image or a PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT image for color, a depth image for depth; NULL for no attachment. */
+    PvkAttachmentLoadOp  loadOp;     /**< What pvkCmdBeginRendering() does with the pixels the image already holds. */
+    PvkAttachmentStoreOp storeOp;    /**< Whether the image's pixels are needed after pvkCmdEndRendering(). */
+    PvkClearValue        clearValue; /**< Value used when loadOp is CLEAR. */
 } PvkRenderingAttachmentInfo;
 
 /** @brief Flags for PvkRenderingInfo. */

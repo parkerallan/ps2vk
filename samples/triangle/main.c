@@ -187,6 +187,7 @@ int main(void)
             .colorAttachment = {
                 .imageView  = views[imageIndex],
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp    = PVK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = { .color = { { 0.1f, 0.1f, 0.2f, 1.0f } } },
             },
         };

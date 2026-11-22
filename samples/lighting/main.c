@@ -541,11 +541,13 @@ int main(void)
             .colorAttachment = {
                 .imageView  = views[imageIndex],
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp    = PVK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = { .color = { { 0.05f, 0.05f, 0.1f, 1.0f } } },
             },
             .depthAttachment = {
                 .imageView  = depthView,
                 .loadOp     = PVK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp    = PVK_ATTACHMENT_STORE_OP_DONT_CARE,
                 .clearValue = { .depthStencil = { .depth = 1.0f } },
             },
         };

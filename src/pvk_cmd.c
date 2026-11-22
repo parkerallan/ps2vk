@@ -457,6 +457,31 @@ static qword_t *cmd_clear(qword_t *q, const PvkRenderingInfo *info, const frameb
     return q;
 }
 
+/* Checks an attachment's load and store ops are values of their enums. */
+static int attachment_ops_valid(const PvkRenderingAttachmentInfo *a, const char *which)
+{
+    switch (a->loadOp) {
+    case PVK_ATTACHMENT_LOAD_OP_LOAD:
+    case PVK_ATTACHMENT_LOAD_OP_CLEAR:
+    case PVK_ATTACHMENT_LOAD_OP_DONT_CARE:
+    case PVK_ATTACHMENT_LOAD_OP_NONE:
+        break;
+    default:
+        pvk_error("pvkCmdBeginRendering: the %s attachment's loadOp %d is not a PvkAttachmentLoadOp\n", which, (int)a->loadOp);
+        return 0;
+    }
+    switch (a->storeOp) {
+    case PVK_ATTACHMENT_STORE_OP_STORE:
+    case PVK_ATTACHMENT_STORE_OP_DONT_CARE:
+    case PVK_ATTACHMENT_STORE_OP_NONE:
+        break;
+    default:
+        pvk_error("pvkCmdBeginRendering: the %s attachment's storeOp %d is not a PvkAttachmentStoreOp\n", which, (int)a->storeOp);
+        return 0;
+    }
+    return 1;
+}
+
 void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 {
     const PvkRenderingAttachmentInfo *color = &info->colorAttachment;
@@ -486,6 +511,10 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
     if (!colorView || !(colorView->image->usage & PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || colorView->levels != 1) {
         pvk_error("pvkCmdBeginRendering: the color attachment must be a one-level view of a swapchain image or "
                   "an image created with PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (!attachment_ops_valid(color, "color") || (depthView && !attachment_ops_valid(depth, "depth"))) {
         cmd->failed = 1;
         return;
     }
