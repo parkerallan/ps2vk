@@ -75,7 +75,7 @@ typedef enum PvkFormat {
     PVK_FORMAT_R32G32B32A32_SFLOAT, /**< Vertex attribute: 4 floats. */
     PVK_FORMAT_CT32,                /**< GS PSMCT32 color image (RGBA, 8 bits each; alpha 0x80 is opaque). */
     PVK_FORMAT_CT24,                /**< GS PSMCT24 texture or color table (RGB, 8 bits each, 3 bytes per texel). Reads as opaque. */
-    PVK_FORMAT_CT16,                /**< GS PSMCT16 texture or color table (16 bits per texel: R in bits 0-4, G 5-9, B 10-14, alpha bit 15). */
+    PVK_FORMAT_CT16,                /**< GS PSMCT16 texture or color table, or GS PSMCT16S swapchain framebuffer (16 bits per pixel: R in bits 0-4, G 5-9, B 10-14, alpha bit 15). */
     PVK_FORMAT_T8,                  /**< GS PSMT8 texture: one byte per texel, an index into a 256-entry color table (PS2 only). */
     PVK_FORMAT_T4,                  /**< GS PSMT4 texture: 4 bits per texel, two per byte with the first in the low bits, an index into a 16-entry color table (PS2 only). */
     PVK_FORMAT_Z32,                 /**< GS PSMZ32 depth image. */
@@ -920,12 +920,28 @@ typedef enum PvkPresentMode {
  * non-interlaced, the whole image every vblank, so presents can follow each
  * other at 60 or 50 a second. 16:9 works in every display mode: a program
  * for a 16:9 TV gives its projection a 16:9 aspect.
+ *
+ * The format sets how many bits each framebuffer pixel has, and with that
+ * the VRAM each framebuffer takes and the number of colors a pixel can hold.
+ *
+ * | format | GS format | Bits per pixel | Levels per channel | Colors | 640x448 framebuffer |
+ * | --- | --- | --- | --- | --- | --- |
+ * | PVK_FORMAT_CT32 | PSMCT32 | 32: 8 each of R, G, B, alpha | 256 | 16.7 million | 1120 KB |
+ * | PVK_FORMAT_CT16 | PSMCT16S | 16: 5 each of R, G, B, 1 of alpha | 32 | 32768 | 560 KB |
+ *
+ * With PVK_FORMAT_CT16 the GS keeps the top 5 bits of each color channel
+ * of every pixel drawn. Neighboring pixels of a smooth gradient then hold
+ * the same color, so the gradient shows as bands. The alpha bit is 1 for a
+ * drawn alpha of 0x80 or more. Textures keep their own formats.
+ *
+ * The GS format is PSMCT16S and not PSMCT16 because the GS pairs a PSMCT16
+ * framebuffer with a PSMZ16 depth buffer only.
  */
 typedef struct PvkSwapchainCreateInfo {
     uint32_t       width;       /**< Width in pixels: a multiple of 64 (GS FRAME.FBW), up to the display mode's limit. */
     uint32_t       height;      /**< Height in pixels, up to the display mode's lines. */
-    PvkFormat      format;      /**< Must be PVK_FORMAT_CT32. */
-    uint32_t       imageCount;  /**< 2 or 3 framebuffers; each takes width x height x 4 bytes of the 4 MB GS VRAM in whole 8 KB pages. */
+    PvkFormat      format;      /**< PVK_FORMAT_CT32 or PVK_FORMAT_CT16; see the format table above. Any other format returns PVK_ERROR_FORMAT_NOT_SUPPORTED. */
+    uint32_t       imageCount;  /**< 2 or 3 framebuffers; each takes width x height x the format's bytes per pixel of the 4 MB GS VRAM in whole 8 KB pages. */
     PvkDisplayMode displayMode; /**< Video mode; 0 is PVK_DISPLAY_MODE_AUTO. */
     PvkPresentMode presentMode; /**< When a presented image goes on screen; 0 is PVK_PRESENT_MODE_IMMEDIATE. */
 } PvkSwapchainCreateInfo;
@@ -935,8 +951,8 @@ typedef struct PvkSwapchainCreateInfo {
  *
  * Image 0 is shown first, so the first image to render into is image 1. The
  * video mode is set from PvkSwapchainCreateInfo::displayMode. Three 640x448
- * images take 3.4 MB of VRAM, which leaves no room for a depth buffer of
- * that size.
+ * PVK_FORMAT_CT32 images take 3.4 MB of VRAM, which leaves no room for a
+ * depth buffer of that size; three PVK_FORMAT_CT16 images take 1.7 MB.
  *
  * @param device The device.
  * @param info Swapchain parameters.
