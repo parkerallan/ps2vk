@@ -322,6 +322,12 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
         pvk_error("pvkBeginCommandBuffer: a secondary command buffer needs inheritanceInfo\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
+    if (inherit && inherit->stencilAttachmentFormat != PVK_FORMAT_UNDEFINED &&
+        inherit->stencilAttachmentFormat != PVK_FORMAT_CT32 && inherit->stencilAttachmentFormat != PVK_FORMAT_CT16) {
+        pvk_error("pvkBeginCommandBuffer: inheritanceInfo->stencilAttachmentFormat must be PVK_FORMAT_CT32, "
+                  "PVK_FORMAT_CT16 or PVK_FORMAT_UNDEFINED\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     if (inherit && inherit->depthAttachmentFormat != PVK_FORMAT_UNDEFINED && !is_depth_format(inherit->depthAttachmentFormat)) {
         pvk_error("pvkBeginCommandBuffer: inheritanceInfo->depthAttachmentFormat must be a depth format or PVK_FORMAT_UNDEFINED\n");
         return PVK_ERROR_VALIDATION_FAILED;
@@ -369,6 +375,8 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
     /* Inside the primary's rendering from the first command on. */
     cmd->inherits     = secondary && (flags & PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);
     cmd->inheritedDepthFormat = inherit ? inherit->depthAttachmentFormat : PVK_FORMAT_UNDEFINED;
+    cmd->inheritedStencilFormat = inherit ? inherit->stencilAttachmentFormat : PVK_FORMAT_UNDEFINED;
+    cmd->stencilFormat = PVK_FORMAT_UNDEFINED;
     cmd->secondaryContents = 0;
     cmd->rendering    = cmd->inherits;
     cmd->fbmsk[0]     = 0; /* a secondary inside the primary's rendering starts with all channels written */
@@ -500,28 +508,38 @@ static uint32_t clear_strips(const PvkRect2D *area)
 
 /* Fill the render area with the clear values: one sprite pass that writes the
  * color buffer, the depth buffer, or both, masking the one that isn't cleared.
- * Uses 5 + 2 * clear_strips(area) qwords. */
+ * Uses at most 6 + 2 * clear_strips(area) qwords. */
 static qword_t *cmd_clear(qword_t *q, const PvkRenderingInfo *info, const framebuffer_t *fb, const PvkImage depth,
-                          int clearColor, int clearDepth)
+                          int clearColor, int clearDepth, int stencil, int clearStencil)
 {
     const PvkRect2D *area = &info->renderArea;
     const float *rgba = info->colorAttachment.clearValue.color.float32;
     union { float f; u32 u; } one = { 1.0f };
     uint32_t strips = clear_strips(area);
-    uint32_t z = 0, s;
+    uint32_t z = 0, s, mask = clearColor ? 0 : 0xFFFFFFFF;
     int y0 = gs_coord(area->y), y1 = gs_coord(area->y + (int32_t)area->height);
+    int alpha = (int)(rgba[3] * 128.0f);
+
+    /* With a stencil attachment alpha bit 7 is the stencil bit: cleared to the value, or kept. */
+    if (stencil) {
+        mask  = clearStencil ? mask & ~0x80000000u : mask | 0x80000000u;
+        alpha = (alpha & 0x7F) | (clearStencil && (info->stencilAttachment.clearValue.depthStencil.stencil & 1) ? 0x80 : 0);
+    }
 
     if (clearDepth)
         z = gs_depth(info->depthAttachment.clearValue.depthStencil.depth, depth->format);
 
-    q = gs_ad(q, GIF_SET_TAG(5 + 2 * strips, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, clearColor ? 0 : 0xFFFFFFFF), GS_REG_FRAME);
+    q = gs_ad(q, GIF_SET_TAG(5 + (stencil != 0) + 2 * strips, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_FRAME(fb->address >> 11, fb->width >> 6, fb->psm, mask), GS_REG_FRAME);
+    /* The clear writes the stencil bit itself; without a stencil attachment FBA stays libdraw's. */
+    if (stencil)
+        q = gs_ad(q, GS_SET_FBA(0), GS_REG_FBA_1);
     q = gs_ad(q, GS_SET_ZBUF(depth ? depth->fb.address >> 11 : 0, depth ? gs_zsm(depth->format) : GS_ZBUF_32,
                              clearDepth ? 0 : 1), GS_REG_ZBUF);
     q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, ZTEST_METHOD_ALLPASS), GS_REG_TEST);
     q = gs_ad(q, GS_SET_PRIM(PRIM_SPRITE, 0, 0, 0, 0, 0, 0, 0, 0), GS_REG_PRIM);
     q = gs_ad(q, GS_SET_RGBAQ((int)(rgba[0] * 255.0f), (int)(rgba[1] * 255.0f),
-                              (int)(rgba[2] * 255.0f), (int)(rgba[3] * 128.0f), one.u), GS_REG_RGBAQ);
+                              (int)(rgba[2] * 255.0f), alpha, one.u), GS_REG_RGBAQ);
     for (s = 0; s < strips; s++) {
         int32_t x0 = area->x + (int32_t)(s * PVK_CLEAR_STRIP);
         int32_t x1 = x0 + PVK_CLEAR_STRIP;
@@ -566,6 +584,8 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
     int clearColor = color->loadOp == PVK_ATTACHMENT_LOAD_OP_CLEAR;
     int clearDepth = depthView && depth->loadOp == PVK_ATTACHMENT_LOAD_OP_CLEAR;
     PvkImage depthImage = depthView ? depthView->image : NULL;
+    const PvkRenderingAttachmentInfo *stencil = &info->stencilAttachment;
+    int clearStencil = stencil->imageView && stencil->loadOp == PVK_ATTACHMENT_LOAD_OP_CLEAR;
     framebuffer_t fb;
     zbuffer_t z = { 0 };
     qword_t *q;
@@ -590,7 +610,16 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
         cmd->failed = 1;
         return;
     }
-    if (!attachment_ops_valid(color, "color") || (depthView && !attachment_ops_valid(depth, "depth"))) {
+    if (!attachment_ops_valid(color, "color") || (depthView && !attachment_ops_valid(depth, "depth")) ||
+        (stencil->imageView && !attachment_ops_valid(stencil, "stencil"))) {
+        cmd->failed = 1;
+        return;
+    }
+    if (stencil->imageView && (stencil->imageView->image != colorView->image ||
+                               stencil->imageView->baseLevel != colorView->baseLevel ||
+                               pvk_format_bits(colorView->image->format) == 24)) {
+        pvk_error("pvkCmdBeginRendering: the stencil attachment must be a view of the color attachment's level, "
+                  "and that image PVK_FORMAT_CT32 or PVK_FORMAT_CT16: the stencil is the top alpha bit of its pixels\n");
         cmd->failed = 1;
         return;
     }
@@ -610,7 +639,7 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
         }
     }
 
-    if (!cmd_reserve(cmd, 56 + (clearColor || clearDepth ? 5 + 2 * clear_strips(&info->renderArea) : 0)))
+    if (!cmd_reserve(cmd, 56 + (clearColor || clearDepth || clearStencil ? 6 + 2 * clear_strips(&info->renderArea) : 0)))
         return;
 
     /* Both GS register sets point at the attachments: context 1 writes depth,
@@ -628,8 +657,8 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
     z.mask    = depthImage ? 0 : 1;
     q = draw_setup_environment(q, 0, &fb, &z);
     q = draw_primitive_xyoffset(q, 0, PVK_GS_ORIGIN, PVK_GS_ORIGIN);
-    if (clearColor || clearDepth) {
-        q = cmd_clear(q, info, &fb, depthImage, clearColor, clearDepth);
+    if (clearColor || clearDepth || clearStencil) {
+        q = cmd_clear(q, info, &fb, depthImage, clearColor, clearDepth, stencil->imageView != NULL, clearStencil);
         /* The clear masked FRAME_1/ZBUF_1; restore context 1. */
         q = gs_ad(q, GIF_SET_TAG(2, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
         q = gs_ad(q, GS_SET_FRAME(fb.address >> 11, fb.width >> 6, fb.psm, 0), GS_REG_FRAME_1);
@@ -640,13 +669,14 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 
     cmd->colorView    = colorView;
     cmd->depthView    = depthView;
+    cmd->stencilFormat = stencil->imageView ? colorView->image->format : PVK_FORMAT_UNDEFINED;
     cmd->secondaryContents = (info->flags & PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) != 0;
     cmd->gsStateDirty = 1;
     cmd->rendering    = 1;
 }
 
 /* Chain qwords cmd_gs_state() uses. */
-#define PVK_GS_STATE_QWORDS 16
+#define PVK_GS_STATE_QWORDS 17
 
 /* The scissor the draws use (the pipeline's, or the command buffer's when dynamic),
  * clipped to the attachment level, or to the GS's 2048x2048 when the attachment
@@ -697,9 +727,12 @@ static void cmd_gs_state(PvkCommandBuffer cmd, const PvkRect2D *scissor)
     }
 
     q = cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG(textured ? (mipmapped ? 9 : 7) : 3, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    /* No alpha test (Vulkan has none); depth test from the pipeline. */
-    q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, 0, 0, 1, p->ztst), GS_REG_TEST_1 + ctxt);
+    q = gs_ad(q, GIF_SET_TAG((textured ? (mipmapped ? 9 : 7) : 3) + (p->stencilFormat != PVK_FORMAT_UNDEFINED), 0, 0,
+                             0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    /* No alpha test (Vulkan has none); depth test and stencil test (DATE/DATM) from the pipeline. */
+    q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, p->date, p->datm, 1, p->ztst), GS_REG_TEST_1 + ctxt);
+    if (p->stencilFormat != PVK_FORMAT_UNDEFINED)
+        q = gs_ad(q, GS_SET_FBA(p->fba), GS_REG_FBA_1 + ctxt);
     q = gs_ad(q, alpha, GS_REG_ALPHA_1 + ctxt);
     q = gs_ad(q, GS_SET_SCISSOR(scissor->x, scissor->x + (int32_t)scissor->width - 1,
                                 scissor->y, scissor->y + (int32_t)scissor->height - 1), GS_REG_SCISSOR_1 + ctxt);
@@ -1372,6 +1405,12 @@ void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkComman
             cmd->failed = 1;
             return;
         }
+        if (s->inherits && s->inheritedStencilFormat != cmd->stencilFormat) {
+            pvk_error("pvkCmdExecuteCommands: entry %u inherits stencil format %d, but the rendering's stencil attachment is %d\n",
+                      (unsigned)i, (int)s->inheritedStencilFormat, (int)cmd->stencilFormat);
+            cmd->failed = 1;
+            return;
+        }
         if (s->inherits && s->inheritedDepthFormat != depthFormat) {
             pvk_error("pvkCmdExecuteCommands: entry %u inherits depth format %d, but the rendering's depth attachment is %d\n",
                       (unsigned)i, (int)s->inheritedDepthFormat, (int)depthFormat);
@@ -1725,6 +1764,15 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         return 0;
     }
 
+    if (p->stencilFormat != (cmd->inherits ? cmd->inheritedStencilFormat : cmd->stencilFormat)) {
+        pvk_error("%s: the pipeline's stencilAttachmentFormat (%d) does not match the stencil "
+                  "attachment of %s (%d)\n", name, (int)p->stencilFormat,
+                  cmd->inherits ? "inheritanceInfo" : "pvkCmdBeginRendering",
+                  (int)(cmd->inherits ? cmd->inheritedStencilFormat : cmd->stencilFormat));
+        cmd->failed = 1;
+        return 0;
+    }
+
     missing = p->dynamic & ~cmd->dynamicSet;
     if (!p->blendFix)
         missing &= ~(1u << PVK_DYNAMIC_STATE_BLEND_CONSTANTS);
@@ -1770,7 +1818,8 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
             cmd_frame_mask(cmd, p->zmsk, p->fbmsk);
         cmd_gs_state(cmd, &scissor);
     }
-    return !p->cullAll; /* FRONT_AND_BACK: every triangle is discarded, so nothing to send */
+    /* FRONT_AND_BACK discards every triangle, a stencil test of NEVER every pixel: nothing to send. */
+    return !p->cullAll && !p->stencilNever;
 }
 
 /* Most indices in one batch: whole primitives that fit the output area. */

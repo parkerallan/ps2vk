@@ -411,6 +411,10 @@ struct PvkPipeline_T {
     int      cullAll;         /* FRONT_AND_BACK on triangles: draws are skipped */
     u64      prim;            /* GS PRIM value for the GIF tag; CTXT = zmsk */
     PvkFormat depthFormat;    /* depth attachment it draws with, or UNDEFINED */
+    PvkFormat stencilFormat;  /* stencil attachment it draws with (the color image's format), or UNDEFINED */
+    uint32_t date, datm;      /* GS TEST.DATE/DATM: the stencil test on the pixel's top alpha bit */
+    uint32_t fba;             /* GS FBA: written pixels get the stencil bit set */
+    int      stencilNever;    /* the stencil test passes no pixel: draws are skipped */
     uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */
     uint32_t zmsk;            /* GS context it draws in: 2 (ZBUF_2.ZMSK = 1) when it writes no depth, else 1 */
     u64      alpha;           /* GS ALPHA */
@@ -463,6 +467,8 @@ struct PvkCommandBuffer_T {
     PvkImageView depthView;   /* or NULL */
     int         inherits;     /* a secondary with RENDER_PASS_CONTINUE: draws into the primary's attachments */
     PvkFormat   inheritedDepthFormat;
+    PvkFormat   stencilFormat; /* of the current rendering's stencil attachment, or UNDEFINED */
+    PvkFormat   inheritedStencilFormat;
     int         secondaryContents; /* the rendering takes its draws from pvkCmdExecuteCommands only */
     int         gsStateDirty; /* TEST/ALPHA/SCISSOR/TEX0 must be re-sent before the next draw */
     uint32_t    fbmsk[2];     /* FBMSK the GS holds in FRAME_1 and FRAME_2 */

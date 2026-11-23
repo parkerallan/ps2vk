@@ -49,6 +49,140 @@ static PvkResult setup_depth(PvkPipeline p, const PvkGraphicsPipelineCreateInfo 
     return PVK_SUCCESS;
 }
 
+/* What a stencil op does to the one stencil bit, and which pixels a stencil compare passes. */
+enum { ST_KEEP, ST_SET0, ST_SET1, ST_INVERT };
+enum { ST_ALWAYS, ST_NEVER, ST_BIT0, ST_BIT1 };
+
+/* The op on a 1-bit stencil; -1 for no PvkStencilOp. A clear write mask bit keeps the bit. */
+static int stencil_action(PvkStencilOp op, const PvkStencilOpState *s)
+{
+    int action;
+
+    switch (op) {
+    case PVK_STENCIL_OP_KEEP:                action = ST_KEEP; break;
+    case PVK_STENCIL_OP_ZERO:
+    case PVK_STENCIL_OP_DECREMENT_AND_CLAMP: action = ST_SET0; break;
+    case PVK_STENCIL_OP_REPLACE:             action = s->reference & 1 ? ST_SET1 : ST_SET0; break;
+    case PVK_STENCIL_OP_INCREMENT_AND_CLAMP: action = ST_SET1; break;
+    case PVK_STENCIL_OP_INVERT:
+    case PVK_STENCIL_OP_INCREMENT_AND_WRAP:
+    case PVK_STENCIL_OP_DECREMENT_AND_WRAP:  action = ST_INVERT; break;
+    default:                                 return -1;
+    }
+    return s->writeMask & 1 ? action : ST_KEEP;
+}
+
+/* (reference & compareMask) compareOp (stencil & compareMask) on a 1-bit stencil; -1 for no PvkCompareOp. */
+static int stencil_passes(const PvkStencilOpState *s)
+{
+    uint32_t m = s->compareMask & 1, r = s->reference & m;
+
+    switch (s->compareOp) {
+    case PVK_COMPARE_OP_NEVER:            return ST_NEVER;
+    case PVK_COMPARE_OP_ALWAYS:           return ST_ALWAYS;
+    case PVK_COMPARE_OP_EQUAL:            return !m ? ST_ALWAYS : r ? ST_BIT1 : ST_BIT0;
+    case PVK_COMPARE_OP_NOT_EQUAL:        return !m ? ST_NEVER : r ? ST_BIT0 : ST_BIT1;
+    case PVK_COMPARE_OP_LESS:             return !m || r ? ST_NEVER : ST_BIT1;
+    case PVK_COMPARE_OP_LESS_OR_EQUAL:    return !m || !r ? ST_ALWAYS : ST_BIT1;
+    case PVK_COMPARE_OP_GREATER:          return !m || !r ? ST_NEVER : ST_BIT0;
+    case PVK_COMPARE_OP_GREATER_OR_EQUAL: return !m || r ? ST_ALWAYS : ST_BIT0;
+    default:                              return -1;
+    }
+}
+
+/* The action on a pixel whose stencil bit is known (0 or 1; -1 = either). */
+static int stencil_resolve(int action, int bit)
+{
+    if (bit == 0)
+        return action == ST_SET0 ? ST_KEEP : action == ST_INVERT ? ST_SET1 : action;
+    if (bit == 1)
+        return action == ST_SET1 ? ST_KEEP : action == ST_INVERT ? ST_SET0 : action;
+    return action;
+}
+
+/* One face's stencil state as the GS does it: `passes` and what a passing pixel gets. 0 if the GS cannot. */
+static int stencil_face(const PvkStencilOpState *s, const PvkPipelineDepthStencilStateCreateInfo *ds,
+                        const char *face, int *passes, int *passAction)
+{
+    int fail = stencil_action(s->failOp, s), pass = stencil_action(s->passOp, s);
+    int depthFail = stencil_action(s->depthFailOp, s), known;
+    int depthCanFail = ds->depthTestEnable && ds->depthCompareOp != PVK_COMPARE_OP_ALWAYS;
+    int depthCanPass = !ds->depthTestEnable || ds->depthCompareOp != PVK_COMPARE_OP_NEVER;
+
+    *passes = stencil_passes(s);
+    if (fail < 0 || pass < 0 || depthFail < 0 || *passes < 0) {
+        pvk_error("pipeline: %s stencil state holds a value that is no PvkStencilOp or PvkCompareOp\n", face);
+        return 0;
+    }
+    /* The GS writes nothing to a pixel that fails the stencil test or the depth test. */
+    known = *passes == ST_BIT0 ? 1 : *passes == ST_BIT1 ? 0 : -1;
+    if (*passes != ST_ALWAYS && stencil_resolve(fail, known) != ST_KEEP) {
+        pvk_error("pipeline: %s failOp %d changes the stencil of a pixel that fails the stencil test; the GS "
+                  "writes nothing to such a pixel, so only an op that keeps the bit works\n", face, (int)s->failOp);
+        return 0;
+    }
+    known = *passes == ST_BIT0 ? 0 : *passes == ST_BIT1 ? 1 : -1;
+    if (*passes != ST_NEVER && depthCanFail && stencil_resolve(depthFail, known) != ST_KEEP) {
+        pvk_error("pipeline: %s depthFailOp %d changes the stencil of a pixel that fails the depth test; the GS "
+                  "writes nothing to such a pixel, so only an op that keeps the bit works\n", face, (int)s->depthFailOp);
+        return 0;
+    }
+    *passAction = *passes != ST_NEVER && depthCanPass ? stencil_resolve(pass, known) : ST_KEEP;
+    if (*passAction != ST_KEEP && *passAction != ST_SET1) {
+        pvk_error("pipeline: %s passOp %d turns the stencil bit off; GS FBA can only turn the bit on, so a "
+                  "draw keeps the bit or sets it, and a clear turns it off\n", face, (int)s->passOp);
+        return 0;
+    }
+    return 1;
+}
+
+/* The stencil is the top alpha bit of the color attachment's pixels: tested by GS TEST.DATE/DATM,
+ * set by FBA, kept by FRAME.FBMSK bit 31. Runs after setup_blend, which sets fbmsk. */
+static PvkResult setup_stencil(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info)
+{
+    const PvkPipelineDepthStencilStateCreateInfo *ds = &info->depthStencil;
+    const PvkPipelineRasterizationStateCreateInfo *rs = &info->rasterization;
+    int triangles = info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+                    info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                    info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    int passes, action, backPasses, backAction;
+
+    if (info->stencilAttachmentFormat != PVK_FORMAT_UNDEFINED && info->stencilAttachmentFormat != PVK_FORMAT_CT32 &&
+        info->stencilAttachmentFormat != PVK_FORMAT_CT16) {
+        pvk_error("pipeline: stencilAttachmentFormat must be PVK_FORMAT_CT32, PVK_FORMAT_CT16 (the color "
+                  "attachment's format) or PVK_FORMAT_UNDEFINED\n");
+        return PVK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    p->stencilFormat = info->stencilAttachmentFormat;
+    /* Without a stencil attachment every pixel passes and FBA and alpha bit 31 are the color's. */
+    if (p->stencilFormat == PVK_FORMAT_UNDEFINED)
+        return PVK_SUCCESS;
+    p->fbmsk |= 0x80000000u;
+    if (!ds->stencilTestEnable)
+        return PVK_SUCCESS;
+
+    if (!stencil_face(&ds->front, ds, "front", &passes, &action) ||
+        !stencil_face(&ds->back, ds, "back", &backPasses, &backAction))
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    if (triangles && rs->cullMode == PVK_CULL_MODE_NONE && (passes != backPasses || action != backAction)) {
+        pvk_error("pipeline: front and back stencil state differ and no face is culled; the GS has one "
+                  "stencil state for both faces\n");
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (triangles && rs->cullMode == PVK_CULL_MODE_FRONT_BIT) {
+        passes = backPasses;
+        action = backAction;
+    }
+    p->stencilNever = passes == ST_NEVER;
+    p->date = passes == ST_BIT0 || passes == ST_BIT1;
+    p->datm = passes == ST_BIT1;
+    if (action == ST_SET1) {
+        p->fba = 1;
+        p->fbmsk &= ~0x80000000u;
+    }
+    return PVK_SUCCESS;
+}
+
 /* A factor as k0 + k1 * alpha; src is the GS ALPHA.C source (As, Ad, FIX) or -1. */
 static int blend_factor(PvkBlendFactor f, int *k0, int *k1, int *src)
 {
@@ -835,7 +969,8 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
                                   info->colorBlend.attachment.blendEnable ? 1 : 0, 0, 0, 0, 0);
 
     if ((res = setup_dynamic(p, info)) != PVK_SUCCESS || (res = setup_depth(p, info)) != PVK_SUCCESS ||
-        (res = setup_blend(p, info)) != PVK_SUCCESS || (res = setup_cull(p, info)) != PVK_SUCCESS) {
+        (res = setup_blend(p, info)) != PVK_SUCCESS || (res = setup_cull(p, info)) != PVK_SUCCESS ||
+        (res = setup_stencil(p, info)) != PVK_SUCCESS) {
         pvkDestroyPipeline(device, p);
         return res;
     }

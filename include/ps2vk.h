@@ -1393,33 +1393,120 @@ typedef struct PvkViewport {
 } PvkViewport;
 
 /**
- * @brief Depth comparisons.
+ * @brief Depth and stencil comparisons.
  *
- * The GS only compares with >= and >, so ps2vk stores depth flipped (near is
- * large) and supports the comparisons that map onto that: LESS,
- * LESS_OR_EQUAL, ALWAYS and NEVER. The others are rejected at pipeline creation.
+ * As a depth comparison: the GS only compares with >= and >, so ps2vk stores
+ * depth flipped (near is large) and supports the comparisons that map onto
+ * that: LESS, LESS_OR_EQUAL, ALWAYS and NEVER. The others are rejected at
+ * pipeline creation. As a stencil comparison all eight work, see
+ * PvkStencilOpState.
  */
 typedef enum PvkCompareOp {
-    PVK_COMPARE_OP_NEVER            = 0, /**< Nothing passes. GS ZTST = 0. */
-    PVK_COMPARE_OP_LESS             = 1, /**< Nearer wins. GS ZTST = GREATER on flipped depth. */
-    PVK_COMPARE_OP_EQUAL            = 2, /**< Not supported. */
-    PVK_COMPARE_OP_LESS_OR_EQUAL    = 3, /**< Nearer or equal wins. GS ZTST = GEQUAL on flipped depth. */
-    PVK_COMPARE_OP_GREATER          = 4, /**< Not supported. */
-    PVK_COMPARE_OP_NOT_EQUAL        = 5, /**< Not supported. */
-    PVK_COMPARE_OP_GREATER_OR_EQUAL = 6, /**< Not supported. */
-    PVK_COMPARE_OP_ALWAYS           = 7  /**< Everything passes. GS ZTST = 1. */
+    PVK_COMPARE_OP_NEVER            = 0, /**< Nothing passes. Depth: GS ZTST = 0. */
+    PVK_COMPARE_OP_LESS             = 1, /**< Depth: nearer wins, GS ZTST = GREATER on flipped depth. */
+    PVK_COMPARE_OP_EQUAL            = 2, /**< Depth: not supported. */
+    PVK_COMPARE_OP_LESS_OR_EQUAL    = 3, /**< Depth: nearer or equal wins, GS ZTST = GEQUAL on flipped depth. */
+    PVK_COMPARE_OP_GREATER          = 4, /**< Depth: not supported. */
+    PVK_COMPARE_OP_NOT_EQUAL        = 5, /**< Depth: not supported. */
+    PVK_COMPARE_OP_GREATER_OR_EQUAL = 6, /**< Depth: not supported. */
+    PVK_COMPARE_OP_ALWAYS           = 7  /**< Everything passes. Depth: GS ZTST = 1. */
 } PvkCompareOp;
 
 /**
- * @brief Depth test and write control.
+ * @brief What a draw does to a pixel's stencil bit.
  *
- * All zeros means no depth test and no depth writes, which is what a pipeline
- * without a depth attachment needs. There is no stencil buffer on the GS.
+ * The stencil holds one bit, so the eight ops come to four actions:
+ *
+ * | Op | Action on the bit |
+ * | --- | --- |
+ * | KEEP | Keeps it. |
+ * | ZERO, DECREMENT_AND_CLAMP | Turns it off. |
+ * | REPLACE | Sets it to bit 0 of PvkStencilOpState::reference. |
+ * | INCREMENT_AND_CLAMP | Turns it on. |
+ * | INVERT, INCREMENT_AND_WRAP, DECREMENT_AND_WRAP | Flips it. |
+ */
+typedef enum PvkStencilOp {
+    PVK_STENCIL_OP_KEEP                = 0, /**< Keeps the bit. */
+    PVK_STENCIL_OP_ZERO                = 1, /**< Turns the bit off. */
+    PVK_STENCIL_OP_REPLACE             = 2, /**< Sets the bit to bit 0 of the reference. */
+    PVK_STENCIL_OP_INCREMENT_AND_CLAMP = 3, /**< Turns the bit on. */
+    PVK_STENCIL_OP_DECREMENT_AND_CLAMP = 4, /**< Turns the bit off. */
+    PVK_STENCIL_OP_INVERT              = 5, /**< Flips the bit. */
+    PVK_STENCIL_OP_INCREMENT_AND_WRAP  = 6, /**< Flips the bit. */
+    PVK_STENCIL_OP_DECREMENT_AND_WRAP  = 7  /**< Flips the bit. */
+} PvkStencilOp;
+
+/**
+ * @brief The stencil test and stencil writes for one face of a triangle.
+ *
+ * The stencil of a pixel is one bit: the top alpha bit of that pixel in the
+ * color attachment (bit 31 of a PVK_FORMAT_CT32 pixel, bit 15 of a
+ * PVK_FORMAT_CT16 pixel). A pixel passes when (reference & compareMask)
+ * compareOp (stencil & compareMask) holds, with bit 0 of each value.
+ *
+ * | compareOp | compareMask bit 0 clear | Reference bit 0 clear | Reference bit 0 set |
+ * | --- | --- | --- | --- |
+ * | NEVER | No pixel | No pixel | No pixel |
+ * | LESS | No pixel | Stencil bit on | No pixel |
+ * | EQUAL | Every pixel | Stencil bit off | Stencil bit on |
+ * | LESS_OR_EQUAL | Every pixel | Every pixel | Stencil bit on |
+ * | GREATER | No pixel | No pixel | Stencil bit off |
+ * | NOT_EQUAL | No pixel | Stencil bit on | Stencil bit off |
+ * | GREATER_OR_EQUAL | Every pixel | Stencil bit off | Every pixel |
+ * | ALWAYS | Every pixel | Every pixel | Every pixel |
+ *
+ * "Stencil bit on" and "stencil bit off" are the GS destination alpha test
+ * (TEST.DATE = 1, DATM = 1 or 0); "every pixel" is DATE = 0; with "no pixel"
+ * the draw is skipped.
+ *
+ * The GS writes a pixel only when the pixel passes the stencil test and the
+ * depth test, and its FBA register can turn the stencil bit of a written
+ * pixel on, never off. So of the three ops:
+ *
+ * | Op | What the GS can do | GS |
+ * | --- | --- | --- |
+ * | passOp | Keep the bit, or turn it on | FRAME.FBMSK bit 31 set, or FBA = 1 |
+ * | failOp | Keep the bit | The pixel is not written |
+ * | depthFailOp | Keep the bit | The pixel is not written |
+ *
+ * An op counts as keeping the bit when writeMask bit 0 is clear, or when the
+ * op leaves the bit at the value the test result implies (ZERO on a pixel
+ * that passed EQUAL with reference 0). An op counts as turning the bit on
+ * when it flips a bit the test result implies is off. Any other combination
+ * is rejected at pipeline creation with PVK_ERROR_FEATURE_NOT_PRESENT. The
+ * bit is turned off by a clear: PvkRenderingInfo::stencilAttachment with
+ * PVK_ATTACHMENT_LOAD_OP_CLEAR.
+ */
+typedef struct PvkStencilOpState {
+    PvkStencilOp failOp;      /**< For a pixel that fails the stencil test. */
+    PvkStencilOp passOp;      /**< For a pixel that passes the stencil test and the depth test. */
+    PvkStencilOp depthFailOp; /**< For a pixel that passes the stencil test and fails the depth test. */
+    PvkCompareOp compareOp;   /**< The stencil test. */
+    uint32_t     compareMask; /**< Bit 0: clear makes both sides of the comparison 0. */
+    uint32_t     writeMask;   /**< Bit 0: clear makes every op keep the bit. */
+    uint32_t     reference;   /**< Bit 0: the value compared with the stencil bit, and the value REPLACE writes. */
+} PvkStencilOpState;
+
+/**
+ * @brief Depth and stencil test and write control.
+ *
+ * All zeros means no depth test, no depth writes and no stencil test, which
+ * is what a pipeline without a depth or stencil attachment needs.
+ *
+ * The GS has one stencil state for both faces. front and back may differ
+ * when PvkPipelineRasterizationStateCreateInfo::cullMode discards one face:
+ * the state of the face that is drawn is used. Points, lines and sprites use
+ * front. With no face culled, front and back must come to the same test and
+ * the same action, or pipeline creation fails with
+ * PVK_ERROR_FEATURE_NOT_PRESENT.
  */
 typedef struct PvkPipelineDepthStencilStateCreateInfo {
-    uint32_t     depthTestEnable;  /**< Nonzero to compare against the depth attachment. GS TEST.ZTE/ZTST. */
-    uint32_t     depthWriteEnable; /**< Nonzero to write passing depths; ignored when the test is off. GS ZBUF.ZMSK. */
-    PvkCompareOp depthCompareOp;   /**< Comparison when the test is on. */
+    uint32_t          depthTestEnable;   /**< Nonzero to compare against the depth attachment. GS TEST.ZTE/ZTST. */
+    uint32_t          depthWriteEnable;  /**< Nonzero to write passing depths; ignored when the test is off. GS ZBUF.ZMSK. */
+    PvkCompareOp      depthCompareOp;    /**< Comparison when the test is on. */
+    uint32_t          stencilTestEnable; /**< Nonzero to test and write the stencil bit with front and back; needs PvkGraphicsPipelineCreateInfo::stencilAttachmentFormat. Zero: every pixel passes and the bit is kept. */
+    PvkStencilOpState front;             /**< Stencil state for front-facing triangles, and for points, lines and sprites. */
+    PvkStencilOpState back;              /**< Stencil state for back-facing triangles. */
 } PvkPipelineDepthStencilStateCreateInfo;
 
 /** @brief Which triangles a pipeline discards. */
@@ -1620,7 +1707,8 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     PvkRect2D                      scissor;        /**< Pixels the draws may write, clipped to the attachment, unless PVK_DYNAMIC_STATE_SCISSOR is dynamic; a zero width or height means the whole attachment level, which a secondary command buffer recorded with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT does not know, so its draws need a real rectangle. GS SCISSOR. */
     PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none. Sets the depth range the viewport maps to. */
     PvkPipelineRasterizationStateCreateInfo rasterization; /**< Back-face culling. */
-    PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth test and write control. */
+    PvkFormat                      stencilAttachmentFormat; /**< Format of the stencil attachment the pipeline draws with: the color attachment's PVK_FORMAT_CT32 or PVK_FORMAT_CT16, or PVK_FORMAT_UNDEFINED for none. With a stencil attachment every draw keeps the color pixel's top alpha bit for the stencil, see PvkRenderingInfo. */
+    PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth and stencil test and write control. */
     PvkPipelineColorBlendStateCreateInfo   colorBlend;   /**< Blending with the color attachment and the channels written. */
     PvkPipelineDynamicStateCreateInfo      dynamicState; /**< State set while recording instead of here. */
 } PvkGraphicsPipelineCreateInfo;
@@ -2013,6 +2101,7 @@ typedef enum PvkCommandBufferUsageFlagBits {
  */
 typedef struct PvkCommandBufferInheritanceInfo {
     PvkFormat depthAttachmentFormat; /**< Format of the depth attachment the primary renders with, or PVK_FORMAT_UNDEFINED for none. The pipelines bound inside must match it, as they match pvkCmdBeginRendering()'s. */
+    PvkFormat stencilAttachmentFormat; /**< Format of the stencil attachment the primary renders with (its color attachment's PVK_FORMAT_CT32 or PVK_FORMAT_CT16), or PVK_FORMAT_UNDEFINED for none. The pipelines bound inside must match it. */
 } PvkCommandBufferInheritanceInfo;
 
 /** @brief Parameters for pvkBeginCommandBuffer(). */
@@ -2026,21 +2115,21 @@ typedef struct PvkClearColorValue {
     float float32[4]; /**< Red, green, blue, alpha, each 0 to 1. */
 } PvkClearColorValue;
 
-/** @brief A clear depth. */
+/** @brief A clear depth and a clear stencil. */
 typedef struct PvkClearDepthStencilValue {
-    float    depth;   /**< Depth to fill with, 0 to 1; usually 1 (far). */
-    uint32_t stencil; /**< Unused: the GS has no stencil buffer. */
+    float    depth;   /**< Depth to fill the depth attachment with, 0 to 1; usually 1 (far). */
+    uint32_t stencil; /**< Bit 0: the value every stencil bit of the stencil attachment's render area gets. */
 } PvkClearDepthStencilValue;
 
 /** @brief The value an attachment is cleared to; which member is used depends on the attachment. */
 typedef union PvkClearValue {
     PvkClearColorValue        color;        /**< For the color attachment. */
-    PvkClearDepthStencilValue depthStencil; /**< For the depth attachment. */
+    PvkClearDepthStencilValue depthStencil; /**< For the depth attachment and the stencil attachment. */
 } PvkClearValue;
 
 /** @brief One attachment of a rendering pass: the image, the load op, the store op and the clear value. */
 typedef struct PvkRenderingAttachmentInfo {
-    PvkImageView         imageView;  /**< A one-level view of the target: a swapchain image or a PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT image for color, a depth image for depth; NULL for no attachment. */
+    PvkImageView         imageView;  /**< A one-level view of the target: a swapchain image or a PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT image for color, a depth image for depth, the color attachment's view for stencil; NULL for no attachment. */
     PvkAttachmentLoadOp  loadOp;     /**< What pvkCmdBeginRendering() does with the pixels the image already holds. */
     PvkAttachmentStoreOp storeOp;    /**< Whether the image's pixels are needed after pvkCmdEndRendering(). */
     PvkClearValue        clearValue; /**< Value used when loadOp is CLEAR. */
@@ -2061,12 +2150,27 @@ typedef enum PvkRenderingFlagBits {
  * same command buffer needs a pvkCmdPipelineBarrier() between the two, as
  * in Vulkan: the barrier carries the GS TEXFLUSH that empties the texture
  * cache.
+ *
+ * The stencil attachment is optional (imageView NULL). The GS has no stencil
+ * memory of its own: the stencil of a pixel is the top alpha bit of that
+ * pixel in the color attachment. So the stencil attachment's imageView is a
+ * view of the color attachment's level, of a PVK_FORMAT_CT32 or
+ * PVK_FORMAT_CT16 image (a PVK_FORMAT_CT24 pixel stores no alpha), and the
+ * pipelines drawn with it name that format in stencilAttachmentFormat.
+ *
+ * | With a stencil attachment | GS |
+ * | --- | --- |
+ * | A draw keeps or sets the stencil bit as its pipeline's PvkStencilOpState says | FRAME.FBMSK bit 31, FBA |
+ * | The color's alpha is stored in the pixel's other alpha bits: 7 bits of PVK_FORMAT_CT32, none of PVK_FORMAT_CT16. An alpha of 1.0 (GS 0x80), drawn or cleared, is stored as 0 | FRAME.FBMSK bit 31 |
+ * | loadOp CLEAR on the stencil attachment sets every stencil bit of renderArea to bit 0 of clearValue.depthStencil.stencil | The clear sprite's alpha bit 7 |
+ * | loadOp CLEAR on the color attachment leaves the stencil bits alone | FRAME.FBMSK bit 31 on the clear sprite |
  */
 typedef struct PvkRenderingInfo {
     uint32_t                   flags;           /**< PvkRenderingFlagBits ORed together; 0 turns none of them on, so the primary draws itself. */
     PvkRect2D                  renderArea;      /**< Area to render (and clear), in pixels of the attachment's level. */
     PvkRenderingAttachmentInfo colorAttachment; /**< The color image. */
     PvkRenderingAttachmentInfo depthAttachment; /**< The depth image, or imageView NULL for none. */
+    PvkRenderingAttachmentInfo stencilAttachment; /**< The stencil: a view of the color attachment's level, or imageView NULL for none. */
 } PvkRenderingInfo;
 
 /**
