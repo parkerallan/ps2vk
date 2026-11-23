@@ -273,6 +273,7 @@ int main(void)
 
     PvkSwapchainCreateInfo swapchainInfo = {
         .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_CT32, .imageCount = 2,
+        .imageUsage = PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .presentMode = PVK_PRESENT_MODE_FIFO,
         .displayMode = PVK_DISPLAY_MODE_NTSC,
     };
@@ -501,10 +502,16 @@ int main(void)
     };
     pvkCmdPipelineBarrier(uploadCmd, PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, PVK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                           0, NULL, 0, NULL, 2, toTransfer);
-    PvkBufferImageCopy copy = { .bufferOffset = 0, .rect = { 0, 0, pic.width, pic.height } };
-    pvkCmdCopyBufferToImage(uploadCmd, textureBuffer, texture, &copy);
-    PvkBufferImageCopy tableCopy = { .bufferOffset = 0, .rect = { 0, 0, 256, 1 } };
-    pvkCmdCopyBufferToImage(uploadCmd, paletteBuffer, colorTable, &tableCopy);
+    PvkBufferImageCopy copy = {
+        .imageSubresource = { .aspectMask = PVK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .layerCount = 1 },
+        .imageExtent      = { pic.width, pic.height, 1 },
+    };
+    pvkCmdCopyBufferToImage(uploadCmd, textureBuffer, texture, PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    PvkBufferImageCopy tableCopy = {
+        .imageSubresource = { .aspectMask = PVK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .layerCount = 1 },
+        .imageExtent      = { 256, 1, 1 },
+    };
+    pvkCmdCopyBufferToImage(uploadCmd, paletteBuffer, colorTable, PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tableCopy);
     /* Release: the transfer queue's writes are done; the graphics queue takes the texture and table over.
      * On the PS2 a transfer queue barrier records nothing: the GS takes the copies in order. */
     PvkImageMemoryBarrier release[2] = {

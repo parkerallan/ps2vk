@@ -12,6 +12,10 @@
 
 /* Writes one A+D register setting. */
 static qword_t *gs_ad(qword_t *q, u64 value, u64 reg);
+static qword_t *cmd_open_gs(PvkCommandBuffer cmd);
+static void cmd_close_gs(PvkCommandBuffer cmd, qword_t *end);
+static void cmd_release_copies(PvkCommandBuffer cmd);
+static int array_grow(PvkCommandBuffer cmd, void **array, uint32_t count, uint32_t *cap, size_t size);
 
 /* Make sure `qwords` more fit in the chain; mark the buffer failed if not. */
 static int cmd_reserve(PvkCommandBuffer cmd, uint32_t qwords)
@@ -185,6 +189,9 @@ void pvkDestroyCommandPool(PvkDevice device, PvkCommandPool pool)
     pvk_queue_wait_chains(pool_queue(pool));
     for (cmd = pool->buffers; cmd; cmd = next) {
         next = cmd->next;
+        cmd_release_copies(cmd);
+        free(cmd->readbacks);
+        free(cmd->uploads);
         free(cmd->executed);
         free(cmd);
     }
@@ -203,8 +210,10 @@ PvkResult pvkResetCommandPool(PvkDevice device, PvkCommandPool pool, uint32_t fl
         return PVK_ERROR_VALIDATION_FAILED;
     }
     pvk_queue_wait_chains(pool_queue(pool));
-    for (cmd = pool->buffers; cmd; cmd = cmd->next)
+    for (cmd = pool->buffers; cmd; cmd = cmd->next) {
         cmd->size = 0;
+        cmd_release_copies(cmd);
+    }
     pool->used = 0;
     return PVK_SUCCESS;
 }
@@ -257,6 +266,9 @@ void pvkFreeCommandBuffers(PvkDevice device, PvkCommandPool pool, uint32_t count
                 break;
             }
         }
+        cmd_release_copies(cmd);
+        free(cmd->readbacks);
+        free(cmd->uploads);
         free(cmd->executed);
         free(cmd);
     }
@@ -351,6 +363,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
     cmd->usage        = flags;
     cmd->used         = 0;
     cmd->executedCount = 0;
+    cmd_release_copies(cmd);
     cmd->colorView    = NULL;
     cmd->depthView    = NULL;
     /* Inside the primary's rendering from the first command on. */
@@ -367,7 +380,7 @@ PvkResult pvkBeginCommandBuffer(PvkCommandBuffer cmd, const PvkCommandBufferBegi
      * upload takes the GIF between draw chains and not between the packets of one. */
     if (!secondary && pool->family == 0 && cmd->device->families[1] && cmd_reserve(cmd, 1)) {
         packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
-        packet2_vif_mskpath3(&cmd->packet, 1, 0);
+        packet2_vif_mskpath3(&cmd->packet, 0x8000, 0);
         packet2_vif_nop(&cmd->packet, 0);
         packet2_chain_close_tag(&cmd->packet);
     }
@@ -751,126 +764,209 @@ void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, ui
  * DMA REF and VIF DIRECT counts are 16. */
 #define PVK_IMAGE_CHUNK_QWORDS 16384
 
-/* Copies a color table into the chain in CSM1 layout (256 entries: 16x16 with index bits 3 and 4 swapped). */
-static void cmd_copy_color_table(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage table, const PvkBufferImageCopy *region)
+/* Slot of color table entry i in the GS's CSM1 layout: a 256-entry table swaps index bits 3 and 4. */
+static uint32_t table_slot(uint32_t entries, uint32_t i)
 {
-    const PvkRect2D *r = &region->rect;
-    uint32_t entries = table->fb.width, bytes = pvk_format_bits(table->format) / 8, qwords = entries * bytes / 16, i;
-    const uint8_t *src = (const uint8_t *)buffer->data + region->bufferOffset;
-    int path3 = cmd->pool->family == 1;
-    uint8_t *dst;
-    qword_t *q;
-
-    if (region->mipLevel || r->x || r->y || r->width != entries || r->height != 1 || region->bufferOffset % 16) {
-        pvk_error("pvkCmdCopyBufferToImage: a color table is uploaded whole: mip level 0, region (0, 0, %u, 1), "
-                  "bufferOffset a multiple of 16\n", (unsigned)entries);
-        cmd->failed = 1;
-        return;
-    }
-    if (region->bufferOffset + (size_t)entries * bytes > buffer->size) {
-        pvk_error("pvkCmdCopyBufferToImage reads past the end of the buffer\n");
-        cmd->failed = 1;
-        return;
-    }
-    if (!cmd_reserve(cmd, 8 + qwords))
-        return;
-
-    q = path3 ? cmd_open_gif(cmd) : cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG(4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    q = gs_ad(q, GS_SET_BITBLTBUF(0, 0, 0, table->fb.address >> 6, 1, table->fb.psm), GS_REG_BITBLTBUF);
-    q = gs_ad(q, GS_SET_TRXPOS(0, 0, 0, 0, 0), GS_REG_TRXPOS);
-    q = gs_ad(q, GS_SET_TRXREG(entries == 256 ? 16 : 8, entries == 256 ? 16 : 2), GS_REG_TRXREG);
-    q = gs_ad(q, GS_SET_TRXDIR(0), GS_REG_TRXDIR);
-    q = gs_ad(q, GIF_SET_TAG(qwords, path3, 0, 0, GIF_FLG_IMAGE, 0), 0);
-    dst = (uint8_t *)q;
-    for (i = 0; i < entries; i++) {
-        uint32_t slot = entries == 256 ? (i & ~0x18u) | ((i & 8) << 1) | ((i & 16) >> 1) : i;
-        memcpy(dst + slot * bytes, src + i * bytes, bytes);
-    }
-    if (path3)
-        cmd_close_gif(cmd, q + qwords);
-    else
-        cmd_close_direct(cmd, q + qwords);
+    return entries == 256 ? (i & ~0x18u) | ((i & 8) << 1) | ((i & 16) >> 1) : i;
 }
 
-void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage image, const PvkBufferImageCopy *region)
+/* A copy region checked against its image and buffer. */
+struct CopyRegion {
+    uint32_t level, x, y, w, h;
+    uint32_t rowBytes; /* bytes of one region row */
+    uint32_t pitch;    /* bytes from one buffer row to the next */
+    uint32_t bytes;    /* rowBytes * h */
+    int      direct;   /* DMA can use the buffer in place */
+};
+
+static int copy_region(PvkCommandBuffer cmd, const char *who, PvkBuffer buffer, PvkImage image,
+                       const PvkBufferImageCopy *r, struct CopyRegion *out)
 {
-    const PvkRect2D *r = &region->rect;
-    const uint8_t *src;
-    uint32_t bytes, qwords, sent = 0, level = region->mipLevel, width, height;
+    const PvkImageSubresourceLayers *sub = &r->imageSubresource;
+    uint32_t bits = pvk_format_bits(image->format);
+    /* A T4 byte holds 2 texels: T4 regions are copied in 2-texel blocks. */
+    uint32_t block = bits == 4 ? 2 : 1, blockBytes = bits == 4 ? 1 : bits / 8;
+    uint32_t w = r->imageExtent.width, h = r->imageExtent.height, width, height;
+    uint32_t rowLength = r->bufferRowLength ? r->bufferRowLength : w;
+
+    if (sub->aspectMask != PVK_IMAGE_ASPECT_COLOR_BIT || sub->baseArrayLayer != 0 || sub->layerCount != 1 ||
+        sub->mipLevel >= image->levels) {
+        pvk_error("%s: imageSubresource must name PVK_IMAGE_ASPECT_COLOR_BIT, layer 0, 1 layer and a mip level "
+                  "below %u (aspect 0x%x, layer %u, %u layers, level %u given)\n", who, (unsigned)image->levels,
+                  (unsigned)sub->aspectMask, (unsigned)sub->baseArrayLayer, (unsigned)sub->layerCount,
+                  (unsigned)sub->mipLevel);
+        cmd->failed = 1;
+        return 0;
+    }
+    width  = image->fb.width >> sub->mipLevel;
+    height = image->fb.height >> sub->mipLevel;
+    if (r->imageOffset.x < 0 || r->imageOffset.y < 0 || r->imageOffset.z != 0 || r->imageExtent.depth != 1 ||
+        w == 0 || h == 0 || (uint32_t)r->imageOffset.x > width || w > width - (uint32_t)r->imageOffset.x ||
+        (uint32_t)r->imageOffset.y > height || h > height - (uint32_t)r->imageOffset.y) {
+        pvk_error("%s: the region (%d, %d, %d) %ux%ux%u is outside the %ux%ux1 level %u\n", who,
+                  (int)r->imageOffset.x, (int)r->imageOffset.y, (int)r->imageOffset.z, (unsigned)w, (unsigned)h,
+                  (unsigned)r->imageExtent.depth, (unsigned)width, (unsigned)height, (unsigned)sub->mipLevel);
+        cmd->failed = 1;
+        return 0;
+    }
+    if (rowLength < w || (r->bufferImageHeight && r->bufferImageHeight < h)) {
+        pvk_error("%s: bufferRowLength %u and bufferImageHeight %u must be 0 or at least the region's %ux%u\n", who,
+                  (unsigned)r->bufferRowLength, (unsigned)r->bufferImageHeight, (unsigned)w, (unsigned)h);
+        cmd->failed = 1;
+        return 0;
+    }
+    if ((uint32_t)r->imageOffset.x % block || w % block || rowLength % block) {
+        pvk_error("%s: a PVK_FORMAT_T4 byte holds 2 texels: imageOffset.x, imageExtent.width and bufferRowLength "
+                  "must be even\n", who);
+        cmd->failed = 1;
+        return 0;
+    }
+    out->level    = sub->mipLevel;
+    out->x        = (uint32_t)r->imageOffset.x;
+    out->y        = (uint32_t)r->imageOffset.y;
+    out->w        = w;
+    out->h        = h;
+    out->rowBytes = w / block * blockBytes;
+    out->pitch    = rowLength / block * blockBytes;
+    out->bytes    = out->rowBytes * h;
+    if (r->bufferOffset > buffer->size ||
+        (size_t)(h - 1) * out->pitch + out->rowBytes > buffer->size - r->bufferOffset) {
+        pvk_error("%s: the region's rows end past the end of the %u-byte buffer\n", who, (unsigned)buffer->size);
+        cmd->failed = 1;
+        return 0;
+    }
+    /* DMA moves whole qwords from or to a 16-byte boundary. */
+    out->direct = r->bufferOffset % 16 == 0 && out->bytes % 16 == 0 && (out->pitch == out->rowBytes || h == 1);
+    return 1;
+}
+
+/* What every copy command checks first. */
+static int copy_begin(PvkCommandBuffer cmd, const char *who, PvkBuffer buffer, PvkImage image, uint32_t usageBit,
+                      const char *usageName, PvkImageLayout layout, PvkImageLayout optimal)
+{
+    if (!(image->usage & usageBit)) {
+        pvk_error("%s: the image was not created with %s\n", who, usageName);
+    } else if (!buffer->data || !image->bound) {
+        pvk_error("%s: the buffer and the image need memory bound\n", who);
+    } else if (cmd->rendering) {
+        pvk_error("%s must be called outside pvkCmdBeginRendering/pvkCmdEndRendering\n", who);
+    } else if (layout != optimal && layout != PVK_IMAGE_LAYOUT_GENERAL) {
+        pvk_error("%s: image layout %d is not the transfer layout of the copy or PVK_IMAGE_LAYOUT_GENERAL\n", who,
+                  (int)layout);
+    } else {
+        return 1;
+    }
+    cmd->failed = 1;
+    return 0;
+}
+
+/* Zeroed EE RAM of whole qwords that DMA reads or writes for a region; owned by the recording. */
+static void *stage_alloc(PvkCommandBuffer cmd, const char *who, uint32_t qwords)
+{
+    size_t size = ((size_t)qwords * 16 + 63) & ~(size_t)63;
+    void *stage = memalign(64, size);
+
+    if (!stage) {
+        pvk_error("%s: out of EE RAM for a %u-byte copy of the region\n", who, (unsigned)size);
+        cmd->failed = 1;
+        return NULL;
+    }
+    memset(stage, 0, size);
+    return stage;
+}
+
+/* Room for one more entry in a growing array; fails the recording when out of memory. */
+static int array_grow(PvkCommandBuffer cmd, void **array, uint32_t count, uint32_t *cap, size_t size)
+{
+    void *grown;
+
+    if (count < *cap)
+        return 1;
+    grown = realloc(*array, (*cap ? *cap * 2 : 4) * size);
+    if (!grown) {
+        pvk_error("copy command: out of memory\n");
+        cmd->failed = 1;
+        return 0;
+    }
+    *array = grown;
+    *cap   = *cap ? *cap * 2 : 4;
+    return 1;
+}
+
+/* Frees the staged regions of the last recording. */
+static void cmd_release_copies(PvkCommandBuffer cmd)
+{
+    uint32_t i;
+
+    for (i = 0; i < cmd->readbackCount; i++)
+        if (cmd->readbacks[i].owned)
+            free(cmd->readbacks[i].stage);
+    for (i = 0; i < cmd->uploadCount; i++)
+        free(cmd->uploads[i].stage);
+    cmd->readbackCount = 0;
+    cmd->uploadCount   = 0;
+}
+
+static void pack_uploads(PvkCommandBuffer cmd)
+{
+    uint32_t i, r;
+
+    for (i = 0; i < cmd->uploadCount; i++) {
+        const struct PvkUpload *u = &cmd->uploads[i];
+        for (r = 0; r < u->rows; r++)
+            memcpy((uint8_t *)u->stage + (size_t)r * u->rowBytes, u->src + (size_t)r * u->srcPitch, u->rowBytes);
+    }
+}
+
+void pvk_cmd_pack_uploads(PvkCommandBuffer cmd)
+{
+    uint32_t i;
+
+    pack_uploads(cmd);
+    for (i = 0; i < cmd->executedCount; i++)
+        pack_uploads(cmd->executed[i].cmd);
+}
+
+/* One host-to-local transfer of h buffer rows into a rectangle; the rows are staged unless DMA
+ * can stream them in place. On VIF1 each block is a DIRECT; on the GIF channel every chunk ends its GIF packet. */
+static int cmd_upload(PvkCommandBuffer cmd, const char *who, uint32_t address, uint32_t bufferWidth, uint32_t psm,
+                      uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *src, uint32_t rowBytes, uint32_t pitch)
+{
+    uint32_t bytes = rowBytes * h, qwords = (bytes + 15) / 16, sent = 0;
     int path3 = cmd->pool->family == 1;
     qword_t *q;
 
-    if (!(image->usage & PVK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-        pvk_error("pvkCmdCopyBufferToImage: the image was not created with PVK_IMAGE_USAGE_TRANSFER_DST_BIT "
-                  "(textures and color tables have it by default)\n");
-        cmd->failed = 1;
-        return;
-    }
-    if (!buffer->data || !image->bound) {
-        pvk_error("pvkCmdCopyBufferToImage: the buffer and the image need memory bound\n");
-        cmd->failed = 1;
-        return;
-    }
-    if (cmd->rendering) {
-        pvk_error("pvkCmdCopyBufferToImage must be called outside pvkCmdBeginRendering/pvkCmdEndRendering\n");
-        cmd->failed = 1;
-        return;
-    }
-    if (image->colorTable) {
-        cmd_copy_color_table(cmd, buffer, image, region);
-        return;
-    }
-    if (level >= image->levels) {
-        pvk_error("pvkCmdCopyBufferToImage: mip level %u, but the image has %u\n", (unsigned)level,
-                  (unsigned)image->levels);
-        cmd->failed = 1;
-        return;
-    }
-    width  = image->fb.width >> level;
-    height = image->fb.height >> level;
-    if (r->x < 0 || r->y < 0 || r->width == 0 || r->height == 0 ||
-        (uint32_t)r->x + r->width > width || (uint32_t)r->y + r->height > height) {
-        pvk_error("pvkCmdCopyBufferToImage: the region (%d, %d, %ux%u) is outside the %ux%u level %u\n",
-                  (int)r->x, (int)r->y, (unsigned)r->width, (unsigned)r->height, (unsigned)width,
-                  (unsigned)height, (unsigned)level);
-        cmd->failed = 1;
-        return;
-    }
-    bytes = r->width * r->height * pvk_format_bits(image->format) / 8;
-    if (bytes % 16 || region->bufferOffset % 16) {
-        pvk_error("pvkCmdCopyBufferToImage: the GIF moves whole qwords: the region's texels must fill a "
-                  "multiple of 16 bytes and bufferOffset must be a multiple of 16\n");
-        cmd->failed = 1;
-        return;
-    }
-    qwords = bytes / 16;
-    if (region->bufferOffset + (size_t)qwords * 16 > buffer->size) {
-        pvk_error("pvkCmdCopyBufferToImage reads past the end of the buffer\n");
-        cmd->failed = 1;
-        return;
-    }
-    src = (const uint8_t *)buffer->data + region->bufferOffset;
+    if ((uintptr_t)src % 16 || bytes % 16 || (pitch != rowBytes && h != 1)) {
+        /* pvkQueueSubmit packs the rows into the stage; the GS drops what follows the last texel. */
+        struct PvkUpload *u;
+        void *stage;
 
-    /* Chain: a block with the transfer setup, then per chunk a block holding the IMAGE tag and a
-     * REF tag streaming the pixels from the buffer. On VIF1 each block is a DIRECT (the REF tag
-     * carries the DIRECT code for its pixels); on the GIF channel the GS packets go as they are,
-     * and every chunk ends its GIF packet so a draw chain may take the GIF between chunks. */
+        if (!array_grow(cmd, (void **)&cmd->uploads, cmd->uploadCount, &cmd->uploadCap, sizeof(*cmd->uploads)) ||
+            !(stage = stage_alloc(cmd, who, qwords)))
+            return 0;
+        u = &cmd->uploads[cmd->uploadCount++];
+        u->stage    = stage;
+        u->src      = src;
+        u->rows     = h;
+        u->rowBytes = rowBytes;
+        u->srcPitch = pitch;
+        src = stage;
+    }
     if (!cmd_reserve(cmd, 7 + 3 * ((qwords + PVK_IMAGE_CHUNK_QWORDS - 1) / PVK_IMAGE_CHUNK_QWORDS)))
-        return;
+        return 0;
 
     q = path3 ? cmd_open_gif(cmd) : cmd_open_direct(cmd);
     q = gs_ad(q, GIF_SET_TAG(4, 0, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    q = gs_ad(q, GS_SET_BITBLTBUF(0, 0, 0, image->levelAddress[level] >> 6, image->levelTbw[level], image->fb.psm),
-              GS_REG_BITBLTBUF);
-    q = gs_ad(q, GS_SET_TRXPOS(0, 0, r->x, r->y, 0), GS_REG_TRXPOS);
-    q = gs_ad(q, GS_SET_TRXREG(r->width, r->height), GS_REG_TRXREG);
+    q = gs_ad(q, GS_SET_BITBLTBUF(0, 0, 0, address >> 6, bufferWidth, psm), GS_REG_BITBLTBUF);
+    q = gs_ad(q, GS_SET_TRXPOS(0, 0, x, y, 0), GS_REG_TRXPOS);
+    q = gs_ad(q, GS_SET_TRXREG(w, h), GS_REG_TRXREG);
     q = gs_ad(q, GS_SET_TRXDIR(0), GS_REG_TRXDIR); /* host to local */
     packet2_update(&cmd->packet, q);
     if (!path3)
         packet2_vif_close_direct_auto(&cmd->packet);
     packet2_chain_close_tag(&cmd->packet);
 
+    /* Per chunk an IMAGE tag, then a REF tag streaming the texels (on VIF1 with the DIRECT code). */
     while (sent < qwords) {
         uint32_t chunk = qwords - sent < PVK_IMAGE_CHUNK_QWORDS ? qwords - sent : PVK_IMAGE_CHUNK_QWORDS;
         int eop = path3 || sent + chunk == qwords;
@@ -891,6 +987,143 @@ void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage im
             packet2_add_u32(&cmd->packet, MAKE_VIF_CODE(chunk, 0, P2_VIF_DIRECT, 0));
         }
         sent += chunk;
+    }
+    return 1;
+}
+
+void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage image, PvkImageLayout layout,
+                             uint32_t regionCount, const PvkBufferImageCopy *regions)
+{
+    static const char who[] = "pvkCmdCopyBufferToImage";
+    uint32_t r;
+
+    if (!copy_begin(cmd, who, buffer, image, PVK_IMAGE_USAGE_TRANSFER_DST_BIT, "PVK_IMAGE_USAGE_TRANSFER_DST_BIT",
+                    layout, PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL))
+        return;
+    for (r = 0; r < regionCount; r++) {
+        const uint8_t *src = (const uint8_t *)buffer->data + regions[r].bufferOffset;
+        struct CopyRegion cr;
+
+        if (!copy_region(cmd, who, buffer, image, &regions[r], &cr))
+            return;
+        if (image->colorTable) {
+            /* A transfer per run of entries that are neighbors in the table's CSM1 layout. */
+            uint32_t entries = image->fb.width, bytes = cr.rowBytes / cr.w, cols = entries == 256 ? 16 : 8, i, j;
+
+            for (i = cr.x; i < cr.x + cr.w; i = j) {
+                uint32_t slot = table_slot(entries, i);
+
+                for (j = i + 1; j < cr.x + cr.w; j++)
+                    if (table_slot(entries, j) != slot + (j - i) || table_slot(entries, j) / cols != slot / cols)
+                        break;
+                if (!cmd_upload(cmd, who, image->fb.address, 1, image->fb.psm, slot % cols, slot / cols, j - i, 1,
+                                src + (i - cr.x) * bytes, (j - i) * bytes, (j - i) * bytes))
+                    return;
+            }
+        } else if (!cmd_upload(cmd, who, image->levelAddress[cr.level], image->levelTbw[cr.level], image->fb.psm,
+                               cr.x, cr.y, cr.w, cr.h, src, cr.rowBytes, cr.pitch)) {
+            return;
+        }
+    }
+}
+
+void pvkCmdCopyImageToBuffer(PvkCommandBuffer cmd, PvkImage image, PvkImageLayout layout, PvkBuffer buffer,
+                             uint32_t regionCount, const PvkBufferImageCopy *regions)
+{
+    static const char who[] = "pvkCmdCopyImageToBuffer";
+    uint32_t i;
+
+    if (!copy_begin(cmd, who, buffer, image, PVK_IMAGE_USAGE_TRANSFER_SRC_BIT, "PVK_IMAGE_USAGE_TRANSFER_SRC_BIT",
+                    layout, PVK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL))
+        return;
+    for (i = 0; i < regionCount; i++) {
+        const PvkBufferImageCopy *region = &regions[i];
+        struct PvkReadback rb = { 0 };
+        struct CopyRegion cr;
+        uint32_t address, bufferWidth, x, y, w, h;
+        qword_t *q;
+        u32 *vif;
+
+        if (!copy_region(cmd, who, buffer, image, region, &cr))
+            return;
+        address     = image->levelAddress[cr.level];
+        bufferWidth = image->levelTbw[cr.level];
+        rb.out      = (uint8_t *)buffer->data + region->bufferOffset;
+        if (image->colorTable) {
+            /* The whole table in CSM1 layout; the handler picks the entries. */
+            rb.tableEntries = image->fb.width;
+            rb.tableFirst   = cr.x;
+            rb.rows         = cr.w;
+            rb.rowBytes     = cr.rowBytes / cr.w;
+            x = y = 0;
+            w = rb.tableEntries == 256 ? 16 : 8;
+            h = rb.tableEntries / w;
+            bufferWidth = 1;
+            rb.qwords   = rb.tableEntries * rb.rowBytes / 16;
+        } else if (cr.direct) {
+            x = cr.x, y = cr.y, w = cr.w, h = cr.h;
+            rb.dst    = rb.out;
+            rb.qwords = cr.bytes / 16;
+        } else {
+            /* Whole buffer-width rows are whole qwords in every format. */
+            x = 0, y = cr.y, w = bufferWidth * 64, h = cr.h;
+            rb.rows       = cr.h;
+            rb.rowBytes   = cr.rowBytes;
+            rb.outPitch   = cr.pitch;
+            rb.stagePitch = w * cr.rowBytes / cr.w;
+            rb.stageSkip  = cr.x * cr.rowBytes / cr.w;
+            rb.qwords     = rb.stagePitch * h / 16;
+        }
+        if (!cmd_reserve(cmd, PVK_READBACK_SETUP_QWORDS + 12) ||
+            !array_grow(cmd, (void **)&cmd->readbacks, cmd->readbackCount, &cmd->readbackCap, sizeof(*cmd->readbacks)))
+            return;
+        if (!rb.dst) {
+            rb.stage = stage_alloc(cmd, who, rb.qwords);
+            if (!rb.stage)
+                return;
+            rb.dst   = rb.stage;
+            rb.owned = 1;
+        }
+
+        /* FINISH and a SIGNAL, then the chain ends: the INTC_GS handler takes over from here. */
+        q = cmd_open_gs(cmd);
+        q = gs_ad(q, GIF_SET_TAG(2, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+        q = gs_ad(q, GS_SET_FINISH(0), GS_REG_FINISH);
+        q = gs_ad(q, GS_SET_SIGNAL(PVK_READBACK_SIGNAL_BIT | cmd->pool->family << 8, 0xFFFFFFFF), GS_REG_SIGNAL);
+        cmd_close_gs(cmd, q);
+        packet2_chain_open_end(&cmd->packet, 0, 0);
+        if (cmd->packet.tte) {
+            packet2_vif_nop(&cmd->packet, 0);
+            packet2_vif_nop(&cmd->packet, 0);
+        }
+        packet2_chain_close_tag(&cmd->packet);
+
+        /* Not part of the chain: the handler sends these qwords down VIF1 in normal mode. */
+        rb.setup = (qword_t *)cmd->packet.next;
+        vif = (u32 *)rb.setup;
+        vif[0] = MAKE_VIF_CODE(0, 0, P2_VIF_NOP, 0);
+        vif[1] = MAKE_VIF_CODE(0x8000, 0, P2_VIF_MSKPATH3, 0);
+        vif[2] = MAKE_VIF_CODE(0, 0, P2_VIF_FLUSHA, 0);
+        vif[3] = MAKE_VIF_CODE(PVK_READBACK_SETUP_QWORDS - 1, 0, P2_VIF_DIRECT, 0);
+        q = rb.setup + 1;
+        q = gs_ad(q, GIF_SET_TAG(6, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+        q = gs_ad(q, GS_SET_BITBLTBUF(address >> 6, bufferWidth, image->fb.psm, 0, 0, 0), GS_REG_BITBLTBUF);
+        q = gs_ad(q, GS_SET_TRXPOS(x, y, 0, 0, 0), GS_REG_TRXPOS);
+        q = gs_ad(q, GS_SET_TRXREG(w, h), GS_REG_TRXREG);
+        q = gs_ad(q, GS_SET_FINISH(0), GS_REG_FINISH);
+        q = gs_ad(q, GS_SET_SIGNAL(PVK_READBACK_GO_BIT, 0xFFFFFFFF), GS_REG_SIGNAL);
+        q = gs_ad(q, GS_SET_TRXDIR(1), GS_REG_TRXDIR); /* local to host */
+        packet2_update(&cmd->packet, q);
+
+        /* The chain goes on here; a draw chain holds PATH3 off as pvkBeginCommandBuffer set it. */
+        rb.resume = (qword_t *)cmd->packet.next;
+        if (cmd->pool->family == 0 && cmd->device->families[1]) {
+            packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
+            packet2_vif_mskpath3(&cmd->packet, 0x8000, 0);
+            packet2_vif_nop(&cmd->packet, 0);
+            packet2_chain_close_tag(&cmd->packet);
+        }
+        cmd->readbacks[cmd->readbackCount++] = rb;
     }
 }
 
@@ -1098,7 +1331,7 @@ void pvkCmdEndRendering(PvkCommandBuffer cmd)
 void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkCommandBuffer *cmds)
 {
     PvkFormat depthFormat = cmd->depthView ? cmd->depthView->image->format : PVK_FORMAT_UNDEFINED;
-    uint32_t i;
+    uint32_t i, r;
 
     if (cmd->level != PVK_COMMAND_BUFFER_LEVEL_PRIMARY) {
         pvk_error("pvkCmdExecuteCommands: only a primary command buffer runs secondary ones\n");
@@ -1181,6 +1414,12 @@ void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkComman
         }
         packet2_chain_close_tag(&cmd->packet);
         s->used = 1;
+        for (r = 0; r < s->readbackCount; r++) {
+            if (!array_grow(cmd, (void **)&cmd->readbacks, cmd->readbackCount, &cmd->readbackCap, sizeof(*cmd->readbacks)))
+                return;
+            cmd->readbacks[cmd->readbackCount] = s->readbacks[r];
+            cmd->readbacks[cmd->readbackCount++].owned = 0;
+        }
         cmd->executed[cmd->executedCount].cmd        = s;
         cmd->executed[cmd->executedCount].generation = s->generation;
         cmd->executedCount++;

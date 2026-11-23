@@ -330,10 +330,17 @@ typedef struct PvkPhysicalDeviceMemoryProperties {
 /** @brief What a queue family's queues can do. */
 typedef enum PvkQueueFlagBits {
     PVK_QUEUE_GRAPHICS_BIT = 0x00000001, /**< Draws: pvkCmdBeginRendering() and everything inside it. */
-    PVK_QUEUE_TRANSFER_BIT = 0x00000004  /**< Copies: pvkCmdCopyBufferToImage(). A graphics family has it too. */
+    PVK_QUEUE_TRANSFER_BIT = 0x00000004  /**< Copies: pvkCmdCopyBufferToImage() and pvkCmdCopyImageToBuffer(). A graphics family has it too. */
 } PvkQueueFlagBits;
 /** @brief Bitmask of PvkQueueFlagBits. */
 typedef uint32_t PvkQueueFlags;
+
+/** @brief A position in three dimensions. */
+typedef struct PvkOffset3D {
+    int32_t x; /**< Texels from the left edge. */
+    int32_t y; /**< Texels from the top edge. */
+    int32_t z; /**< 0: an image has one slice. */
+} PvkOffset3D;
 
 /** @brief A size in three dimensions. */
 typedef struct PvkExtent3D {
@@ -353,7 +360,7 @@ typedef struct PvkQueueFamilyProperties {
     PvkQueueFlags queueFlags;                  /**< PvkQueueFlagBits ORed together. */
     uint32_t      queueCount;                  /**< Queues in the family: 1. */
     uint32_t      timestampValidBits;          /**< 32: the EE COP0 Count register pvkCmdWriteTimestamp() reads. */
-    PvkExtent3D   minImageTransferGranularity; /**< (1, 1, 1): copies are limited by format and qword size only, see pvkCmdCopyBufferToImage(). */
+    PvkExtent3D   minImageTransferGranularity; /**< (1, 1, 1): a copy takes any offset and extent inside the image level. */
 } PvkQueueFamilyProperties;
 
 /** @brief Most queue families the device has. */
@@ -600,6 +607,7 @@ typedef struct PvkImageView_T     *PvkImageView;
 
 /** @brief What an image is used for. */
 typedef enum PvkImageUsageFlagBits {
+    PVK_IMAGE_USAGE_TRANSFER_SRC_BIT             = 0x01, /**< Read by pvkCmdCopyImageToBuffer(): PVK_FORMAT_CT32/CT24/CT16/T8, a color table included. Not PVK_FORMAT_T4: the GS has no local-to-host transfer of PSMT4. */
     PVK_IMAGE_USAGE_TRANSFER_DST_BIT             = 0x02, /**< Filled by pvkCmdCopyBufferToImage(): a texture or color table. */
     PVK_IMAGE_USAGE_SAMPLED_BIT                  = 0x04, /**< Read through a combined image sampler binding: GS TEX0. */
     PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT         = 0x10, /**< Rendered into as the color attachment: GS FRAME. Page-aligned VRAM, PVK_FORMAT_CT32/CT24/CT16, at least 64 wide. */
@@ -709,6 +717,7 @@ typedef enum PvkImageLayout {
     PVK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL         = 2, /**< Rendered into through GS FRAME. */
     PVK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL = 3, /**< Rendered into through GS ZBUF. */
     PVK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL         = 5, /**< Sampled through GS TEX0. */
+    PVK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL             = 6, /**< Read by pvkCmdCopyImageToBuffer(). */
     PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL             = 7, /**< Written by pvkCmdCopyBufferToImage(). */
     PVK_IMAGE_LAYOUT_PRESENT_SRC                      = 1000001002 /**< Shown through GS DISPFB. */
 } PvkImageLayout;
@@ -729,6 +738,14 @@ typedef struct PvkImageSubresourceRange {
     uint32_t            baseArrayLayer; /**< 0: an image has one layer. */
     uint32_t            layerCount;     /**< 1, or PVK_REMAINING_ARRAY_LAYERS. */
 } PvkImageSubresourceRange;
+
+/** @brief One mip level of an image, named by a copy. */
+typedef struct PvkImageSubresourceLayers {
+    PvkImageAspectFlags aspectMask;     /**< PVK_IMAGE_ASPECT_COLOR_BIT: copies take color images. */
+    uint32_t            mipLevel;       /**< The level, 0 for the base level; below the image's mipLevels. */
+    uint32_t            baseArrayLayer; /**< 0: an image has one layer. */
+    uint32_t            layerCount;     /**< 1. */
+} PvkImageSubresourceLayers;
 
 /** @brief Parameters for pvkCreateImageView(). */
 typedef struct PvkImageViewCreateInfo {
@@ -944,6 +961,7 @@ typedef struct PvkSwapchainCreateInfo {
     uint32_t       imageCount;  /**< 2 or 3 framebuffers; each takes width x height x the format's bytes per pixel of the 4 MB GS VRAM in whole 8 KB pages. */
     PvkDisplayMode displayMode; /**< Video mode; 0 is PVK_DISPLAY_MODE_AUTO. */
     PvkPresentMode presentMode; /**< When a presented image goes on screen; 0 is PVK_PRESENT_MODE_IMMEDIATE. */
+    uint32_t       imageUsage;  /**< PvkImageUsageFlagBits of the images, at least one: PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT to render into them, PVK_IMAGE_USAGE_SAMPLED_BIT to sample them, PVK_IMAGE_USAGE_TRANSFER_SRC_BIT for pvkCmdCopyImageToBuffer(). */
 } PvkSwapchainCreateInfo;
 
 /**
@@ -1939,7 +1957,7 @@ typedef enum PvkCommandPoolResetFlagBits {
  * A pool's command buffers are submitted to the queue of its family. Those of
  * the graphics family (0) are VIF1 chains and take every command; those of
  * the transfer family (1) are GIF channel chains, which carry no VIF codes,
- * so they take pvkCmdCopyBufferToImage(), pvkCmdPipelineBarrier() and
+ * so they take pvkCmdCopyBufferToImage(), pvkCmdCopyImageToBuffer(), pvkCmdPipelineBarrier() and
  * pvkCmdExecuteCommands() only.
  */
 typedef struct PvkCommandPoolCreateInfo {
@@ -2270,35 +2288,95 @@ typedef enum PvkIndexType {
  */
 void pvkCmdBindIndexBuffer(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, PvkIndexType type);
 
-/** @brief A region copied by pvkCmdCopyBufferToImage(). */
+/**
+ * @brief A region copied between a buffer and one mip level of an image.
+ *
+ * The buffer holds the region's texels in the image's format (see PvkFormat),
+ * row after row from bufferOffset. A buffer row is bufferRowLength texels
+ * long and the copy uses its first imageExtent.width texels. A
+ * PVK_FORMAT_T4 byte holds 2 texels, so for that format imageOffset.x,
+ * imageExtent.width and bufferRowLength are even.
+ */
 typedef struct PvkBufferImageCopy {
-    size_t    bufferOffset; /**< Byte offset of the first pixel in the buffer; a multiple of 16. */
-    uint32_t  mipLevel;     /**< Destination mip level, 0 for the base level; below the image's mipLevels. */
-    PvkRect2D rect;         /**< Destination rectangle in that level (level n is the image size shifted right by n). The buffer holds its rows back to back with no padding, texels in the image's format (see PvkFormat). For a color table: (0, 0, entries, 1). */
+    size_t                    bufferOffset;      /**< Byte offset of the region's first texel in the buffer. */
+    uint32_t                  bufferRowLength;   /**< Texels from one buffer row to the next: 0 for imageExtent.width, else at least imageExtent.width. */
+    uint32_t                  bufferImageHeight; /**< Rows from one buffer slice to the next: 0 for imageExtent.height, else at least imageExtent.height. An image has one slice, so the value moves no texel. */
+    PvkImageSubresourceLayers imageSubresource;  /**< The mip level. */
+    PvkOffset3D               imageOffset;       /**< Top left texel of the region in that level (level n is the image size shifted right by n); z is 0. A color table is its entries wide and 1 high. */
+    PvkExtent3D               imageExtent;       /**< Size of the region in texels, inside the level; depth is 1. */
 } PvkBufferImageCopy;
 
 /**
- * @brief Uploads texels from a buffer into one mip level of a texture, or the entries of a color table.
+ * @brief Uploads texels from a buffer into regions of a texture or a color table.
  *
- * A GS host-to-local transfer (BITBLTBUF at the level's VRAM, TRXPOS, TRXREG, TRXDIR, then the
- * texels as a GIF IMAGE packet). A texture's texels stream straight from the
- * buffer by DMA when the command buffer is submitted, so the buffer must
- * stay unchanged until then; the region's bytes must be a multiple of 16
- * (4 CT32 texels, 16 CT24, 8 CT16, 16 T8, 32 T4). A color table's entries
- * are copied into the command buffer as it is recorded, rearranged into the
- * GS's CSM1 layout (a 256-entry table swaps index bits 3 and 4), so its
- * buffer is free again at once. In a graphics family command buffer the
- * packets go through VIF1 DIRECT (PATH2); in a transfer family one they go
- * down the GIF channel (PATH3), each 16K-qword IMAGE packet ending its GIF
- * packet so a draw chain may take the GIF between them. Must be called
- * outside pvkCmdBeginRendering() / pvkCmdEndRendering().
+ * Each region is a GS host-to-local transfer (BITBLTBUF at the level's VRAM,
+ * TRXPOS, TRXREG, TRXDIR, then the texels as GIF IMAGE packets). The texels
+ * are read from the buffer at pvkQueueSubmit(), so the buffer must stay
+ * unchanged from then until the copy has run. The GS keeps a color table in
+ * its CSM1 layout (a 256-entry table swaps index bits 3 and 4), so a color
+ * table region is one transfer per run of entries that are neighbors in that
+ * layout, 8 entries at most.
  *
- * @param cmd The command buffer.
- * @param buffer Source texels in the image's format.
- * @param image Destination texture or color table.
- * @param region What to copy and where.
+ * | Transfer | How the texels reach the GS |
+ * | --- | --- |
+ * | bufferOffset a multiple of 16, buffer rows imageExtent.width long, texel bytes a multiple of 16 | DMA streams the texels straight from the buffer. |
+ * | Any other | pvkQueueSubmit() packs the rows into EE RAM the command buffer owns; DMA streams that. |
+ *
+ * In a graphics family command buffer the packets go through VIF1 DIRECT
+ * (PATH2); in a transfer family one they go down the GIF channel (PATH3),
+ * each 16K-qword IMAGE packet ending its GIF packet so a draw chain may take
+ * the GIF between them. Must be called outside pvkCmdBeginRendering() /
+ * pvkCmdEndRendering().
+ *
+ * @param commandBuffer The command buffer.
+ * @param srcBuffer Source texels in the image's format.
+ * @param dstImage Destination texture or color table, created with PVK_IMAGE_USAGE_TRANSFER_DST_BIT.
+ * @param dstImageLayout Layout of the image when the copy runs: PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL or PVK_IMAGE_LAYOUT_GENERAL.
+ * @param regionCount Number of regions.
+ * @param pRegions The regions.
  */
-void pvkCmdCopyBufferToImage(PvkCommandBuffer cmd, PvkBuffer buffer, PvkImage image, const PvkBufferImageCopy *region);
+void pvkCmdCopyBufferToImage(PvkCommandBuffer commandBuffer, PvkBuffer srcBuffer, PvkImage dstImage,
+                             PvkImageLayout dstImageLayout, uint32_t regionCount, const PvkBufferImageCopy *pRegions);
+
+/**
+ * @brief Copies regions of an image out of GS VRAM into a buffer in EE RAM.
+ *
+ * The source is a swapchain image, a render target, a texture or a color
+ * table with PVK_IMAGE_USAGE_TRANSFER_SRC_BIT. The buffer holds the texels
+ * once the fence of the pvkQueueSubmit() that ran the command buffer is
+ * signaled; a program that writes those texels to a file has a screenshot.
+ *
+ * Each region is a GS local-to-host transfer. The command buffer's DMA chain
+ * ends at the copy with a GS SIGNAL, and interrupt handlers run these steps:
+ *
+ * | Step | Hardware |
+ * | --- | --- |
+ * | Wait | The VIF1 and GIF DMA channels finish the chains they are sending; no queue starts another chain. |
+ * | Set up | A VIF1 packet holds PATH3 off (MSKPATH3), waits for the GS paths (FLUSHA) and writes BITBLTBUF (the level's VRAM as the source), TRXPOS, TRXREG, a second SIGNAL and TRXDIR = 1. |
+ * | Turn | At the second SIGNAL the VIF1 FIFO is turned to GS-to-EE (VIF1_STAT.FDR) and the GS bus with it (BUSDIR = 1). |
+ * | Read | The VIF1 DMA channel writes the texels into EE RAM, at most 32768 qwords per start. |
+ * | Resume | FDR and BUSDIR go back to 0, PATH3 is let go and the rest of the command buffer's chain starts. |
+ *
+ * | Region | Where the DMA writes |
+ * | --- | --- |
+ * | bufferOffset a multiple of 16, buffer rows imageExtent.width long, texel bytes a multiple of 16 | Straight into the buffer. |
+ * | Any other region | The region's rows, at the level's whole buffer width, go into EE RAM the command buffer owns; the handler copies the region's texels into the buffer. |
+ * | A color table | The whole table is read; the handler stores the region's entries in index order. |
+ *
+ * A PVK_FORMAT_CT24 texel is 3 bytes in the buffer, a PVK_FORMAT_CT16 texel
+ * 2 bytes. The command works in both queue families and in a secondary
+ * command buffer. Must be called outside pvkCmdBeginRendering() /
+ * pvkCmdEndRendering().
+ *
+ * @param commandBuffer The command buffer.
+ * @param srcImage Source image, created with PVK_IMAGE_USAGE_TRANSFER_SRC_BIT.
+ * @param srcImageLayout Layout of the image when the copy runs: PVK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL or PVK_IMAGE_LAYOUT_GENERAL.
+ * @param dstBuffer Destination buffer.
+ * @param regionCount Number of regions.
+ * @param pRegions The regions.
+ */
+void pvkCmdCopyImageToBuffer(PvkCommandBuffer commandBuffer, PvkImage srcImage, PvkImageLayout srcImageLayout,
+                             PvkBuffer dstBuffer, uint32_t regionCount, const PvkBufferImageCopy *pRegions);
 
 /**
  * @brief Binds descriptor sets for the following draws.
@@ -2475,7 +2553,8 @@ typedef enum PvkAccessFlagBits {
     PVK_ACCESS_SHADER_READ_BIT                    = 0x00000020, /**< A texture sampled through GS TEX0; a barrier whose destination has this bit ends with a GS TEXFLUSH. */
     PVK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT         = 0x00000100, /**< Pixels written through GS FRAME. */
     PVK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT = 0x00000400, /**< Depth written through GS ZBUF. */
-    PVK_ACCESS_TRANSFER_WRITE_BIT                 = 0x00001000, /**< Texels written by pvkCmdCopyBufferToImage(). */
+    PVK_ACCESS_TRANSFER_READ_BIT                  = 0x00000800, /**< Texels read by pvkCmdCopyImageToBuffer(). */
+    PVK_ACCESS_TRANSFER_WRITE_BIT                 = 0x00001000, /**< Texels written by pvkCmdCopyBufferToImage(), buffer bytes written by pvkCmdCopyImageToBuffer(). */
     PVK_ACCESS_HOST_WRITE_BIT                     = 0x00004000, /**< CPU writes to mapped memory; written back at pvkQueueSubmit(). */
     PVK_ACCESS_MEMORY_READ_BIT                    = 0x00008000, /**< Any read. */
     PVK_ACCESS_MEMORY_WRITE_BIT                   = 0x00010000  /**< Any write. */

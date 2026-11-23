@@ -225,6 +225,13 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
         pvk_error("swapchain format must be PVK_FORMAT_CT32 or PVK_FORMAT_CT16\n");
         return PVK_ERROR_FORMAT_NOT_SUPPORTED;
     }
+    if (!info->imageUsage || (info->imageUsage & ~(PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | PVK_IMAGE_USAGE_SAMPLED_BIT |
+                                                   PVK_IMAGE_USAGE_TRANSFER_SRC_BIT))) {
+        pvk_error("swapchain imageUsage 0x%x must name at least one of PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, "
+                  "PVK_IMAGE_USAGE_SAMPLED_BIT and PVK_IMAGE_USAGE_TRANSFER_SRC_BIT, and nothing else\n",
+                  (unsigned)info->imageUsage);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     if (info->imageCount < 2 || info->imageCount > PVK_MAX_SWAPCHAIN_IMAGES) {
         pvk_error("swapchain imageCount must be 2 or %d\n", PVK_MAX_SWAPCHAIN_IMAGES);
         return PVK_ERROR_FEATURE_NOT_PRESENT;
@@ -281,7 +288,7 @@ PvkResult pvkCreateSwapchain(PvkDevice device, const PvkSwapchainCreateInfo *inf
         }
         sc->images[i].format = info->format;
         sc->images[i].bound  = 1;
-        sc->images[i].usage  = PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | PVK_IMAGE_USAGE_SAMPLED_BIT;
+        sc->images[i].usage  = info->imageUsage;
         fb->address = address;
         fb->width   = sc->width;
         fb->height  = sc->height;

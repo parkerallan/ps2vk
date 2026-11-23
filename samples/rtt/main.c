@@ -194,6 +194,7 @@ int main(void)
 
     PvkSwapchainCreateInfo swapchainInfo = {
         .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_CT32, .imageCount = 2,
+        .imageUsage = PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .presentMode = PVK_PRESENT_MODE_FIFO,
         .displayMode = PVK_DISPLAY_MODE_NTSC,
     };

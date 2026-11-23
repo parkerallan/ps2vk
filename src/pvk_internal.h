@@ -72,6 +72,44 @@ struct PvkSubmission {
     PvkSemaphore signals[PVK_MAX_SUBMIT_SEMAPHORES];    /* of the last chain of a submit */
     uint32_t     signalCount;
     volatile int state;                                 /* 0 free, 1 queued, 2 chain sent */
+    volatile uint32_t readbackNext;                     /* cmd->readbacks[] entry its chain stops at next */
+};
+
+/* SIGNAL IDs of a pvkCmdCopyImageToBuffer region: the chain has stopped (family in bit 8), */
+#define PVK_READBACK_SIGNAL_BIT 0x20000000u
+/* and the GS has taken the transfer setup. */
+#define PVK_READBACK_GO_BIT     0x10000000u
+#define PVK_READBACK_SETUP_QWORDS 8
+
+/* One pvkCmdCopyImageToBuffer region. The chain ends before it and goes on at `resume`. */
+struct PvkReadback {
+    qword_t  *setup;      /* VIF1 packet: MSKPATH3, FLUSHA, the transfer registers, a SIGNAL, TRXDIR = 1 */
+    qword_t  *resume;     /* DMA tag the chain goes on from */
+    void     *dst;        /* where the DMA writes: the buffer, or `stage` */
+    uint32_t  qwords;
+    void     *stage;      /* EE RAM for a region the DMA cannot write in place, else NULL */
+    int       owned;      /* `stage` is freed with this recording; 0 in a primary's copy of a secondary's */
+    uint8_t  *out;        /* staged: the region's first byte in the buffer */
+    uint32_t  rows, rowBytes, outPitch;  /* staged: rows, bytes copied per row, bytes between buffer rows */
+    uint32_t  stagePitch, stageSkip;     /* staged: bytes between stage rows, bytes before the region in one */
+    uint32_t  tableEntries, tableFirst;  /* a color table of that size: `rows` entries from tableFirst, rowBytes each */
+};
+
+/* A pvkCmdCopyBufferToImage region DMA cannot stream in place: packed into `stage` at submit. */
+struct PvkUpload {
+    void          *stage;
+    const uint8_t *src;
+    uint32_t       rows, rowBytes, srcPitch;
+};
+
+/* The region the handlers are reading back; stage 0 = none. */
+struct PvkReadbackRun {
+    volatile int stage;   /* 1 waiting for the channels, 2 setup sent, 3 DMA reading */
+    PvkQueue     queue;   /* whose head entry stopped */
+    const struct PvkReadback *rb;
+    uint32_t     done, chunk; /* qwords read, qwords of the running DMA */
+    int          unmasked;    /* PATH3 was let go so the GIF channel's chain can finish */
+    PvkQueue     pending;     /* the other queue's chain stopped for a readback meanwhile, or NULL */
 };
 
 /* One in-order queue. Chains wait in a ring and are started from the DMAC and vblank handlers once
@@ -124,7 +162,11 @@ struct PvkDevice_T {
     uint32_t vramCount;       /* taken VRAM ranges, sorted by start: swapchain framebuffers and type 1 allocations */
     struct PvkVramRange vram[PVK_MAX_VRAM_ALLOCATIONS];
     PvkQueryPool queryPools[PVK_MAX_QUERY_POOLS]; /* by the number a SIGNAL ID carries, or NULL */
+    struct PvkReadbackRun readback;
 };
+
+/* Packs the command buffer's staged upload regions, and its secondaries', from their buffers. */
+void pvk_cmd_pack_uploads(PvkCommandBuffer cmd);
 
 /* Takes `words` words of VRAM (a multiple of a page) at the first fit; 0 when none. */
 int  pvk_vram_alloc(PvkDevice device, uint32_t words, uint32_t *address);
@@ -409,6 +451,10 @@ struct PvkCommandBuffer_T {
     int         used;         /* submitted or executed since it was recorded */
     struct PvkExecuted *executed; /* the secondaries a primary calls, checked at submit */
     uint32_t    executedCount, executedCap;
+    struct PvkReadback *readbacks; /* its pvkCmdCopyImageToBuffer regions in chain order, secondaries' included */
+    uint32_t    readbackCount, readbackCap;
+    struct PvkUpload *uploads;     /* its staged pvkCmdCopyBufferToImage regions */
+    uint32_t    uploadCount, uploadCap;
     packet2_t   packet;       /* VIF1 (family 0) or GIF channel (family 1) DMA chain, inside the pool's block */
     uint32_t    signalQw;     /* qword of the GS SIGNAL at a primary's end; its ID is set at submit */
     PvkPipeline pipeline;

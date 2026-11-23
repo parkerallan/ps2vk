@@ -236,6 +236,7 @@ int main(void)
 
     PvkSwapchainCreateInfo swapchainInfo = {
         .width = WIDTH, .height = HEIGHT, .format = PVK_FORMAT_CT32, .imageCount = 2,
+        .imageUsage = PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .presentMode = PVK_PRESENT_MODE_FIFO,
         .displayMode = PVK_DISPLAY_MODE_NTSC,
     };
@@ -475,8 +476,11 @@ int main(void)
     };
     pvkCmdPipelineBarrier(uploadCmd, PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, PVK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                           0, NULL, 0, NULL, 1, &toTransfer);
-    PvkBufferImageCopy copy = { .bufferOffset = 0, .rect = { 0, 0, RAMP_WIDTH, RAMP_HEIGHT } };
-    pvkCmdCopyBufferToImage(uploadCmd, rampBuffer, ramp, &copy);
+    PvkBufferImageCopy copy = {
+        .imageSubresource = { .aspectMask = PVK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .layerCount = 1 },
+        .imageExtent      = { RAMP_WIDTH, RAMP_HEIGHT, 1 },
+    };
+    pvkCmdCopyBufferToImage(uploadCmd, rampBuffer, ramp, PVK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     /* Release: the transfer family's writes are done; the graphics family takes the ramp over.
      * On the PS2 a transfer queue barrier records nothing: the GS takes the copies in order. */
     PvkImageMemoryBarrier release = {

@@ -156,11 +156,13 @@ PvkResult pvkCreateImage(PvkDevice device, const PvkImageCreateInfo *info, PvkIm
         return PVK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     if (depth ? usage != PVK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
-              : (usage & ~(PVK_IMAGE_USAGE_TRANSFER_DST_BIT | PVK_IMAGE_USAGE_SAMPLED_BIT |
-                           PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) || (target && (table || pvk_format_bits(info->format) < 16))) {
+              : (usage & ~(PVK_IMAGE_USAGE_TRANSFER_SRC_BIT | PVK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                           PVK_IMAGE_USAGE_SAMPLED_BIT | PVK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) ||
+                (target && (table || pvk_format_bits(info->format) < 16)) ||
+                ((usage & PVK_IMAGE_USAGE_TRANSFER_SRC_BIT) && info->format == PVK_FORMAT_T4)) {
         pvk_error("pvkCreateImage: usage 0x%x does not fit format %d: a depth format is only a depth attachment, "
-                  "a color format is a transfer destination, sampled, or (CT32/CT24/CT16, not a color table) "
-                  "a color attachment\n", (unsigned)usage, (int)info->format);
+                  "a color format is a transfer source (not T4), a transfer destination, sampled, or "
+                  "(CT32/CT24/CT16, not a color table) a color attachment\n", (unsigned)usage, (int)info->format);
         return PVK_ERROR_VALIDATION_FAILED;
     }
     if (table && info->width != 16 && info->width != 256) {

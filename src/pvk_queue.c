@@ -2,6 +2,7 @@
  * started from interrupt handlers; a GS SIGNAL per chain, taken by an INTC_GS handler.
  * The graphics queue owns the VIF1 channel (PATH2), the transfer queue the GIF channel (PATH3). */
 #include <stdlib.h>
+#include <string.h>
 
 #include <dma_registers.h>
 #include <gs_privileged.h>
@@ -16,6 +17,15 @@
 #define D2_CHCR ((volatile u32 *)0x1000A000)
 #define D2_QWC  ((volatile u32 *)0x1000A020)
 #define D2_TADR ((volatile u32 *)0x1000A030)
+#define D1_MADR ((volatile u32 *)0x10009010)
+#define D_STAT  ((volatile u32 *)0x1000E010)
+#define VIF1_STAT ((volatile u32 *)0x10003C00)
+#define VIF1_FIFO ((volatile u128 *)0x10005000)
+#define VIF1_STAT_FDR 0x00800000u /* FIFO direction: GS to EE */
+#define VIF1_STAT_FQC 0x1F000000u /* qwords in the FIFO */
+
+/* Most qwords one start of the VIF1 channel reads back (QWC is 16 bits). */
+#define PVK_READBACK_CHUNK_QWORDS 32768
 
 /* SIGNAL ID of a ring entry: the index, and the queue's family above it. */
 #define PVK_SIGNAL_ID(queue, index) ((uint32_t)(index) | (queue)->family << 8)
@@ -68,10 +78,18 @@ void pvk_queue_kick(PvkQueue queue)
     struct PvkSubmission *e;
     uint32_t idx;
 
+    /* A readback owns the VIF1 channel and the GS bus until its chain goes on. */
+    if (queue->device->readback.stage)
+        return;
     for (;;) {
-        for (idx = queue->head; idx != queue->tail; idx = (idx + 1) % PVK_MAX_PENDING_SUBMISSIONS)
-            if (queue->ring[idx].state == 1)
+        for (idx = queue->head; idx != queue->tail; idx = (idx + 1) % PVK_MAX_PENDING_SUBMISSIONS) {
+            e = &queue->ring[idx];
+            if (e->state == 1)
                 break;
+            /* A sent chain that still stops for a readback keeps the channel. */
+            if (e->cmd && e->readbackNext < e->cmd->readbackCount)
+                return;
+        }
         if (idx == queue->tail)
             return;
         e = &queue->ring[idx];
@@ -113,6 +131,122 @@ static inline uint32_t ee_count(void)
     return count;
 }
 
+/* VIF MSKPATH3 with the mask bit clear: PATH3 may go. */
+static const u128 path3_on = 0x06000000;
+
+static void readback_read_chunk(PvkDevice dev)
+{
+    struct PvkReadbackRun *run = &dev->readback;
+    uint32_t left = run->rb->qwords - run->done;
+
+    run->chunk = left < PVK_READBACK_CHUNK_QWORDS ? left : PVK_READBACK_CHUNK_QWORDS;
+    *D1_MADR = (u32)run->rb->dst + run->done * 16;
+    *D1_QWC  = run->chunk;
+    /* Normal mode, device to memory; ASP stays for a chain stopped inside a secondary. */
+    *D1_CHCR = (*D1_CHCR & 0x30) | 0x100;
+}
+
+/* Stage 1: once both channels are idle, sends the region's setup packet down VIF1. */
+static void readback_step(PvkDevice dev)
+{
+    struct PvkReadbackRun *run = &dev->readback;
+
+    if (*D1_CHCR & 0x100)
+        return;
+    if (dev->families[1] && (*D2_CHCR & 0x100)) {
+        /* An upload in flight keeps the GS transfer registers: let it finish first. */
+        if (!run->unmasked) {
+            *VIF1_FIFO = path3_on;
+            run->unmasked = 1;
+        }
+        return;
+    }
+    run->stage = 2;
+    *D1_MADR = (u32)run->rb->setup;
+    *D1_QWC  = PVK_READBACK_SETUP_QWORDS;
+    *D1_CHCR = (*D1_CHCR & 0x30) | 0x101;
+}
+
+/* The head chain of `queue` stopped at its next pvkCmdCopyImageToBuffer region. */
+static void readback_begin(PvkDevice dev, PvkQueue queue)
+{
+    struct PvkSubmission *e = &queue->ring[queue->head];
+    struct PvkReadbackRun *run = &dev->readback;
+
+    if (queue->head == queue->tail || e->state != 2 || !e->cmd || e->readbackNext >= e->cmd->readbackCount)
+        return;
+    if (run->stage) {
+        run->pending = queue;
+        return;
+    }
+    run->queue    = queue;
+    run->rb       = &e->cmd->readbacks[e->readbackNext];
+    run->done     = 0;
+    run->unmasked = 0;
+    run->stage    = 1;
+    readback_step(dev);
+}
+
+/* The GS has TRXDIR = 1: turns the VIF1 FIFO and the GS bus around and starts reading. */
+static void readback_turn(PvkDevice dev)
+{
+    while (*D1_CHCR & 0x100)
+        ;
+    while (*VIF1_STAT & VIF1_STAT_FQC)
+        ;
+    *D_STAT    = 1u << DMA_CHANNEL_VIF1; /* the setup packet's channel interrupt is not a finished read */
+    *VIF1_STAT = VIF1_STAT_FDR;
+    *GS_REG_BUSDIR = 1;
+    dev->readback.stage = 3;
+    readback_read_chunk(dev);
+}
+
+/* Copies a staged region into the buffer: its rows, or a color table's entries out of CSM1 order. */
+static void readback_unstage(const struct PvkReadback *rb)
+{
+    const uint8_t *s = rb->stage;
+    uint32_t r;
+
+    for (r = 0; r < rb->rows; r++) {
+        if (rb->tableEntries) {
+            uint32_t i = rb->tableFirst + r;
+            uint32_t slot = rb->tableEntries == 256 ? (i & ~0x18u) | ((i & 8) << 1) | ((i & 16) >> 1) : i;
+            memcpy(rb->out + r * rb->rowBytes, s + slot * rb->rowBytes, rb->rowBytes);
+        } else {
+            memcpy(rb->out + (size_t)r * rb->outPitch, s + (size_t)r * rb->stagePitch + rb->stageSkip, rb->rowBytes);
+        }
+    }
+}
+
+/* The VIF1 channel finished a read: the next chunk, or the bus back and the chain on. */
+static void readback_chunk_done(PvkDevice dev)
+{
+    struct PvkReadbackRun *run = &dev->readback;
+    PvkQueue queue = run->queue;
+
+    run->done += run->chunk;
+    if (run->done < run->rb->qwords) {
+        readback_read_chunk(dev);
+        return;
+    }
+    *VIF1_STAT = 0;
+    *GS_REG_BUSDIR = 0;
+    *VIF1_FIFO = path3_on;
+    if (run->rb->stage)
+        readback_unstage(run->rb);
+    queue->ring[queue->head].readbackNext++;
+    run->stage = 0;
+    *queue->qwc  = 0;
+    *queue->tadr = DMA_SET_TADR((u32)run->rb->resume, 0);
+    *queue->chcr = DMA_SET_CHCR(1, 1, (*queue->chcr >> 4) & 3, queue->family == 0, 0, 1, 0);
+    if (run->pending) {
+        queue = run->pending;
+        run->pending = NULL;
+        readback_begin(dev, queue);
+    }
+    pvk_device_kick(dev);
+}
+
 /* INTC_GS fires on SIGNAL: the oldest sent chain of the queue the ID names has finished. */
 static s32 gs_signal_handler(s32 cause)
 {
@@ -125,6 +259,11 @@ static s32 gs_signal_handler(s32 cause)
             uint32_t id = (uint32_t)*GS_REG_SIGLBLID;
             if (id & PVK_QUERY_SIGNAL_BIT) {
                 pvk_query_signal(dev, id, ticks);
+            } else if (id & PVK_READBACK_GO_BIT) {
+                if (dev->readback.stage == 2)
+                    readback_turn(dev);
+            } else if (id & PVK_READBACK_SIGNAL_BIT) {
+                readback_begin(dev, (id >> 8) & 1 ? &dev->transfer : &dev->queue);
             } else {
                 PvkQueue queue = (id >> 8) & 1 ? &dev->transfer : &dev->queue;
                 if (queue->head != queue->tail && queue->ring[queue->head].state == 2)
@@ -145,9 +284,15 @@ static s32 gs_signal_handler(s32 cause)
 /* A channel finished a chain: the queue's next one may go while the GS takes this one. */
 static int vif1_handler(int channel)
 {
+    PvkDevice dev = handler_device;
+
     (void)channel;
-    if (handler_device)
-        pvk_queue_kick(&handler_device->queue);
+    if (dev && dev->readback.stage == 1)
+        readback_step(dev);
+    else if (dev && dev->readback.stage == 3 && !(*D1_CHCR & 0x100))
+        readback_chunk_done(dev);
+    else if (dev)
+        pvk_queue_kick(&dev->queue);
     ExitHandler();
     return 0;
 }
@@ -155,7 +300,9 @@ static int vif1_handler(int channel)
 static int gif_handler(int channel)
 {
     (void)channel;
-    if (handler_device)
+    if (handler_device && handler_device->readback.stage == 1)
+        readback_step(handler_device);
+    else if (handler_device)
         pvk_queue_kick(&handler_device->transfer);
     ExitHandler();
     return 0;
@@ -419,8 +566,10 @@ PvkResult pvkQueueSubmit(PvkQueue queue, uint32_t submitCount, const PvkSubmitIn
                     e->signals[i] = si->signalSemaphores[i];
                 e->signalCount = si->signalSemaphoreCount;
             }
+            e->readbackNext = 0;
             if (cmd) {
                 cmd->used = 1;
+                pvk_cmd_pack_uploads(cmd);
                 cmd->packet.base[cmd->signalQw].dw[0] = GS_SET_SIGNAL(PVK_SIGNAL_ID(queue, e - queue->ring), 0xFFFFFFFF);
             }
             queue->tail = (queue->tail + 1) % PVK_MAX_PENDING_SUBMISSIONS;
