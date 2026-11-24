@@ -729,8 +729,8 @@ static void cmd_gs_state(PvkCommandBuffer cmd, const PvkRect2D *scissor)
     q = cmd_open_direct(cmd);
     q = gs_ad(q, GIF_SET_TAG((textured ? (mipmapped ? 9 : 7) : 3) + (p->stencilFormat != PVK_FORMAT_UNDEFINED), 0, 0,
                              0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    /* No alpha test (Vulkan has none); depth test and stencil test (DATE/DATM) from the pipeline. */
-    q = gs_ad(q, GS_SET_TEST(0, 0, 0, 0, p->date, p->datm, 1, p->ztst), GS_REG_TEST_1 + ctxt);
+    /* Alpha test from the fragment shader's discard (a failing pixel writes nothing); depth and stencil test from the pipeline. */
+    q = gs_ad(q, GS_SET_TEST(p->ate, p->atst, p->aref, 0, p->date, p->datm, 1, p->ztst), GS_REG_TEST_1 + ctxt);
     if (p->stencilFormat != PVK_FORMAT_UNDEFINED)
         q = gs_ad(q, GS_SET_FBA(p->fba), GS_REG_FBA_1 + ctxt);
     q = gs_ad(q, alpha, GS_REG_ALPHA_1 + ctxt);

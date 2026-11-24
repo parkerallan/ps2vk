@@ -1342,6 +1342,14 @@ typedef struct PvkShaderSpecConstant {
  * PvkShaderSpecConstant); a branch or loop count that depends on one stays a
  * branch, since its value is only known when the pipeline is created.
  *
+ * A fragment shader becomes GS settings, so its discard has to fit the GS
+ * alpha test: the discard is unconditional, or its condition compares the
+ * alpha of the color the shader writes with a constant. shaderc turns the
+ * condition into the comparison a kept pixel passes (alphaTestFunction,
+ * alphaTestReference); a pixel that fails writes no color and no depth. GS
+ * alpha has 8 bits with 128 for 1.0, and the comparison is carried out on
+ * those steps. shaderc rejects a discard on any other condition.
+ *
  * Applications never fill this in by hand: shaderc emits a .c file defining
  * one of these, and the application passes its address to
  * pvkCreateShaderModule().
@@ -1373,6 +1381,9 @@ typedef struct PvkShaderCode {
     uint32_t        textureFunction;       /**< Fragment: GS TEX0.TFX, 0 = modulate (texture * color), 1 = decal (texture only). */
     int32_t         samplerBinding;        /**< Fragment: the sampler2D's binding, or -1 if it has none. */
     int32_t         samplerSet;            /**< Fragment: the sampler2D's descriptor set (0 when the GLSL names none), or -1 if it has no sampler. */
+    uint32_t        alphaTest;             /**< Fragment: GS TEST.ATE, 1 when the shader has a discard. */
+    uint32_t        alphaTestFunction;     /**< Fragment: GS TEST.ATST, the comparison a pixel's alpha must pass to be kept: 0 never, 1 always, 2 <, 3 <=, 4 ==, 5 >=, 6 >, 7 !=. */
+    uint32_t        alphaTestReference;    /**< Fragment: GS TEST.AREF, the value the alpha is compared with, 0 to 255 where 128 is 1.0. */
 } PvkShaderCode;
 
 /** @brief Parameters for pvkCreateShaderModule(). */

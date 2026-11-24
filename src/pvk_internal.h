@@ -426,6 +426,7 @@ struct PvkPipeline_T {
     uint32_t date, datm;      /* GS TEST.DATE/DATM: the stencil test on the pixel's top alpha bit */
     uint32_t fba;             /* GS FBA: written pixels get the stencil bit set */
     int      stencilNever;    /* the stencil test passes no pixel: draws are skipped */
+    uint32_t ate, atst, aref; /* GS TEST.ATE/ATST/AREF: the alpha test of a fragment shader with a discard */
     uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */
     uint32_t zmsk;            /* GS context it draws in: 2 (ZBUF_2.ZMSK = 1) when it writes no depth, else 1 */
     u64      alpha;           /* GS ALPHA */

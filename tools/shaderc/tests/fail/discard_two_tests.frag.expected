@@ -1,0 +1,1 @@
+discard_two_tests.frag:10: error: fragment shader uses OpPhi (a value chosen by a branch): the GS cannot run code per pixel. Only 'outColor = <color input>;', 'outColor = texture(<sampler>, <texcoord input>);' and their product are supported so far

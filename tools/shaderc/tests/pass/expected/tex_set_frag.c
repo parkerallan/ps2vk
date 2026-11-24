@@ -15,4 +15,7 @@ const PvkShaderCode tex_set_frag = {
     .textureFunction = 1,
     .samplerBinding = 2,
     .samplerSet = 1,
+    .alphaTest = 0,
+    .alphaTestFunction = 0,
+    .alphaTestReference = 0,
 };

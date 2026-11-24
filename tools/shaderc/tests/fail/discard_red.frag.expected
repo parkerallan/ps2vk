@@ -1,0 +1,1 @@
+discard_red.frag:10: error: fragment shader reads something other than the alpha of its color; the GS discards a pixel only by comparing the alpha of the color written with a constant: 'if (<color>.a < <constant>) discard;'

@@ -1,0 +1,1 @@
+discard_missing.frag:10: error: fragment shader has an 'if' that does not discard: the GS cannot run code per pixel

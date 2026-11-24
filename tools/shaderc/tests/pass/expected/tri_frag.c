@@ -15,4 +15,7 @@ const PvkShaderCode tri_frag = {
     .textureFunction = 0,
     .samplerBinding = -1,
     .samplerSet = -1,
+    .alphaTest = 0,
+    .alphaTestFunction = 0,
+    .alphaTestReference = 0,
 };

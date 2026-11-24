@@ -1,0 +1,1 @@
+discard_other_color.frag:12: error: fragment shader discards on the alpha of the texture sample but writes the texture sample times the color input; the GS discards a pixel only by comparing the alpha of the color written with a constant: 'if (<color>.a < <constant>) discard;'

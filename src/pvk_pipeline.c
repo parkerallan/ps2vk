@@ -1023,6 +1023,9 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
 
     p->vs           = vs;
     p->fs           = fs;
+    p->ate          = fs->alphaTest;
+    p->atst         = fs->alphaTestFunction;
+    p->aref         = fs->alphaTestReference;
     p->layout       = info->layout;
     if ((res = validate_layout(p, info)) != PVK_SUCCESS ||
         (res = setup_vertex_input(p, info, fmt, qword, instance)) != PVK_SUCCESS ||

@@ -31,6 +31,7 @@
  *   fragment: outColor = vColor;                      (Gouraud)
  *             outColor = texture(tex, vUV);           (GS TFX decal)
  *             outColor = texture(tex, vUV) * vColor;  (GS TFX modulate)
+ *             if (<that color>.a < <constant>) discard;  (GS alpha test)
  *
  * Anything else is rejected with an error that says why, the way a Vulkan
  * driver rejects a shader that uses a feature the device lacks.
@@ -88,6 +89,7 @@ enum {
     OpPhi = 245, OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249,
     OpBranchConditional = 250, OpSwitch = 251, OpKill = 252, OpReturn = 253, OpReturnValue = 254,
     OpUnreachable = 255, OpNoLine = 317, OpModuleProcessed = 330,
+    OpTerminateInvocation = 4416, OpDemoteToHelperInvocation = 5380,
     OpDynLoad = 0x10000,            /* ours: lq of a block qword through VI08 */
     OpPhiMove = 0x10001,            /* ours: copy a value into a phi's register at the end of a block */
     OpConstLoad = 0x10002,          /* ours: lq of a push constant or uniform qword */
@@ -204,10 +206,16 @@ typedef struct {
     int      mapOp;          /* 1 + body index of the shuffle/constructor that builds it, 0 if none */
     /* fragment shaders: what a value is, since the GS has fixed functions only */
     int      texel;          /* TEXEL_* */
+    int      fragAlpha;      /* ALPHA_*: the color this float is the alpha of, or this comparison tests */
+    int      fragCmp;        /* CMP_*: a comparison "alpha CMP fragRef" */
+    float    fragRef;
     const char *name;
 } IdInfo;
 
 enum { TEXEL_NONE, TEXEL_SAMPLER, TEXEL_SAMPLE, TEXEL_SAMPLE_TIMES_COLOR };
+/* Whose alpha: one of the three colors a fragment shader can write, or whatever outColor holds. */
+enum { ALPHA_NONE, ALPHA_COLOR, ALPHA_SAMPLE, ALPHA_SAMPLE_TIMES_COLOR, ALPHA_OUTPUT };
+enum { CMP_NONE, CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_EQ, CMP_NE };
 
 typedef struct {
     int location;
@@ -289,6 +297,11 @@ static const char *op_name(uint32_t op)
     default: return NULL;
     }
 }
+
+enum { DISCARD_NONE, DISCARD_IF, DISCARD_ALWAYS };
+
+#define DISCARD_FORM "the GS discards a pixel only by comparing the alpha of the color written " \
+                     "with a constant: 'if (<color>.a < <constant>) discard;'"
 
 static void unsupported(uint32_t op, const char *stage)
 {
@@ -542,7 +555,15 @@ typedef struct {
     int      samplerBinding;        /* its binding, -1 if none */
     int      samplerSet;            /* its descriptor set, -1 if none */
     int      textureFunction;       /* fragment: GS TEX0.TFX, 0 modulate, 1 decal */
-    uint32_t colorVar;              /* vertex: the vec4 output variable, 0 if none */
+    int      discard;               /* fragment: DISCARD_* */
+    int      discardInv;            /* the discard is on the false side of the 'if' */
+    int      branches;              /* fragment: 'if's seen */
+    uint32_t branchCond, branchTrue, branchFalse, branchMerge; /* of its one 'if' */
+    uint32_t branchLine;            /* source line of that 'if' */
+    uint32_t storeLabel;            /* fragment: block of the last store to outColor */
+    uint32_t prevColorValue;        /* colorValue and textureFunction before that store */
+    int      prevTextureFunction;
+    uint32_t colorVar;             /* vertex: the vec4 output variable, 0 if none */
     uint32_t texcoordVar;           /* vertex: the vec2 output variable, 0 if none */
     int      texcoordLocation;      /* -1 if none */
     uint32_t texcoordValue;         /* value id stored to the texcoord output, 0 if never */
@@ -1119,6 +1140,127 @@ static void place_const_loads(IdInfo *ids, Shader *sh)
     renumber_maps(ids, sh);
 }
 
+/* Which of the colors a fragment shader can write a vec4 value is, ALPHA_NONE if none. */
+static int frag_color(const IdInfo *ids, const Shader *sh, uint32_t id)
+{
+    if (ids[id].kind != ID_VALUE)
+        return ALPHA_NONE;
+    if (ids[id].texel == TEXEL_SAMPLE)
+        return ALPHA_SAMPLE;
+    if (ids[id].texel == TEXEL_SAMPLE_TIMES_COLOR)
+        return ALPHA_SAMPLE_TIMES_COLOR;
+    if (ids[id].texel == TEXEL_NONE && sh->colorInput >= 0 && ids[id].fromInput == sh->colorInput &&
+        !ids[id].comp && !ids[id].fragAlpha)
+        return ALPHA_COLOR;
+    return ALPHA_NONE;
+}
+
+/* Whose alpha a float value is, ALPHA_NONE if it is no alpha. */
+static int frag_alpha(const IdInfo *ids, const Shader *sh, uint32_t id)
+{
+    if (ids[id].kind != ID_VALUE || ids[id].fragCmp)
+        return ALPHA_NONE;
+    if (ids[id].fragAlpha)
+        return ids[id].fragAlpha;
+    /* vColor.a loaded through an access chain */
+    if (sh->colorInput >= 0 && ids[id].fromInput == sh->colorInput && ids[id].comp == 3)
+        return ALPHA_COLOR;
+    return ALPHA_NONE;
+}
+
+static const char *frag_color_name(int whose)
+{
+    switch (whose) {
+    case ALPHA_COLOR: return "the color input";
+    case ALPHA_SAMPLE: return "the texture sample";
+    case ALPHA_SAMPLE_TIMES_COLOR: return "the texture sample times the color input";
+    default: return "another value";
+    }
+}
+
+/* A float comparison as "alpha CMP constant"; constLeft when the SPIR-V has the constant first. */
+static int frag_compare(uint32_t op, int constLeft)
+{
+    int cmp;
+
+    switch (op) {
+    case OpFOrdLessThan: case OpFUnordLessThan:                 cmp = CMP_LT; break;
+    case OpFOrdLessThanEqual: case OpFUnordLessThanEqual:       cmp = CMP_LE; break;
+    case OpFOrdGreaterThan: case OpFUnordGreaterThan:           cmp = CMP_GT; break;
+    case OpFOrdGreaterThanEqual: case OpFUnordGreaterThanEqual: cmp = CMP_GE; break;
+    case OpFOrdEqual: case OpFUnordEqual:                       return CMP_EQ;
+    case OpFOrdNotEqual: case OpFUnordNotEqual:                 return CMP_NE;
+    default:                                                    return CMP_NONE;
+    }
+    if (!constLeft)
+        return cmp;
+    return cmp == CMP_LT ? CMP_GT : cmp == CMP_LE ? CMP_GE : cmp == CMP_GT ? CMP_LT : CMP_LE;
+}
+
+static int frag_not(int cmp)
+{
+    switch (cmp) {
+    case CMP_LT: return CMP_GE;
+    case CMP_LE: return CMP_GT;
+    case CMP_GT: return CMP_LE;
+    case CMP_GE: return CMP_LT;
+    case CMP_EQ: return CMP_NE;
+    default:     return CMP_EQ;
+    }
+}
+
+/* The GS alpha test that passes the pixels the shader keeps. GS alpha is 8 bits with
+ * 128 = 1.0, so the comparison is redone on those steps: TEST.ATST and TEST.AREF. */
+static void frag_alpha_test(const Shader *sh, const IdInfo *ids, int *atst, int *aref)
+{
+    enum { NEVER, ALWAYS, LESS, LEQUAL, EQUAL, GEQUAL, GREATER, NOTEQUAL };
+    int cmp = ids[sh->branchCond].fragCmp;
+    double x = 128.0 * (double)ids[sh->branchCond].fragRef;
+    long lo, hi; /* floor and ceiling of x */
+
+    *aref = 0;
+    if (sh->discard == DISCARD_ALWAYS) {
+        *atst = NEVER;
+        return;
+    }
+    if (sh->discardInv)
+        cmp = frag_not(cmp);
+    x = x < -1.0 ? -1.0 : x > 256.0 ? 256.0 : x;
+    lo = (long)x;
+    if ((double)lo > x)
+        lo--;
+    hi = (double)lo < x ? lo + 1 : lo;
+
+    switch (cmp) {
+    case CMP_LT: /* keep alpha >= x */
+        *atst = hi <= 0 ? ALWAYS : hi > 255 ? NEVER : GEQUAL;
+        *aref = (int)hi;
+        break;
+    case CMP_LE: /* keep alpha > x */
+        *atst = lo < 0 ? ALWAYS : lo >= 255 ? NEVER : GREATER;
+        *aref = (int)lo;
+        break;
+    case CMP_GT: /* keep alpha <= x */
+        *atst = lo < 0 ? NEVER : lo >= 255 ? ALWAYS : LEQUAL;
+        *aref = (int)lo;
+        break;
+    case CMP_GE: /* keep alpha < x */
+        *atst = hi <= 0 ? NEVER : hi > 255 ? ALWAYS : LESS;
+        *aref = (int)hi;
+        break;
+    case CMP_EQ: /* keep alpha != x */
+        *atst = lo == hi && lo >= 0 && lo <= 255 ? NOTEQUAL : ALWAYS;
+        *aref = (int)lo;
+        break;
+    default:     /* keep alpha == x */
+        *atst = lo == hi && lo >= 0 && lo <= 255 ? EQUAL : NEVER;
+        *aref = (int)lo;
+        break;
+    }
+    if (*atst == NEVER || *atst == ALWAYS)
+        *aref = 0;
+}
+
 static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 {
     size_t pc;
@@ -1156,7 +1298,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 
         switch (op) {
         case OpCapability:
-            if (w[1] != 1) /* Shader */
+            if (w[1] != 1 && w[1] != 5379) /* Shader, DemoteToHelperInvocation */
                 fail("shader needs SPIR-V capability %u, which the PS2 does not support", (unsigned)w[1]);
             break;
         case OpEntryPoint:
@@ -1515,7 +1657,31 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         } else if (inFunction) {
             switch (op) {
             case OpLine: case OpNoLine: case OpNop: case OpFunctionEnd:
-            case OpSelectionMerge: case OpLoopMerge: case OpUnreachable:
+            case OpLoopMerge: case OpUnreachable:
+                break;
+            case OpSelectionMerge:
+                sh->branchMerge = w[1];
+                break;
+            case OpKill: case OpTerminateInvocation: case OpDemoteToHelperInvocation:
+                if (sh->execModel != ExecFragment)
+                    unsupported(OpKill, stage);
+                if (sh->discard)
+                    fail("fragment shader has more than one discard; the GS has one alpha test per draw");
+                if (!sh->branches) {
+                    sh->discard = DISCARD_ALWAYS;
+                } else if (sh->lastLabel == sh->branchTrue && sh->branchTrue != sh->branchMerge) {
+                    sh->discard = DISCARD_IF;
+                } else if (sh->lastLabel == sh->branchFalse && sh->branchFalse != sh->branchMerge) {
+                    sh->discard = DISCARD_IF;
+                    sh->discardInv = 1;
+                } else {
+                    fail("fragment shader discards outside its 'if'; " DISCARD_FORM);
+                }
+                /* A store in the block that discards is never seen. */
+                if (op != OpDemoteToHelperInvocation && sh->storeLabel == sh->lastLabel) {
+                    sh->colorValue = sh->prevColorValue;
+                    sh->textureFunction = sh->prevTextureFunction;
+                }
                 break;
             case OpLabel:
                 new_op(sh->body, &sh->bodyCount, OpLabel, w[1]);
@@ -1532,6 +1698,17 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             }
             case OpBranchConditional: {
                 BodyOp *b;
+                if (sh->execModel == ExecFragment) {
+                    if (!ids[w[1]].fragCmp)
+                        unsupported(op, stage);
+                    if (sh->branches++)
+                        fail("fragment shader has more than one 'if'; the GS has one alpha test per draw");
+                    sh->branchLine  = g_line;
+                    sh->branchCond  = w[1];
+                    sh->branchTrue  = w[2];
+                    sh->branchFalse = w[3];
+                    break;
+                }
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 b = new_op(sh->body, &sh->bodyCount, OpBranchConditional, 0);
@@ -1587,6 +1764,23 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 uint32_t id = w[2], a, c;
                 int swap, zero, inv;
 
+                if (sh->execModel == ExecFragment) {
+                    /* alpha CMP constant, whichever side the constant is on. */
+                    int left = frag_alpha(ids, sh, w[3]), right = frag_alpha(ids, sh, w[4]);
+                    uint32_t k = left ? w[4] : w[3];
+                    int cmp = frag_compare(op, !left);
+
+                    if (!cmp || !left == !right || ids[k].kind != ID_CONST || ids[k].compCount != 1 ||
+                        !is_float(ids, ids[k].valType))
+                        fail("fragment shader compares something other than the alpha of its color with a "
+                             "constant; " DISCARD_FORM);
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    ids[id].fragAlpha = left ? left : right;
+                    ids[id].fragCmp = cmp;
+                    memcpy(&ids[id].fragRef, &ids[k].comps[0], sizeof(float));
+                    break;
+                }
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 compare_kind(op, &swap, &zero, &inv);
@@ -1621,6 +1815,11 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 break;
             }
             case OpLogicalNot:
+                if (sh->execModel == ExecFragment && ids[w[3]].fragCmp) {
+                    ids[w[2]] = ids[w[3]];
+                    ids[w[2]].fragCmp = frag_not(ids[w[3]].fragCmp);
+                    break;
+                }
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 if (!ids[w[3]].boolKind)
@@ -1727,6 +1926,13 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     ids[id].kind = ID_VALUE;
                     ids[id].valType = w[1];
                     ids[id].instanceIndex = 1;
+                    break;
+                }
+                if (ids[ptr].kind == ID_PTR && ids[ptr].fragAlpha) {
+                    /* outColor.a read back */
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    ids[id].fragAlpha = ids[ptr].fragAlpha;
                     break;
                 }
                 if ((ids[ptr].kind != ID_VAR && ids[ptr].kind != ID_PTR) || ids[ptr].fromInput < 0)
@@ -1998,6 +2204,16 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 Field fl[1];
                 int size;
 
+                if (sh->execModel == ExecFragment) {
+                    int whose = frag_color(ids, sh, src);
+
+                    if (!whose || n != 5 || w[4] != 3)
+                        fail("fragment shader reads something other than the alpha of its color; " DISCARD_FORM);
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    ids[id].fragAlpha = whose;
+                    break;
+                }
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 size = value_size(ids, src, stage);
@@ -2174,14 +2390,23 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 if (ids[base].kind == ID_VAR && ids[base].fromInput >= 0) {
                     /* in.w read straight from the input: glslang emits this instead of
                      * OpCompositeExtract when debug info is on. */
-                    if (sh->execModel != ExecVertex)
-                        unsupported(OpCompositeExtract, stage);
+                    if (sh->execModel == ExecFragment &&
+                        (ids[base].fromInput != sh->colorInput || n != 5 || ids[w[4]].kind != ID_CONST ||
+                         ids[w[4]].value != 3))
+                        fail("fragment shader reads something other than the alpha of its color; " DISCARD_FORM);
                     if (n != 5 || ids[w[4]].kind != ID_CONST || ids[w[4]].value >= 4)
                         fail("vertex shader indexes an input with something other than a "
                              "constant component; only in.x .. in.w is supported so far");
                     ids[id].kind = ID_PTR;
                     ids[id].fromInput = ids[base].fromInput;
                     ids[id].comp = (int)ids[w[4]].value;
+                    break;
+                }
+                if (sh->execModel == ExecFragment && base && base == sh->colorVar) {
+                    if (n != 5 || ids[w[4]].kind != ID_CONST || ids[w[4]].value != 3)
+                        fail("fragment shader reads something other than the alpha of its color; " DISCARD_FORM);
+                    ids[id].kind = ID_PTR;
+                    ids[id].fragAlpha = ALPHA_OUTPUT;
                     break;
                 }
                 if (base != sh->positionVar || n != 5 || ids[w[4]].kind != ID_CONST)
@@ -2209,6 +2434,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                         fail("corrupt SPIR-V: fragment shader stores the sampler itself");
                     if (ptr != sh->colorVar)
                         fail("fragment shader writes to something other than its output");
+                    sh->prevColorValue = sh->colorValue;
+                    sh->prevTextureFunction = sh->textureFunction;
+                    sh->storeLabel = sh->lastLabel;
                     sh->colorValue = val;
                     sh->textureFunction = ids[val].texel == TEXEL_SAMPLE ? 1 : 0;
                     break;
@@ -2302,9 +2530,20 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             fail("vertex shader declares a color output but never writes it");
         if (sh->texcoordVar && !sh->texcoordValue)
             fail("vertex shader declares a texture coordinate output but never writes it");
-    } else if (!sh->colorValue) {
-        fail("fragment shader must write 'outColor = <color input>;' or "
-             "'outColor = texture(<sampler>, <texcoord input>);'");
+    } else {
+        g_line = sh->branchLine;
+        if (sh->branches && sh->discard != DISCARD_IF)
+            fail("fragment shader has an 'if' that does not discard: the GS cannot run code per pixel");
+        if (!sh->colorValue && sh->discard != DISCARD_ALWAYS)
+            fail("fragment shader must write 'outColor = <color input>;' or "
+                 "'outColor = texture(<sampler>, <texcoord input>);'");
+        if (sh->discard == DISCARD_IF) {
+            int tested = ids[sh->branchCond].fragAlpha, written = frag_color(ids, sh, sh->colorValue);
+
+            if (tested != ALPHA_OUTPUT && tested != written)
+                fail("fragment shader discards on the alpha of %s but writes %s; " DISCARD_FORM,
+                     frag_color_name(tested), frag_color_name(written));
+        }
     }
 }
 
@@ -3508,13 +3747,19 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
 static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base, const char *sym)
 {
     FILE *f = open_out(base, ".c");
-    int texel = ids[sh->colorValue].texel;
-    int usesColor = texel == TEXEL_NONE || texel == TEXEL_SAMPLE_TIMES_COLOR;
+    int texel = sh->colorValue ? ids[sh->colorValue].texel : TEXEL_NONE;
+    int usesColor = sh->colorValue && (texel == TEXEL_NONE || texel == TEXEL_SAMPLE_TIMES_COLOR);
     int usesTexture = texel != TEXEL_NONE;
+    int atst = 0, aref = 0;
+
+    if (sh->discard)
+        frag_alpha_test(sh, ids, &atst, &aref);
 
     fprintf(f, "/* Generated by ps2vk-shaderc from %s. Do not edit. */\n", g_src);
     fprintf(f, "#include \"ps2vk.h\"\n\n");
-    if (texel == TEXEL_NONE)
+    if (!sh->colorValue)
+        fprintf(f, "/* discard: every pixel fails the GS alpha test. */\n");
+    else if (texel == TEXEL_NONE)
         fprintf(f, "/* outColor = interpolated color: Gouraud shading, no texture. */\n");
     else if (texel == TEXEL_SAMPLE)
         fprintf(f, "/* outColor = texture sample: GS decal, the vertex color is ignored. */\n");
@@ -3535,6 +3780,9 @@ static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base,
     fprintf(f, "    .textureFunction = %d,\n", usesTexture ? sh->textureFunction : 0);
     fprintf(f, "    .samplerBinding = %d,\n", usesTexture ? sh->samplerBinding : -1);
     fprintf(f, "    .samplerSet = %d,\n", usesTexture ? sh->samplerSet : -1);
+    fprintf(f, "    .alphaTest = %d,\n", sh->discard ? 1 : 0);
+    fprintf(f, "    .alphaTestFunction = %d,\n", atst);
+    fprintf(f, "    .alphaTestReference = %d,\n", aref);
     fprintf(f, "};\n");
     fclose(f);
 }
