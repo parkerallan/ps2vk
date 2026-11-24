@@ -16,8 +16,10 @@ const PvkShaderCode tex_no_color_vert = {
     .inputLocations = { 0, 1 },
     .colorOutputLocation = -1,
     .texcoordOutputLocation = 3,
+    .fogOutputLocation = -1,
     .pushConstantBytes = 0,
     .uniformBlockCount = 0,
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
+    .fogInputLocation = -1,
 };

@@ -55,8 +55,7 @@
 #define PVK_VU1_INPUT_HEADER      4   /* qwords before the first unpacked vertex */
 
 #define PVK_VU1_OUTPUT_ADDR       512
-#define PVK_VU1_OUTPUT_PER_VERTEX 2   /* RGBAQ, XYZ2 */
-#define PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED 3 /* ST, RGBAQ, XYZ2 */
+#define PVK_VU1_OUTPUT_PER_VERTEX 2   /* RGBAQ, XYZ2; one more each for ST and for FOG */
 
 /* VF register a textured vertex shader builds its ST (S/w, T/w, Q = 1/w) or UV output in. */
 #define PVK_VU1_TEXCOORD_REG      19

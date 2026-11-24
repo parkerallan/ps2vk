@@ -8,6 +8,7 @@ const PvkShaderCode tex_set_frag = {
     .entryPoint = "main",
     .colorOutputLocation = -1,
     .texcoordOutputLocation = -1,
+    .fogOutputLocation = -1,
     .colorInputLocation = -1,
     .texcoordInputLocation = 1,
     .gouraud = 0,
@@ -18,4 +19,7 @@ const PvkShaderCode tex_set_frag = {
     .alphaTest = 0,
     .alphaTestFunction = 0,
     .alphaTestReference = 0,
+    .fogInputLocation = -1,
+    .fog = 0,
+    .fogColor = 0x000000,
 };

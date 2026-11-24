@@ -21,6 +21,7 @@ const PvkShaderCode uniform_bones_vert = {
     .inputLocations = { 0, 1 },
     .colorOutputLocation = -1,
     .texcoordOutputLocation = -1,
+    .fogOutputLocation = -1,
     .pushConstantBytes = 0,
     .uniformBlockCount = 2,
     .uniformBlocks = {
@@ -29,4 +30,5 @@ const PvkShaderCode uniform_bones_vert = {
     },
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
+    .fogInputLocation = -1,
 };

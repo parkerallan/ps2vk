@@ -24,6 +24,7 @@ const PvkShaderCode loop_unrolled_vert = {
     .inputLocations = { 0, 1, 2 },
     .colorOutputLocation = 0,
     .texcoordOutputLocation = -1,
+    .fogOutputLocation = -1,
     .pushConstantBytes = 0,
     .uniformBlockCount = 2,
     .uniformBlocks = {
@@ -32,4 +33,5 @@ const PvkShaderCode loop_unrolled_vert = {
     },
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
+    .fogInputLocation = -1,
 };

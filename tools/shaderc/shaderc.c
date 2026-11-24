@@ -32,6 +32,7 @@
  *             outColor = texture(tex, vUV);           (GS TFX decal)
  *             outColor = texture(tex, vUV) * vColor;  (GS TFX modulate)
  *             if (<that color>.a < <constant>) discard;  (GS alpha test)
+ *             outColor = vec4(mix(<constant vec3>, <that color>.rgb, vFog), <that color>.a);  (GS fog)
  *
  * Anything else is rejected with an error that says why, the way a Vulkan
  * driver rejects a shader that uses a feature the device lacks.
@@ -209,6 +210,10 @@ typedef struct {
     int      fragAlpha;      /* ALPHA_*: the color this float is the alpha of, or this comparison tests */
     int      fragCmp;        /* CMP_*: a comparison "alpha CMP fragRef" */
     float    fragRef;
+    int      fragKind;       /* FK_*: a piece of 'vec4(mix(<constant>, <color>.rgb, <fog>), <color>.a)' */
+    int      fragClass;      /* ALPHA_*: the color that piece comes from */
+    uint32_t fragSrc;        /* FK_FOGGED: the fog color constant; FK_FOGGED_COMP: the mix */
+    int      fragFogged;     /* a color mixed with a fog color */
     const char *name;
 } IdInfo;
 
@@ -216,6 +221,8 @@ enum { TEXEL_NONE, TEXEL_SAMPLER, TEXEL_SAMPLE, TEXEL_SAMPLE_TIMES_COLOR };
 /* Whose alpha: one of the three colors a fragment shader can write, or whatever outColor holds. */
 enum { ALPHA_NONE, ALPHA_COLOR, ALPHA_SAMPLE, ALPHA_SAMPLE_TIMES_COLOR, ALPHA_OUTPUT };
 enum { CMP_NONE, CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_EQ, CMP_NE };
+/* <color>.rgb, vec3(<fog>), the mix of the two with the fog color, one component of that mix */
+enum { FK_NONE, FK_RGB, FK_FOG_VEC, FK_FOGGED, FK_FOGGED_COMP };
 
 typedef struct {
     int location;
@@ -302,6 +309,8 @@ enum { DISCARD_NONE, DISCARD_IF, DISCARD_ALWAYS };
 
 #define DISCARD_FORM "the GS discards a pixel only by comparing the alpha of the color written " \
                      "with a constant: 'if (<color>.a < <constant>) discard;'"
+#define FOG_FORM "the GS fogs a pixel only by mixing its red, green and blue with a constant color by " \
+                 "the float input: 'vec4(mix(<constant vec3>, <color>.rgb, <float input>), <color>.a)'"
 
 static void unsupported(uint32_t op, const char *stage)
 {
@@ -505,7 +514,7 @@ typedef struct {
     uint32_t line;                  /* GLSL line, 0 if unknown */
 } BodyOp;
 
-enum { OUT_POSITION, OUT_COLOR, OUT_TEXCOORD, OUT_COUNT };
+enum { OUT_POSITION, OUT_COLOR, OUT_TEXCOORD, OUT_FOG, OUT_COUNT };
 enum { FIELD_ZERO = -1, FIELD_ONE = -2, FIELD_UNDEF = -3 };
 #define SHUFFLE_UNDEF 0xffffffffu
 
@@ -567,6 +576,13 @@ typedef struct {
     uint32_t texcoordVar;           /* vertex: the vec2 output variable, 0 if none */
     int      texcoordLocation;      /* -1 if none */
     uint32_t texcoordValue;         /* value id stored to the texcoord output, 0 if never */
+    uint32_t fogVar;                /* vertex: the float output variable, 0 if none */
+    int      fogLocation;           /* -1 if none */
+    uint32_t fogValue;              /* value id stored to the fog output, 0 if never */
+    int      fogInput;              /* fragment: index into inputs[] of the float input, -1 if none */
+    int      fogged;                /* fragment: the color written is mixed with a fog color */
+    uint32_t fogColor;              /* that color as GS FOGCOL */
+    int      prevFogged;            /* fogged before the last store to outColor */
     uint32_t pushVar;               /* push constant block variable, 0 if none */
     uint32_t instanceIndexVar;      /* gl_InstanceIndex, 0 if none */
     uint32_t pushBytes;             /* size of the push constant block */
@@ -998,7 +1014,7 @@ static void renumber_maps(IdInfo *ids, Shader *sh)
 static void rebuild_phis(IdInfo *ids, Shader *sh)
 {
     static BodyOp out[MAX_BODY];
-    uint32_t *outValue[OUT_COUNT] = { &sh->positionValue, &sh->colorValue, &sh->texcoordValue };
+    uint32_t *outValue[OUT_COUNT] = { &sh->positionValue, &sh->colorValue, &sh->texcoordValue, &sh->fogValue };
     uint32_t synth[OUT_COUNT] = { 0 }, label = 0;
     int n = 0, stores[OUT_COUNT] = { 0 };
 
@@ -1088,13 +1104,13 @@ static void place_const_loads(IdInfo *ids, Shader *sh)
 {
     static BodyOp out[MAX_BODY];
     uint32_t loaded[CONST_QWORDS];   /* in the current block: value id holding qword q, 0 if none */
-    uint32_t *outputs[3] = { &sh->positionValue, &sh->colorValue, &sh->texcoordValue };
+    uint32_t *outputs[OUT_COUNT] = { &sh->positionValue, &sh->colorValue, &sh->texcoordValue, &sh->fogValue };
     int n = 0;
 
     memset(loaded, 0, sizeof(loaded));
     for (int i = 0; i <= sh->bodyCount; i++) {
         BodyOp *b = i < sh->bodyCount ? &sh->body[i] : NULL;
-        int nops = b ? b->nops : 3;
+        int nops = b ? b->nops : OUT_COUNT;
 
         if (b && b->op == OpLabel)
             memset(loaded, 0, sizeof(loaded));
@@ -1143,7 +1159,7 @@ static void place_const_loads(IdInfo *ids, Shader *sh)
 /* Which of the colors a fragment shader can write a vec4 value is, ALPHA_NONE if none. */
 static int frag_color(const IdInfo *ids, const Shader *sh, uint32_t id)
 {
-    if (ids[id].kind != ID_VALUE)
+    if (ids[id].kind != ID_VALUE || ids[id].fragKind)
         return ALPHA_NONE;
     if (ids[id].texel == TEXEL_SAMPLE)
         return ALPHA_SAMPLE;
@@ -1158,7 +1174,7 @@ static int frag_color(const IdInfo *ids, const Shader *sh, uint32_t id)
 /* Whose alpha a float value is, ALPHA_NONE if it is no alpha. */
 static int frag_alpha(const IdInfo *ids, const Shader *sh, uint32_t id)
 {
-    if (ids[id].kind != ID_VALUE || ids[id].fragCmp)
+    if (ids[id].kind != ID_VALUE || ids[id].fragCmp || ids[id].fragKind)
         return ALPHA_NONE;
     if (ids[id].fragAlpha)
         return ids[id].fragAlpha;
@@ -1176,6 +1192,39 @@ static const char *frag_color_name(int whose)
     case ALPHA_SAMPLE_TIMES_COLOR: return "the texture sample times the color input";
     default: return "another value";
     }
+}
+
+/* Nonzero if the value is the fragment shader's float input, the fog amount. */
+static int frag_is_fog(const IdInfo *ids, const Shader *sh, uint32_t id)
+{
+    return ids[id].kind == ID_VALUE && sh->fogInput >= 0 && ids[id].fromInput == sh->fogInput &&
+           !ids[id].fragKind && !ids[id].fragAlpha;
+}
+
+/* Makes id the color `whose`, fogged: what 'vec4(mix(...), <color>.a)' comes to. */
+static void frag_define_fogged(IdInfo *ids, const Shader *sh, uint32_t id, uint32_t type, int whose)
+{
+    ids[id].kind = ID_VALUE;
+    ids[id].valType = type;
+    ids[id].texel = whose == ALPHA_SAMPLE ? TEXEL_SAMPLE
+                  : whose == ALPHA_SAMPLE_TIMES_COLOR ? TEXEL_SAMPLE_TIMES_COLOR : TEXEL_NONE;
+    if (whose == ALPHA_COLOR)
+        ids[id].fromInput = sh->colorInput;
+    ids[id].fragFogged = 1;
+}
+
+/* A constant vec3 in 0..1 as GS FOGCOL: red in bits 0-7, green 8-15, blue 16-23. */
+static uint32_t frag_fogcol(const IdInfo *c)
+{
+    uint32_t out = 0;
+
+    for (int i = 0; i < 3; i++) {
+        float v;
+        memcpy(&v, &c->comps[i], sizeof(v));
+        v = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+        out |= (uint32_t)(v * 255.0f + 0.5f) << (8 * i);
+    }
+    return out;
 }
 
 /* A float comparison as "alpha CMP constant"; constLeft when the SPIR-V has the constant first. */
@@ -1274,8 +1323,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 
     memset(sh, 0, sizeof(*sh));
     sh->execModel = ~0u;
-    sh->colorLocation = sh->texcoordLocation = -1;
-    sh->colorInput = sh->texcoordInput = sh->samplerBinding = sh->samplerSet = -1;
+    sh->colorLocation = sh->texcoordLocation = sh->fogLocation = -1;
+    sh->colorInput = sh->texcoordInput = sh->fogInput = sh->samplerBinding = sh->samplerSet = -1;
     sh->constBase = bound;
     sh->nextId = bound + CONST_QWORDS;
     for (uint32_t i = 0; i < MAX_IDS; i++) {
@@ -1521,9 +1570,14 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                         fail("fragment shader has two vec2 inputs; the GS interpolates only one "
                              "texture coordinate pair");
                     sh->texcoordInput = sh->inputCount;
+                } else if (size == 1 && is_float(ids, pointee)) {
+                    if (sh->fogInput >= 0)
+                        fail("fragment shader has two float inputs; the GS interpolates only one "
+                             "fog amount");
+                    sh->fogInput = sh->inputCount;
                 } else {
-                    fail("fragment input '%s' must be a vec4 (the color) or a vec2 (the texture "
-                         "coordinate); the GS interpolates nothing else", name);
+                    fail("fragment input '%s' must be a vec4 (the color), a vec2 (the texture "
+                         "coordinate) or a float (the fog amount); the GS interpolates nothing else", name);
                 }
                 if (sh->inputCount == MAX_INPUTS)
                     fail("too many inputs (max %d)", MAX_INPUTS);
@@ -1587,9 +1641,15 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                                  "interpolates only one pair (S, T)");
                         sh->texcoordVar = id;
                         sh->texcoordLocation = ids[id].location;
+                    } else if (size == 1 && is_float(ids, pointee) && sh->execModel == ExecVertex) {
+                        if (sh->fogVar)
+                            fail("vertex shader has 2 float outputs; the GS interpolates only one "
+                                 "fog amount");
+                        sh->fogVar = id;
+                        sh->fogLocation = ids[id].location;
                     } else if (sh->execModel == ExecVertex) {
-                        fail("vertex output '%s' must be a vec4 (the color) or a vec2 (the "
-                             "texture coordinate); the GS interpolates nothing else", name);
+                        fail("vertex output '%s' must be a vec4 (the color), a vec2 (the texture "
+                             "coordinate) or a float (the fog amount); the GS interpolates nothing else", name);
                     } else {
                         fail("fragment output '%s' must be a vec4", name);
                     }
@@ -1610,8 +1670,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         if (sh->execModel == ExecFragment) {
             if (sh->inputs[i].size == 4)
                 sh->colorInput = i;
-            else
+            else if (sh->inputs[i].size == 2)
                 sh->texcoordInput = i;
+            else
+                sh->fogInput = i;
         }
     }
 
@@ -1681,6 +1743,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 if (op != OpDemoteToHelperInvocation && sh->storeLabel == sh->lastLabel) {
                     sh->colorValue = sh->prevColorValue;
                     sh->textureFunction = sh->prevTextureFunction;
+                    sh->fogged = sh->prevFogged;
                 }
                 break;
             case OpLabel:
@@ -2139,6 +2202,21 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 const char *name = "dot";
                 BodyOp *b;
 
+                if (sh->execModel == ExecFragment && op == OpExtInst && w[3] == sh->glsl450 && ext == GlslFMix &&
+                    nargs == 3) {
+                    /* mix(<constant vec3>, <color>.rgb, <fog>) */
+                    uint32_t k = args[0], rgb = args[1], amount = args[2];
+
+                    if (ids[k].kind != ID_CONST || ids[k].compCount != 3 || ids[rgb].fragKind != FK_RGB ||
+                        !(ids[amount].fragKind == FK_FOG_VEC || frag_is_fog(ids, sh, amount)))
+                        fail("fragment shader's mix() is not the fog mix; " FOG_FORM);
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    ids[id].fragKind = FK_FOGGED;
+                    ids[id].fragClass = ids[rgb].fragClass;
+                    ids[id].fragSrc = k;
+                    break;
+                }
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 if (op == OpExtInst) {
@@ -2204,6 +2282,15 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 Field fl[1];
                 int size;
 
+                if (sh->execModel == ExecFragment && ids[src].fragKind == FK_FOGGED && n == 5 && w[4] < 3) {
+                    /* one of the mix's three components, on its way into the vec4 */
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    ids[id].fragKind = FK_FOGGED_COMP;
+                    ids[id].fragSrc = src;
+                    ids[id].comp = (int)w[4];
+                    break;
+                }
                 if (sh->execModel == ExecFragment) {
                     int whose = frag_color(ids, sh, src);
 
@@ -2230,6 +2317,19 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 int size1, size2, size = (int)(n - 5);
                 Field fl[4];
 
+                if (sh->execModel == ExecFragment) {
+                    /* <color>.rgb */
+                    int whose = frag_color(ids, sh, v1);
+
+                    if (!whose || v2 != v1 || size != 3 || w[5] != 0 || w[6] != 1 || w[7] != 2 ||
+                        ids[v1].fragFogged)
+                        fail("fragment shader swizzles something other than the .rgb of its color; " FOG_FORM);
+                    ids[id].kind = ID_VALUE;
+                    ids[id].valType = w[1];
+                    ids[id].fragKind = FK_RGB;
+                    ids[id].fragClass = whose;
+                    break;
+                }
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 size1 = value_size(ids, v1, stage);
@@ -2258,6 +2358,32 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 int size, total = 0;
                 Field fl[4];
 
+                if (sh->execModel == ExecFragment) {
+                    uint32_t a = w[3], mix = 0, alpha = 0;
+
+                    if (n == 6 && frag_is_fog(ids, sh, a) && w[4] == a && w[5] == a) {
+                        /* vec3(<fog>): how glslang passes a float as mix()'s third argument */
+                        ids[id].kind = ID_VALUE;
+                        ids[id].valType = w[1];
+                        ids[id].fragKind = FK_FOG_VEC;
+                        break;
+                    }
+                    if (n == 5 && ids[a].fragKind == FK_FOGGED) {
+                        mix = a;
+                        alpha = w[4];
+                    } else if (n == 7 && ids[a].fragKind == FK_FOGGED_COMP && ids[a].comp == 0 &&
+                               ids[w[4]].fragKind == FK_FOGGED_COMP && ids[w[4]].comp == 1 &&
+                               ids[w[5]].fragKind == FK_FOGGED_COMP && ids[w[5]].comp == 2 &&
+                               ids[w[4]].fragSrc == ids[a].fragSrc && ids[w[5]].fragSrc == ids[a].fragSrc) {
+                        mix = ids[a].fragSrc;
+                        alpha = w[6];
+                    }
+                    if (!mix || frag_alpha(ids, sh, alpha) != ids[mix].fragClass)
+                        fail("fragment shader builds a vector other than the fogged color; " FOG_FORM);
+                    frag_define_fogged(ids, sh, id, w[1], ids[mix].fragClass);
+                    ids[id].fragSrc = ids[mix].fragSrc;
+                    break;
+                }
                 if (sh->execModel != ExecVertex)
                     unsupported(op, stage);
                 size = type_size(ids, w[1]);
@@ -2436,7 +2562,11 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                         fail("fragment shader writes to something other than its output");
                     sh->prevColorValue = sh->colorValue;
                     sh->prevTextureFunction = sh->textureFunction;
+                    sh->prevFogged = sh->fogged;
                     sh->storeLabel = sh->lastLabel;
+                    sh->fogged = ids[val].fragFogged;
+                    if (sh->fogged)
+                        sh->fogColor = frag_fogcol(&ids[ids[val].fragSrc]);
                     sh->colorValue = val;
                     sh->textureFunction = ids[val].texel == TEXEL_SAMPLE ? 1 : 0;
                     break;
@@ -2459,6 +2589,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                             fail("vertex shader stores something other than a vec2 to the texture "
                                  "coordinate output");
                         out = OUT_TEXCOORD;
+                    } else if (ptr && ptr == sh->fogVar) {
+                        if (value_size(ids, val, stage) != 1)
+                            fail("vertex shader stores something other than a float to the fog output");
+                        out = OUT_FOG;
                     } else {
                         fail("%s shader writes to something other than its outputs", stage);
                     }
@@ -2502,6 +2636,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             used[root(ids, sh->colorValue)] = 1;
         if (sh->texcoordValue)
             used[root(ids, sh->texcoordValue)] = 1;
+        if (sh->fogValue)
+            used[root(ids, sh->fogValue)] = 1;
         for (int i = 0; i < sh->bodyCount; i++)
             if (is_map_op(sh->body[i].op) && !used[sh->body[i].result])
                 sh->body[i].dead = 1;
@@ -2530,6 +2666,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             fail("vertex shader declares a color output but never writes it");
         if (sh->texcoordVar && !sh->texcoordValue)
             fail("vertex shader declares a texture coordinate output but never writes it");
+        if (sh->fogVar && !sh->fogValue)
+            fail("vertex shader declares a fog output but never writes it");
     } else {
         g_line = sh->branchLine;
         if (sh->branches && sh->discard != DISCARD_IF)
@@ -3308,6 +3446,8 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         r.lastUse[canon(ids, sh, sh->texcoordValue)] = MAX_BODY;
         r.busy[PVK_VU1_TEXCOORD_REG] = 1;   /* the STQ output lives there */
     }
+    if (sh->fogValue)
+        r.lastUse[canon(ids, sh, sh->fogValue)] = MAX_BODY;
     /* A value from before a loop that the loop reads must outlive every
      * iteration: its last read becomes the branch back to the loop's start. */
     for (i = 0; i < sh->bodyCount; i++) {
@@ -3380,7 +3520,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     snprintf(buf, sizeof(buf), "ilw.z         VI12,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_CULL);
     vu(f, "NOP", buf, "vertices per triangle, 0 = no culling");
 
-    for (i = 0; i <= sh->bodyCount + 2; i++) {
+    for (i = 0; i <= sh->bodyCount + 3; i++) {
         uint32_t use[MAX_OPERANDS] = { 0 };
         if (i < sh->bodyCount) {
             for (int j = 0; j < sh->body[i].nops && !sh->body[i].dead; j++)
@@ -3389,8 +3529,10 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             use[0] = sh->positionValue;
         } else if (i == sh->bodyCount + 1) {
             use[0] = sh->colorValue;
-        } else {
+        } else if (i == sh->bodyCount + 2) {
             use[0] = sh->texcoordValue;
+        } else {
+            use[0] = sh->fogValue;
         }
         for (int j = 0; j < MAX_OPERANDS; j++) {
             uint32_t c = use[j] ? root(ids, use[j]) : 0, k;
@@ -3592,6 +3734,8 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         reg_ensure_loaded(f, &r, ids, sh, sh->colorValue);
     if (sh->texcoordValue)
         reg_ensure_loaded(f, &r, ids, sh, sh->texcoordValue);
+    if (sh->fogValue)
+        reg_ensure_loaded(f, &r, ids, sh, sh->fogValue);
     snprintf(buf, sizeof(buf), "move.xyzw     VF20,VF%02d", reg_of(&r, ids, sh, sh->positionValue));
     vu(f, "NOP", buf, "gl_Position");
     if (sh->colorValue) {
@@ -3606,6 +3750,14 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
                  reg_of(&r, ids, sh, sh->texcoordValue));
         snprintf(buf2, sizeof(buf2), "texture coordinate output, location %d", sh->texcoordLocation);
         vu(f, "NOP", buf, buf2);
+    }
+    if (sh->fogValue) {
+        /* The fog amount rides in VF22's w field, which the position leaves free. */
+        char c = "xyzw"[ids[sh->fogValue].comp];
+        vu(f, "sub.w         VF22,VF00,VF00", "NOP", NULL);
+        snprintf(buf, sizeof(buf), "max%c.w        VF22,VF22,VF%02d%c", c, reg_of(&r, ids, sh, sh->fogValue), c);
+        snprintf(buf2, sizeof(buf2), "fog output, location %d, not below 0", sh->fogLocation);
+        vu(f, buf, "NOP", buf2);
     }
 
     fprintf(f, "; epilogue: perspective divide, viewport, GS formats, store\n");
@@ -3640,20 +3792,29 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     vu(f, "ftoi0.z       VF23,VF22", "NOP", "z to integer depth");
     vu(f, "mul.xyzw      VF24,VF21,VF03", "NOP", "color 0..1 to GS range");
     vu(f, "ftoi0.xyzw    VF24,VF24", "NOP", NULL);
-    if (sh->texcoordValue) {
-        snprintf(buf, sizeof(buf), "sq            VF%02d,0(VI05)", PVK_VU1_TEXCOORD_REG);
-        vu(f, "NOP", buf, "ST (and Q), or UV");
-        vu(f, "NOP", "sq            VF24,1(VI05)", "RGBAQ");
-    } else {
-        vu(f, "NOP", "sq            VF24,0(VI05)", "RGBAQ");
+    if (sh->fogValue) {
+        vu(f, "miniw.w       VF22,VF22,VF00w", "NOP", "fog not above 1");
+        vu(f, "mulx.w        VF22,VF22,VF03x", "NOP", "fog 0..1 to 0..255");
+        vu(f, "ftoi4.w       VF22,VF22", "NOP", "the FOG register's F field starts at bit 4 of w");
     }
-    emit_cull(f, sym);
-    if (sh->texcoordValue) {
-        vu(f, "NOP", "sq            VF23,2(VI05)", "XYZ2 (draws unless ADC is set)");
-        snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED);
-    } else {
-        vu(f, "NOP", "sq            VF23,1(VI05)", "XYZ2 (draws unless ADC is set)");
-        snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX);
+    {
+        /* [ST,] RGBAQ, [FOG,] XYZ2 */
+        int st = sh->texcoordValue ? 1 : 0, fog = sh->fogValue ? 1 : 0;
+
+        if (st) {
+            snprintf(buf, sizeof(buf), "sq            VF%02d,0(VI05)", PVK_VU1_TEXCOORD_REG);
+            vu(f, "NOP", buf, "ST (and Q), or UV");
+        }
+        snprintf(buf, sizeof(buf), "sq            VF24,%d(VI05)", st);
+        vu(f, "NOP", buf, "RGBAQ");
+        if (fog) {
+            snprintf(buf, sizeof(buf), "sq            VF22,%d(VI05)", st + 1);
+            vu(f, "NOP", buf, "FOG");
+        }
+        emit_cull(f, sym);
+        snprintf(buf, sizeof(buf), "sq            VF23,%d(VI05)", st + fog + 1);
+        vu(f, "NOP", buf, "XYZ2 (draws unless ADC is set)");
+        snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX + st + fog);
     }
     vu(f, "NOP", buf, NULL);
     vu(f, "NOP", "iadd          VI03,VI03,VI07", "next vertex");
@@ -3728,6 +3889,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     fprintf(f, " },\n");
     fprintf(f, "    .colorOutputLocation = %d,\n", sh->colorValue ? sh->colorLocation : -1);
     fprintf(f, "    .texcoordOutputLocation = %d,\n", sh->texcoordValue ? sh->texcoordLocation : -1);
+    fprintf(f, "    .fogOutputLocation = %d,\n", sh->fogValue ? sh->fogLocation : -1);
     fprintf(f, "    .pushConstantBytes = %u,\n", (unsigned)sh->pushBytes);
     fprintf(f, "    .uniformBlockCount = %d,\n", sh->uniformCount);
     if (sh->uniformCount) {
@@ -3740,6 +3902,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     }
     fprintf(f, "    .colorInputLocation = -1,\n");
     fprintf(f, "    .texcoordInputLocation = -1,\n");
+    fprintf(f, "    .fogInputLocation = -1,\n");
     fprintf(f, "};\n");
     fclose(f);
 }
@@ -3771,6 +3934,7 @@ static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base,
     fprintf(f, "    .entryPoint = \"%s\",\n", sh->entryPoint);
     fprintf(f, "    .colorOutputLocation = -1,\n");
     fprintf(f, "    .texcoordOutputLocation = -1,\n");
+    fprintf(f, "    .fogOutputLocation = -1,\n");
     fprintf(f, "    .colorInputLocation = %d,\n",
             usesColor && sh->colorInput >= 0 ? sh->inputs[sh->colorInput].location : -1);
     fprintf(f, "    .texcoordInputLocation = %d,\n",
@@ -3783,6 +3947,9 @@ static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base,
     fprintf(f, "    .alphaTest = %d,\n", sh->discard ? 1 : 0);
     fprintf(f, "    .alphaTestFunction = %d,\n", atst);
     fprintf(f, "    .alphaTestReference = %d,\n", aref);
+    fprintf(f, "    .fogInputLocation = %d,\n", sh->fogged ? sh->inputs[sh->fogInput].location : -1);
+    fprintf(f, "    .fog = %d,\n", sh->fogged ? 1 : 0);
+    fprintf(f, "    .fogColor = 0x%06x,\n", sh->fogged ? (unsigned)sh->fogColor : 0u);
     fprintf(f, "};\n");
     fclose(f);
 }

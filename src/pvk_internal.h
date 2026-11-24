@@ -408,7 +408,7 @@ struct PvkPipeline_T {
     uint32_t uniformSlots[PVK_MAX_UNIFORM_BLOCKS]; /* bindings[] slot of each vs->uniformBlocks[] entry in its set layout */
     uint32_t vertexQwords;    /* qwords per vertex in VU1 memory: the vertex-rate inputs */
     uint32_t instanceQwords;  /* qwords per instance: the instance-rate inputs, 0 = none */
-    uint32_t outputQwords;    /* qwords per vertex VU1 emits: RGBAQ, XYZ2, plus ST when textured */
+    uint32_t outputQwords;    /* qwords per vertex VU1 emits: RGBAQ, XYZ2, plus ST when textured, plus FOG */
     struct PvkVertexBinding vertexBindings[PVK_MAX_VERTEX_BINDINGS];
     uint32_t align;           /* batches start on a vertex that is a multiple of this: lcm of the vertex-rate bindings' align */
     uint32_t instanceAlign;   /* the same for the instance-rate bindings */
@@ -427,6 +427,8 @@ struct PvkPipeline_T {
     uint32_t fba;             /* GS FBA: written pixels get the stencil bit set */
     int      stencilNever;    /* the stencil test passes no pixel: draws are skipped */
     uint32_t ate, atst, aref; /* GS TEST.ATE/ATST/AREF: the alpha test of a fragment shader with a discard */
+    uint32_t texcoordOut, fogOut; /* VU1 emits ST (or UV), FOG per vertex */
+    uint32_t fogcol;          /* GS FOGCOL when the fragment shader fogs (PRIM.FGE) */
     uint32_t ztst;            /* GS TEST.ZTST: 0 never, 1 always, 2 >=, 3 > */
     uint32_t zmsk;            /* GS context it draws in: 2 (ZBUF_2.ZMSK = 1) when it writes no depth, else 1 */
     u64      alpha;           /* GS ALPHA */

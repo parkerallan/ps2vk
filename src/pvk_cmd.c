@@ -676,7 +676,7 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info)
 }
 
 /* Chain qwords cmd_gs_state() uses. */
-#define PVK_GS_STATE_QWORDS 17
+#define PVK_GS_STATE_QWORDS 18
 
 /* The scissor the draws use (the pipeline's, or the command buffer's when dynamic),
  * clipped to the attachment level, or to the GS's 2048x2048 when the attachment
@@ -717,6 +717,7 @@ static void cmd_gs_state(PvkCommandBuffer cmd, const PvkRect2D *scissor)
     int textured = p->fs->textured;
     const struct PvkDescriptorSlot *slot = textured ? &cmd->sets[p->samplerSet]->slots[p->samplerSlot] : NULL;
     int mipmapped = textured && slot->view->levels > 1;
+    int fog = (int)((p->prim >> 5) & 1); /* PRIM.FGE */
     u64 alpha = p->alpha, ctxt = p->zmsk;
     qword_t *q;
 
@@ -727,13 +728,15 @@ static void cmd_gs_state(PvkCommandBuffer cmd, const PvkRect2D *scissor)
     }
 
     q = cmd_open_direct(cmd);
-    q = gs_ad(q, GIF_SET_TAG((textured ? (mipmapped ? 9 : 7) : 3) + (p->stencilFormat != PVK_FORMAT_UNDEFINED), 0, 0,
+    q = gs_ad(q, GIF_SET_TAG((textured ? (mipmapped ? 9 : 7) : 3) + (p->stencilFormat != PVK_FORMAT_UNDEFINED) + fog, 0, 0,
                              0, GIF_FLG_PACKED, 1), GIF_REG_AD);
     /* Alpha test from the fragment shader's discard (a failing pixel writes nothing); depth and stencil test from the pipeline. */
     q = gs_ad(q, GS_SET_TEST(p->ate, p->atst, p->aref, 0, p->date, p->datm, 1, p->ztst), GS_REG_TEST_1 + ctxt);
     if (p->stencilFormat != PVK_FORMAT_UNDEFINED)
         q = gs_ad(q, GS_SET_FBA(p->fba), GS_REG_FBA_1 + ctxt);
     q = gs_ad(q, alpha, GS_REG_ALPHA_1 + ctxt);
+    if (fog)
+        q = gs_ad(q, p->fogcol, GS_REG_FOGCOL);
     q = gs_ad(q, GS_SET_SCISSOR(scissor->x, scissor->x + (int32_t)scissor->width - 1,
                                 scissor->y, scissor->y + (int32_t)scissor->height - 1), GS_REG_SCISSOR_1 + ctxt);
     if (textured) {
@@ -1948,9 +1951,16 @@ static void batch_begin(PvkCommandBuffer cmd, uint32_t count, uint32_t indexOffs
     const PvkPipeline p = cmd->pipeline;
     uint32_t fst = cmd_fst(cmd);
     float sign = p->strip && (first & 1) ? -p->cullSign : p->cullSign;
-    u64 regs = p->outputQwords == PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED
-             ? (fst ? GIF_REG_UV : GIF_REG_ST) | (GIF_REG_RGBAQ << 4) | (GIF_REG_XYZ2 << 8)
-             : GIF_REG_RGBAQ | (GIF_REG_XYZ2 << 4);
+    u64 regs = 0;
+    uint32_t n = 0;
+
+    /* [ST or UV,] RGBAQ, [FOG,] XYZ2: the order VU1 stores them in. */
+    if (p->texcoordOut)
+        regs |= (u64)(fst ? GIF_REG_UV : GIF_REG_ST) << (4 * n++);
+    regs |= (u64)GIF_REG_RGBAQ << (4 * n++);
+    if (p->fogOut)
+        regs |= (u64)GIF_REG_FOG << (4 * n++);
+    regs |= (u64)GIF_REG_XYZ2 << (4 * n++);
 
     cmd_flush(cmd);
     packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_INPUT_ADDR, 0);

@@ -1342,14 +1342,6 @@ typedef struct PvkShaderSpecConstant {
  * PvkShaderSpecConstant); a branch or loop count that depends on one stays a
  * branch, since its value is only known when the pipeline is created.
  *
- * A fragment shader becomes GS settings, so its discard has to fit the GS
- * alpha test: the discard is unconditional, or its condition compares the
- * alpha of the color the shader writes with a constant. shaderc turns the
- * condition into the comparison a kept pixel passes (alphaTestFunction,
- * alphaTestReference); a pixel that fails writes no color and no depth. GS
- * alpha has 8 bits with 128 for 1.0, and the comparison is carried out on
- * those steps. shaderc rejects a discard on any other condition.
- *
  * Applications never fill this in by hand: shaderc emits a .c file defining
  * one of these, and the application passes its address to
  * pvkCreateShaderModule().
@@ -1370,6 +1362,7 @@ typedef struct PvkShaderCode {
     uint32_t        inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< Vertex: input locations, in the order VU1 reads them. */
     int32_t         colorOutputLocation;   /**< Vertex: location of the color output, or -1 if none. */
     int32_t         texcoordOutputLocation;/**< Vertex: location of the vec2 texture coordinate output, or -1 if none. When set, VU1 emits ST (or UV for a sampler with unnormalizedCoordinates), RGBAQ, XYZ2 per vertex instead of RGBAQ, XYZ2. */
+    int32_t         fogOutputLocation;     /**< Vertex: location of the float output, the fog amount, or -1 if none. When set, VU1 clamps the value to 0..1 (0 = all fog, 1 = no fog, in 256 steps) and emits it per vertex in the GS FOG register, between RGBAQ and XYZ2; the GS interpolates it across the primitive. */
     uint32_t        pushConstantBytes;     /**< Vertex: size of its push constant block, 0 if it has none. */
     uint32_t        uniformBlockCount;     /**< Vertex: number of entries in uniformBlocks. */
     PvkShaderUniformBlock uniformBlocks[PVK_MAX_UNIFORM_BLOCKS]; /**< Vertex: its uniform blocks, in (set, binding) order. */
@@ -1381,9 +1374,12 @@ typedef struct PvkShaderCode {
     uint32_t        textureFunction;       /**< Fragment: GS TEX0.TFX, 0 = modulate (texture * color), 1 = decal (texture only). */
     int32_t         samplerBinding;        /**< Fragment: the sampler2D's binding, or -1 if it has none. */
     int32_t         samplerSet;            /**< Fragment: the sampler2D's descriptor set (0 when the GLSL names none), or -1 if it has no sampler. */
-    uint32_t        alphaTest;             /**< Fragment: GS TEST.ATE, 1 when the shader has a discard. */
+    uint32_t        alphaTest;             /**< Fragment: GS TEST.ATE, 1 when the shader has a discard. The discard is unconditional, or its condition compares the alpha of the color the shader writes with a constant; shaderc rejects a discard on any other condition. A pixel that fails the test writes no color and no depth. */
     uint32_t        alphaTestFunction;     /**< Fragment: GS TEST.ATST, the comparison a pixel's alpha must pass to be kept: 0 never, 1 always, 2 <, 3 <=, 4 ==, 5 >=, 6 >, 7 !=. */
-    uint32_t        alphaTestReference;    /**< Fragment: GS TEST.AREF, the value the alpha is compared with, 0 to 255 where 128 is 1.0. */
+    uint32_t        alphaTestReference;    /**< Fragment: GS TEST.AREF, the value the alpha is compared with, 0 to 255 where 128 is 1.0; the shader's comparison is carried out on those steps. */
+    int32_t         fogInputLocation;      /**< Fragment: location of the float input it fogs by, or -1 if it does not fog. */
+    uint32_t        fog;                   /**< Fragment: GS PRIM.FGE, 1 when the shader mixes the red, green and blue of the color it writes with a constant vec3 by its float input, and keeps the alpha; shaderc rejects any other mix(). */
+    uint32_t        fogColor;              /**< Fragment: GS FOGCOL, the constant the shader mixes with: red in bits 0-7, green in bits 8-15, blue in bits 16-23. */
 } PvkShaderCode;
 
 /** @brief Parameters for pvkCreateShaderModule(). */

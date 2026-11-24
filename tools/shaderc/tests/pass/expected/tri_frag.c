@@ -8,6 +8,7 @@ const PvkShaderCode tri_frag = {
     .entryPoint = "main",
     .colorOutputLocation = -1,
     .texcoordOutputLocation = -1,
+    .fogOutputLocation = -1,
     .colorInputLocation = 0,
     .texcoordInputLocation = -1,
     .gouraud = 1,
@@ -18,4 +19,7 @@ const PvkShaderCode tri_frag = {
     .alphaTest = 0,
     .alphaTestFunction = 0,
     .alphaTestReference = 0,
+    .fogInputLocation = -1,
+    .fog = 0,
+    .fogColor = 0x000000,
 };

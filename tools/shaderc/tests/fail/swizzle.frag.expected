@@ -1,1 +1,1 @@
-swizzle.frag:10: error: fragment shader uses OpVectorShuffle (a swizzle): the GS cannot run code per pixel. Only 'outColor = <color input>;', 'outColor = texture(<sampler>, <texcoord input>);' and their product are supported so far
+swizzle.frag:10: error: fragment shader swizzles something other than the .rgb of its color; the GS fogs a pixel only by mixing its red, green and blue with a constant color by the float input: 'vec4(mix(<constant vec3>, <color>.rgb, <float input>), <color>.a)'

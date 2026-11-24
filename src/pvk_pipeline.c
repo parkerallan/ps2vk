@@ -434,6 +434,12 @@ static PvkResult validate_shaders(const PvkShaderCode *vs, const PvkShaderCode *
                   fs->name, (int)fs->texcoordInputLocation, vs->name);
         return PVK_ERROR_VALIDATION_FAILED;
     }
+    if (fs->fogInputLocation >= 0 && fs->fogInputLocation != vs->fogOutputLocation) {
+        pvk_error("pipeline: fragment shader '%s' fogs by the float at location %d, "
+                  "but vertex shader '%s' does not write one there\n",
+                  fs->name, (int)fs->fogInputLocation, vs->name);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     return PVK_SUCCESS;
 }
 
@@ -1037,14 +1043,17 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
     if (cache)
         program_intern(p, cache);
     /* A vertex shader with a texture coordinate output stores ST before RGBAQ, XYZ2. */
-    p->outputQwords = vs->texcoordOutputLocation >= 0 ? PVK_VU1_OUTPUT_PER_VERTEX_TEXTURED : PVK_VU1_OUTPUT_PER_VERTEX;
+    p->texcoordOut  = vs->texcoordOutputLocation >= 0;
+    p->fogOut       = vs->fogOutputLocation >= 0;
+    p->fogcol       = fs->fogColor;
+    p->outputQwords = PVK_VU1_OUTPUT_PER_VERTEX + p->texcoordOut + p->fogOut;
     p->primStep     = topologies[info->topology].step;
     p->primOverlap  = topologies[info->topology].overlap;
     p->fan          = topologies[info->topology].fan;
     p->strip        = info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     p->maxBatch     = max_batch_vertices(p, p->primStep);
     /* ST holds S/w, T/w and Q = 1/w (FST = 0), so the GS divides per pixel. */
-    p->prim         = GS_SET_PRIM(topologies[info->topology].prim, fs->gouraud, fs->textured, 0,
+    p->prim         = GS_SET_PRIM(topologies[info->topology].prim, fs->gouraud, fs->textured, fs->fog,
                                   info->colorBlend.attachment.blendEnable ? 1 : 0, 0, 0, 0, 0);
 
     if ((res = setup_dynamic(p, info)) != PVK_SUCCESS || (res = setup_depth(p, info)) != PVK_SUCCESS ||

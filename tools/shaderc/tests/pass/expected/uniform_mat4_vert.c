@@ -16,6 +16,7 @@ const PvkShaderCode uniform_mat4_vert = {
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 0,
     .texcoordOutputLocation = -1,
+    .fogOutputLocation = -1,
     .pushConstantBytes = 0,
     .uniformBlockCount = 1,
     .uniformBlocks = {
@@ -23,4 +24,5 @@ const PvkShaderCode uniform_mat4_vert = {
     },
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
+    .fogInputLocation = -1,
 };

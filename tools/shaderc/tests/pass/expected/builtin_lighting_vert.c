@@ -16,8 +16,10 @@ const PvkShaderCode builtin_lighting_vert = {
     .inputLocations = { 0, 1, 2 },
     .colorOutputLocation = 0,
     .texcoordOutputLocation = -1,
+    .fogOutputLocation = -1,
     .pushConstantBytes = 80,
     .uniformBlockCount = 0,
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
+    .fogInputLocation = -1,
 };

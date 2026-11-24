@@ -16,8 +16,10 @@ const PvkShaderCode swapped_locations_vert = {
     .inputLocations = { 0, 1 },
     .colorOutputLocation = 2,
     .texcoordOutputLocation = -1,
+    .fogOutputLocation = -1,
     .pushConstantBytes = 0,
     .uniformBlockCount = 0,
     .colorInputLocation = -1,
     .texcoordInputLocation = -1,
+    .fogInputLocation = -1,
 };

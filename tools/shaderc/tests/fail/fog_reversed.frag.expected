@@ -1,0 +1,1 @@
+fog_reversed.frag:11: error: fragment shader's mix() is not the fog mix; the GS fogs a pixel only by mixing its red, green and blue with a constant color by the float input: 'vec4(mix(<constant vec3>, <color>.rgb, <float input>), <color>.a)'

@@ -8,6 +8,7 @@ const PvkShaderCode discard_color_frag = {
     .entryPoint = "main",
     .colorOutputLocation = -1,
     .texcoordOutputLocation = -1,
+    .fogOutputLocation = -1,
     .colorInputLocation = 0,
     .texcoordInputLocation = -1,
     .gouraud = 1,
@@ -18,4 +19,7 @@ const PvkShaderCode discard_color_frag = {
     .alphaTest = 1,
     .alphaTestFunction = 5,
     .alphaTestReference = 39,
+    .fogInputLocation = -1,
+    .fog = 0,
+    .fogColor = 0x000000,
 };
