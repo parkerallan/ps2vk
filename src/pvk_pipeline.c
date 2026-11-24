@@ -309,16 +309,92 @@ static PvkResult setup_dynamic(PvkPipeline p, const PvkGraphicsPipelineCreateInf
     for (i = 0; i < info->dynamicState.dynamicStateCount; i++) {
         PvkDynamicState s = info->dynamicState.dynamicStates[i];
 
+        if (s == PVK_DYNAMIC_STATE_LINE_STIPPLE) {
+            p->dynamic |= PVK_DYNAMIC_LINE_STIPPLE_BIT;
+            continue;
+        }
         if (s != PVK_DYNAMIC_STATE_VIEWPORT && s != PVK_DYNAMIC_STATE_SCISSOR &&
             s != PVK_DYNAMIC_STATE_BLEND_CONSTANTS) {
-            pvk_error("pipeline: dynamic state %d; only VIEWPORT, SCISSOR and BLEND_CONSTANTS change between draws\n",
-                      (int)s);
+            pvk_error("pipeline: dynamic state %d; only VIEWPORT, SCISSOR, BLEND_CONSTANTS and LINE_STIPPLE "
+                      "change between draws\n", (int)s);
             return PVK_ERROR_FEATURE_NOT_PRESENT;
         }
         p->dynamic |= 1u << s;
     }
     p->scissor = info->scissor;
     return PVK_SUCCESS;
+}
+
+/* The line and polygon smooth states chained to the rasterization state: PRIM.AA1. */
+static PvkResult setup_lines(PvkPipeline p, PvkDevice device, const PvkGraphicsPipelineCreateInfo *info)
+{
+    const PvkPhysicalDeviceLineRasterizationFeatures *on = &device->lineFeatures;
+    const PvkPipelineRasterizationLineStateCreateInfo *ls = NULL;
+    const PvkPipelineRasterizationPolygonStateCreateInfo *ps = NULL;
+    const struct PvkBaseStructure *s;
+    int line = info->topology == PVK_PRIMITIVE_TOPOLOGY_LINE_LIST || info->topology == PVK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    int triangle = info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+                   info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                   info->topology == PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+
+    if (info->rasterization.sType != PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO) {
+        pvk_error("pipeline: rasterization.sType is %d, not "
+                  "PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO\n", (int)info->rasterization.sType);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    for (s = info->rasterization.pNext; s; s = s->pNext)
+        if (s->sType == PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO)
+            ls = (const PvkPipelineRasterizationLineStateCreateInfo *)s;
+        else if (s->sType == PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_POLYGON_STATE_CREATE_INFO)
+            ps = (const PvkPipelineRasterizationPolygonStateCreateInfo *)s;
+
+    if (ps && ps->polygonRasterizationMode != PVK_POLYGON_RASTERIZATION_MODE_DEFAULT &&
+        ps->polygonRasterizationMode != PVK_POLYGON_RASTERIZATION_MODE_RECTANGULAR_SMOOTH) {
+        pvk_error("pipeline: polygonRasterizationMode %d is no PvkPolygonRasterizationMode\n",
+                  (int)ps->polygonRasterizationMode);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    /* Blended, PRIM.AA1 takes the coverage only where alpha is 1.0 and draws the other borders at full alpha. */
+    if (ps && ps->polygonRasterizationMode == PVK_POLYGON_RASTERIZATION_MODE_RECTANGULAR_SMOOTH && triangle &&
+        !info->colorBlend.attachment.blendEnable) {
+        p->prim |= PVK_PRIM_AA1;
+        /* The coverage is the alpha of every pixel: (Cs - Cd) * As + Cd. */
+        p->alpha = GS_SET_ALPHA(0, 1, 0, 1, 0x80);
+    }
+    if (!ls)
+        return PVK_SUCCESS;
+
+    if (ls->stippledLineEnable) {
+        pvk_error("pipeline: stippledLineEnable; the GS has no line pattern\n");
+        return PVK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    switch (ls->lineRasterizationMode) {
+    case PVK_LINE_RASTERIZATION_MODE_DEFAULT:
+        return PVK_SUCCESS;
+    case PVK_LINE_RASTERIZATION_MODE_RECTANGULAR:
+        if (on->rectangularLines)
+            return PVK_SUCCESS;
+        pvk_error("pipeline: PVK_LINE_RASTERIZATION_MODE_RECTANGULAR needs the rectangularLines feature\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    case PVK_LINE_RASTERIZATION_MODE_BRESENHAM:
+        if (on->bresenhamLines)
+            return PVK_SUCCESS;
+        pvk_error("pipeline: PVK_LINE_RASTERIZATION_MODE_BRESENHAM needs the bresenhamLines feature\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    case PVK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH:
+        if (!on->smoothLines) {
+            pvk_error("pipeline: PVK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH needs the smoothLines feature\n");
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        /* Unblended, PRIM.AA1 would still blend the border with the ALPHA register. */
+        if (line && info->colorBlend.attachment.blendEnable)
+            p->prim |= PVK_PRIM_AA1;
+        return PVK_SUCCESS;
+    default:
+        pvk_error("pipeline: lineRasterizationMode %d is no PvkLineRasterizationMode\n",
+                  (int)ls->lineRasterizationMode);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
 }
 
 void pvk_viewport_context(const PvkViewport *vp, PvkFormat depthFormat, float *ctx)
@@ -970,7 +1046,7 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
 
     if ((res = setup_dynamic(p, info)) != PVK_SUCCESS || (res = setup_depth(p, info)) != PVK_SUCCESS ||
         (res = setup_blend(p, info)) != PVK_SUCCESS || (res = setup_cull(p, info)) != PVK_SUCCESS ||
-        (res = setup_stencil(p, info)) != PVK_SUCCESS) {
+        (res = setup_stencil(p, info)) != PVK_SUCCESS || (res = setup_lines(p, device, info)) != PVK_SUCCESS) {
         pvkDestroyPipeline(device, p);
         return res;
     }

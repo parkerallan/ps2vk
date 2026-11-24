@@ -188,7 +188,7 @@ int main(void)
     CHECK(pvkEnumeratePhysicalDevices(instance, &physicalDeviceCount, &physicalDevice));
     /* Queue family 0 is the graphics queue (pvkGetPhysicalDeviceQueueFamilyProperties lists it). */
     PvkDeviceQueueCreateInfo queueInfo = { .queueFamilyIndex = 0, .queueCount = 1 };
-    PvkDeviceCreateInfo deviceInfo = { .queueCreateInfoCount = 1, .queueCreateInfos = &queueInfo };
+    PvkDeviceCreateInfo deviceInfo = { .sType = PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .queueCreateInfos = &queueInfo };
     CHECK(pvkCreateDevice(physicalDevice, &deviceInfo, &device));
     pvkGetDeviceQueue(device, 0, 0, &queue);
 
@@ -351,7 +351,8 @@ int main(void)
         .colorBlend     = { .attachment = { .colorWriteMask = PVK_COLOR_COMPONENT_R_BIT | PVK_COLOR_COMPONENT_G_BIT
                                                              | PVK_COLOR_COMPONENT_B_BIT | PVK_COLOR_COMPONENT_A_BIT } },
         .depthAttachmentFormat = PVK_FORMAT_Z16,
-        .rasterization  = { .cullMode = PVK_CULL_MODE_BACK_BIT, .frontFace = PVK_FRONT_FACE_CLOCKWISE },
+        .rasterization  = { .sType = PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                            .cullMode = PVK_CULL_MODE_BACK_BIT, .frontFace = PVK_FRONT_FACE_CLOCKWISE },
         .depthStencil   = { .depthTestEnable = 1, .depthWriteEnable = 1, .depthCompareOp = PVK_COMPARE_OP_LESS },
     };
     CHECK(pvkCreateGraphicsPipeline(device, pipelineCache, &pipelineInfo, &innerPipeline));

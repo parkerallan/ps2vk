@@ -41,6 +41,12 @@ static const PvkPhysicalDeviceFeatures supported_features = {
     .drawIndirectFirstInstance = 1,
 };
 
+/* A GS line is a run of single pixels with no pattern; PRIM.AA1 smooths it. */
+static const PvkPhysicalDeviceLineRasterizationFeatures supported_line_features = {
+    .bresenhamLines = 1,
+    .smoothLines    = 1,
+};
+
 PvkResult pvkCreateInstance(const PvkInstanceCreateInfo *info, PvkInstance *instance)
 {
     (void)info;
@@ -85,6 +91,43 @@ void pvkGetPhysicalDeviceFeatures(PvkPhysicalDevice physicalDevice, PvkPhysicalD
     *features = supported_features;
 }
 
+void pvkGetPhysicalDeviceFeatures2(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceFeatures2 *features)
+{
+    struct PvkBaseStructure *s;
+
+    if (features->sType != PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+        pvk_error("pvkGetPhysicalDeviceFeatures2: sType is %d, not PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2\n",
+                  (int)features->sType);
+        return;
+    }
+    pvkGetPhysicalDeviceFeatures(physicalDevice, &features->features);
+    for (s = features->pNext; s; s = s->pNext)
+        if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES) {
+            PvkPhysicalDeviceLineRasterizationFeatures *f = (PvkPhysicalDeviceLineRasterizationFeatures *)s;
+            void *next = f->pNext;
+
+            *f = supported_line_features;
+            f->sType = PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES;
+            f->pNext = next;
+        }
+}
+
+void pvkGetPhysicalDeviceProperties2(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceProperties2 *properties)
+{
+    struct PvkBaseStructure *s;
+
+    if (properties->sType != PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2) {
+        pvk_error("pvkGetPhysicalDeviceProperties2: sType is %d, not PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2\n",
+                  (int)properties->sType);
+        return;
+    }
+    pvkGetPhysicalDeviceProperties(physicalDevice, &properties->properties);
+    for (s = properties->pNext; s; s = s->pNext)
+        if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES)
+            ((PvkPhysicalDeviceLineRasterizationProperties *)s)->lineSubPixelPrecisionBits =
+                pvk_limits.subPixelPrecisionBits;
+}
+
 void pvkGetPhysicalDeviceMemoryProperties(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceMemoryProperties *properties)
 {
     (void)physicalDevice;
@@ -126,11 +169,30 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
 {
     PvkDevice dev;
     int families[PVK_MAX_QUEUE_FAMILIES] = { 0 };
+    const PvkPhysicalDeviceFeatures *enabled;
+    const PvkPhysicalDeviceLineRasterizationFeatures *lines = NULL;
+    const struct PvkBaseStructure *s;
     uint32_t i;
 
     (void)physicalDevice;
 
-    if (!info || !info->queueCreateInfoCount) {
+    if (!info || info->sType != PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO) {
+        pvk_error("pvkCreateDevice: sType is not PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    enabled = info->enabledFeatures;
+    for (s = info->pNext; s; s = s->pNext) {
+        if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            if (info->enabledFeatures) {
+                pvk_error("pvkCreateDevice: enabledFeatures must be NULL with a PvkPhysicalDeviceFeatures2 in pNext\n");
+                return PVK_ERROR_VALIDATION_FAILED;
+            }
+            enabled = &((const PvkPhysicalDeviceFeatures2 *)s)->features;
+        } else if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES) {
+            lines = (const PvkPhysicalDeviceLineRasterizationFeatures *)s;
+        }
+    }
+    if (!info->queueCreateInfoCount) {
         pvk_error("pvkCreateDevice: queueCreateInfos must name at least one queue family\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
@@ -152,8 +214,22 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
         }
         families[q->queueFamilyIndex] = 1;
     }
-    if (info->enabledFeatures) {
-        const PvkPhysicalDeviceFeatures *f = info->enabledFeatures;
+    if (lines) {
+        const PvkPhysicalDeviceLineRasterizationFeatures *have = &supported_line_features;
+        const char *missing = lines->rectangularLines && !have->rectangularLines ? "rectangularLines"
+                            : lines->bresenhamLines && !have->bresenhamLines ? "bresenhamLines"
+                            : lines->smoothLines && !have->smoothLines ? "smoothLines"
+                            : lines->stippledRectangularLines && !have->stippledRectangularLines
+                                ? "stippledRectangularLines"
+                            : lines->stippledBresenhamLines && !have->stippledBresenhamLines ? "stippledBresenhamLines"
+                            : lines->stippledSmoothLines && !have->stippledSmoothLines ? "stippledSmoothLines" : NULL;
+        if (missing) {
+            pvk_error("pvkCreateDevice: %s is not supported\n", missing);
+            return PVK_ERROR_FEATURE_NOT_PRESENT;
+        }
+    }
+    if (enabled) {
+        const PvkPhysicalDeviceFeatures *f = enabled;
         const char *missing = f->robustBufferAccess && !supported_features.robustBufferAccess ? "robustBufferAccess"
                             : f->multiDrawIndirect && !supported_features.multiDrawIndirect ? "multiDrawIndirect"
                             : f->drawIndirectFirstInstance && !supported_features.drawIndirectFirstInstance
@@ -171,8 +247,10 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
     dev->transfer.device = dev;
     for (i = 0; i < PVK_MAX_QUEUE_FAMILIES; i++)
         dev->families[i] = families[i];
-    if (info->enabledFeatures)
-        dev->features = *info->enabledFeatures;
+    if (enabled)
+        dev->features = *enabled;
+    if (lines)
+        dev->lineFeatures = *lines;
     /* Reset the GIF: the BIOS (OSDSYS) leaves it busy, which stalls the first
      * VIF1 DIRECT transfer forever (ps2gl does the same in glutInit). */
     GIF_REG_CTRL = 1;

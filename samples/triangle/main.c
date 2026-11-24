@@ -74,7 +74,7 @@ int main(void)
     CHECK(pvkEnumeratePhysicalDevices(instance, &physicalDeviceCount, &physicalDevice));
     /* Queue family 0 is the graphics queue (pvkGetPhysicalDeviceQueueFamilyProperties lists it). */
     PvkDeviceQueueCreateInfo queueInfo = { .queueFamilyIndex = 0, .queueCount = 1 };
-    PvkDeviceCreateInfo deviceInfo = { .queueCreateInfoCount = 1, .queueCreateInfos = &queueInfo };
+    PvkDeviceCreateInfo deviceInfo = { .sType = PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .queueCreateInfos = &queueInfo };
     CHECK(pvkCreateDevice(physicalDevice, &deviceInfo, &device));
     pvkGetDeviceQueue(device, 0, 0, &queue);
 
@@ -151,6 +151,7 @@ int main(void)
         .viewport       = { 0.0f, 0.0f, WIDTH, HEIGHT, 0.0f, 1.0f },
         .colorBlend     = { .attachment = { .colorWriteMask = PVK_COLOR_COMPONENT_R_BIT | PVK_COLOR_COMPONENT_G_BIT
                                                              | PVK_COLOR_COMPONENT_B_BIT | PVK_COLOR_COMPONENT_A_BIT } },
+        .rasterization  = { .sType = PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO },
     };
     CHECK(pvkCreateGraphicsPipeline(device, NULL, &pipelineInfo, &pipeline));
 

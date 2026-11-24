@@ -229,7 +229,7 @@ int main(void)
         { .queueFamilyIndex = graphicsFamily, .queueCount = 1 },
         { .queueFamilyIndex = transferFamily, .queueCount = 1 },
     };
-    PvkDeviceCreateInfo deviceInfo = { .queueCreateInfoCount = 2, .queueCreateInfos = queueInfos };
+    PvkDeviceCreateInfo deviceInfo = { .sType = PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 2, .queueCreateInfos = queueInfos };
     CHECK(pvkCreateDevice(physicalDevice, &deviceInfo, &device));
     pvkGetDeviceQueue(device, graphicsFamily, 0, &queue);
     pvkGetDeviceQueue(device, transferFamily, 0, &transferQueue);
@@ -437,7 +437,8 @@ int main(void)
         .colorBlend     = { .attachment = { .colorWriteMask = PVK_COLOR_COMPONENT_R_BIT | PVK_COLOR_COMPONENT_G_BIT
                                                              | PVK_COLOR_COMPONENT_B_BIT | PVK_COLOR_COMPONENT_A_BIT } },
         .depthAttachmentFormat = PVK_FORMAT_Z24,
-        .depthStencil   = { .depthTestEnable = 1, .depthWriteEnable = 1, .depthCompareOp = PVK_COMPARE_OP_LESS },
+        .rasterization  = { .sType = PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO },
+        .depthStencil   ={ .depthTestEnable = 1, .depthWriteEnable = 1, .depthCompareOp = PVK_COMPARE_OP_LESS },
     };
     CHECK(pvkCreateGraphicsPipeline(device, NULL, &pipelineInfo, &pipeline));
 

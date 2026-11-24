@@ -39,6 +39,25 @@ typedef enum PvkResult {
 } PvkResult;
 
 /**
+ * @brief Names the struct a pNext chain entry is.
+ *
+ * A struct with an sType member holds its own value there. Its pNext member
+ * is NULL or points at another such struct that adds parameters to it; the
+ * library walks the chain, reads the structs it knows by their sType and
+ * skips the others.
+ */
+typedef enum PvkStructureType {
+    PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO                            = 3,          /**< PvkDeviceCreateInfo. */
+    PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO      = 23,         /**< PvkPipelineRasterizationStateCreateInfo. */
+    PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2                    = 1000059000, /**< PvkPhysicalDeviceFeatures2. */
+    PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2                  = 1000059001, /**< PvkPhysicalDeviceProperties2. */
+    PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES   = 1000259000, /**< PvkPhysicalDeviceLineRasterizationFeatures. */
+    PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO = 1000259001, /**< PvkPipelineRasterizationLineStateCreateInfo. */
+    PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES = 1000259002, /**< PvkPhysicalDeviceLineRasterizationProperties. */
+    PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_POLYGON_STATE_CREATE_INFO = 2000000000 /**< PS2 only: PvkPipelineRasterizationPolygonStateCreateInfo. */
+} PvkStructureType;
+
+/**
  * @brief Data formats for vertex attributes and images.
  *
  * Vertex attribute formats are a vec4 of floats, or 1 to 4
@@ -282,6 +301,64 @@ typedef struct PvkPhysicalDeviceFeatures {
     uint32_t drawIndirectFirstInstance; /**< Nonzero: an indirect command's firstInstance may be nonzero. */
 } PvkPhysicalDeviceFeatures;
 
+/**
+ * @brief The features, with a pNext chain for the feature structs of their own.
+ *
+ * pvkGetPhysicalDeviceFeatures2() fills features and every struct it knows in
+ * the chain (PvkPhysicalDeviceLineRasterizationFeatures). In
+ * PvkDeviceCreateInfo::pNext the struct names the features to turn on, in
+ * place of PvkDeviceCreateInfo::enabledFeatures, which must then be NULL.
+ */
+typedef struct PvkPhysicalDeviceFeatures2 {
+    PvkStructureType          sType;    /**< PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2. */
+    void                     *pNext;    /**< NULL or the next struct of the chain. */
+    PvkPhysicalDeviceFeatures features; /**< The features. */
+} PvkPhysicalDeviceFeatures2;
+
+/**
+ * @brief The properties, with a pNext chain for the property structs of their own.
+ *
+ * pvkGetPhysicalDeviceProperties2() fills properties and every struct it
+ * knows in the chain (PvkPhysicalDeviceLineRasterizationProperties).
+ */
+typedef struct PvkPhysicalDeviceProperties2 {
+    PvkStructureType            sType;      /**< PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2. */
+    void                       *pNext;      /**< NULL or the next struct of the chain. */
+    PvkPhysicalDeviceProperties properties; /**< The properties. */
+} PvkPhysicalDeviceProperties2;
+
+/**
+ * @brief Which ways of drawing lines the hardware has.
+ *
+ * Read with pvkGetPhysicalDeviceFeatures2() and turned on by chaining the
+ * struct to PvkDeviceCreateInfo::pNext; a pipeline may only name a
+ * PvkLineRasterizationMode whose feature is on.
+ *
+ * | Feature | Value | Where it comes from |
+ * | --- | --- | --- |
+ * | rectangularLines | 0 | a GS line is a run of single pixels, not a rectangle |
+ * | bresenhamLines | 1 | the GS steps a line one pixel at a time along its longer axis |
+ * | smoothLines | 1 | GS PRIM.AA1 |
+ * | stippledRectangularLines, stippledBresenhamLines, stippledSmoothLines | 0 | the GS has no line pattern |
+ */
+typedef struct PvkPhysicalDeviceLineRasterizationFeatures {
+    PvkStructureType sType;                    /**< PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES. */
+    void            *pNext;                    /**< NULL or the next struct of the chain. */
+    uint32_t         rectangularLines;         /**< Nonzero: PVK_LINE_RASTERIZATION_MODE_RECTANGULAR. */
+    uint32_t         bresenhamLines;           /**< Nonzero: PVK_LINE_RASTERIZATION_MODE_BRESENHAM. */
+    uint32_t         smoothLines;              /**< Nonzero: PVK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH. */
+    uint32_t         stippledRectangularLines; /**< Nonzero: stippledLineEnable with RECTANGULAR lines. */
+    uint32_t         stippledBresenhamLines;   /**< Nonzero: stippledLineEnable with BRESENHAM lines. */
+    uint32_t         stippledSmoothLines;      /**< Nonzero: stippledLineEnable with RECTANGULAR_SMOOTH lines. */
+} PvkPhysicalDeviceLineRasterizationFeatures;
+
+/** @brief Limits of line drawing, read with pvkGetPhysicalDeviceProperties2(). */
+typedef struct PvkPhysicalDeviceLineRasterizationProperties {
+    PvkStructureType sType;                     /**< PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES. */
+    void            *pNext;                     /**< NULL or the next struct of the chain. */
+    uint32_t         lineSubPixelPrecisionBits; /**< 4: fraction bits of a line's end points, XYZ2 being 12.4 fixed point. */
+} PvkPhysicalDeviceLineRasterizationProperties;
+
 /** @brief Properties of a memory heap. */
 typedef enum PvkMemoryHeapFlagBits {
     PVK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 1 /**< GS VRAM: only the GS reads and writes it. */
@@ -375,9 +452,11 @@ typedef struct PvkDeviceQueueCreateInfo {
 
 /** @brief Parameters for pvkCreateDevice(). */
 typedef struct PvkDeviceCreateInfo {
+    PvkStructureType                sType;                /**< PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO. */
+    const void                     *pNext;                /**< NULL, or a chain of the feature structs to turn on: PvkPhysicalDeviceFeatures2, PvkPhysicalDeviceLineRasterizationFeatures. */
     uint32_t                        queueCreateInfoCount; /**< Number of entries in queueCreateInfos, at least 1. */
     const PvkDeviceQueueCreateInfo *queueCreateInfos;     /**< The queue families to create queues of, each family once. */
-    const PvkPhysicalDeviceFeatures *enabledFeatures;     /**< Features to turn on, or NULL for none. */
+    const PvkPhysicalDeviceFeatures *enabledFeatures;     /**< Features to turn on, or NULL for none; NULL when pNext holds a PvkPhysicalDeviceFeatures2. */
 } PvkDeviceCreateInfo;
 
 /**
@@ -418,6 +497,20 @@ void      pvkGetPhysicalDeviceProperties(PvkPhysicalDevice physicalDevice, PvkPh
 void      pvkGetPhysicalDeviceFeatures(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceFeatures *features);
 
 /**
+ * @brief Reports which features the hardware supports, those of the structs chained to @p features included.
+ * @param physicalDevice The physical device.
+ * @param[in,out] features sType and pNext set by the caller; features and every known struct of the chain are filled in.
+ */
+void      pvkGetPhysicalDeviceFeatures2(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceFeatures2 *features);
+
+/**
+ * @brief Reports what the hardware is and its limits, those of the structs chained to @p properties included.
+ * @param physicalDevice The physical device.
+ * @param[in,out] properties sType and pNext set by the caller; properties and every known struct of the chain are filled in.
+ */
+void      pvkGetPhysicalDeviceProperties2(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceProperties2 *properties);
+
+/**
  * @brief Reports the memory types and heaps.
  * @param physicalDevice The physical device.
  * @param[out] properties Filled in.
@@ -437,7 +530,7 @@ void      pvkGetPhysicalDeviceQueueFamilyProperties(PvkPhysicalDevice physicalDe
  * @param physicalDevice The physical device from pvkEnumeratePhysicalDevices().
  * @param info The queue families to create queues of and the features to enable.
  * @param[out] device The new device.
- * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED if no queue is asked for, a family is unknown or asked for twice, or a queueCount is not 1; PVK_ERROR_FEATURE_NOT_PRESENT for an enabled feature the hardware lacks; or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED if sType is wrong, no queue is asked for, a family is unknown or asked for twice, a queueCount is not 1, or enabledFeatures is given next to a PvkPhysicalDeviceFeatures2 in pNext; PVK_ERROR_FEATURE_NOT_PRESENT for an enabled feature the hardware lacks; or PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
 PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreateInfo *info, PvkDevice *device);
 
@@ -1523,10 +1616,83 @@ typedef enum PvkFrontFace {
     PVK_FRONT_FACE_CLOCKWISE         = 1  /**< Negative signed area is front-facing. */
 } PvkFrontFace;
 
+/** @brief How a pipeline with a line topology draws its lines. */
+typedef enum PvkLineRasterizationMode {
+    PVK_LINE_RASTERIZATION_MODE_DEFAULT            = 0, /**< The GS line: one pixel per step along the longer axis. */
+    PVK_LINE_RASTERIZATION_MODE_RECTANGULAR        = 1, /**< Not supported: rectangularLines is 0. */
+    PVK_LINE_RASTERIZATION_MODE_BRESENHAM          = 2, /**< The GS line; needs bresenhamLines. */
+    PVK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH = 3  /**< Antialiased: each pixel's alpha is scaled by how much of the pixel the line covers. GS PRIM.AA1; needs smoothLines. */
+} PvkLineRasterizationMode;
+
 /**
- * @brief Culling.
+ * @brief Line drawing of a pipeline, chained to PvkPipelineRasterizationStateCreateInfo::pNext.
  *
- * All zeros means no culling and counter-clockwise front faces. Only triangle
+ * Without the struct a pipeline draws PVK_LINE_RASTERIZATION_MODE_DEFAULT
+ * lines. The mode applies to PVK_PRIMITIVE_TOPOLOGY_LINE_LIST and
+ * PVK_PRIMITIVE_TOPOLOGY_LINE_STRIP; every other topology ignores the struct.
+ * A mode other than DEFAULT needs its feature turned on at pvkCreateDevice()
+ * (see PvkPhysicalDeviceLineRasterizationFeatures).
+ *
+ * RECTANGULAR_SMOOTH lowers the alpha of the pixels along a line's border to
+ * the part of the pixel the line covers, so the pipeline has to blend with
+ * the fragment's alpha (blendEnable with a SRC_ALPHA factor) for the border
+ * to fade into the attachment. Such a pipeline's line draws set GS PRIM.AA1,
+ * which draws a line two pixels wide and fades the pixels by their coverage.
+ * Two limits of the GS: PRIM.AA1 puts the coverage in place of the fragment's
+ * alpha only where that alpha is 1.0, so a line drawn with any other alpha
+ * is two pixels wide at that alpha and is not smoothed; and with blendEnable
+ * 0 a line is drawn without PRIM.AA1, so the attachment's alpha gets the
+ * fragment's alpha, not the coverage.
+ *
+ * The GS has no line pattern: the three stippled features are 0, so
+ * stippledLineEnable must be 0 and the factor and pattern are not read.
+ */
+typedef struct PvkPipelineRasterizationLineStateCreateInfo {
+    PvkStructureType         sType;                 /**< PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO. */
+    const void              *pNext;                 /**< NULL or the next struct of the chain. */
+    PvkLineRasterizationMode lineRasterizationMode; /**< How lines are drawn. */
+    uint32_t                 stippledLineEnable;    /**< 0: no stippled feature is supported. */
+    uint32_t                 lineStippleFactor;     /**< Repeat count of each pattern bit; read only with stippledLineEnable, unless PVK_DYNAMIC_STATE_LINE_STIPPLE is dynamic. */
+    uint16_t                 lineStipplePattern;    /**< The pattern's 16 bits; read only with stippledLineEnable, unless PVK_DYNAMIC_STATE_LINE_STIPPLE is dynamic. */
+} PvkPipelineRasterizationLineStateCreateInfo;
+
+/** @brief PS2 only: how a pipeline with a triangle topology draws the edges of its triangles. */
+typedef enum PvkPolygonRasterizationMode {
+    PVK_POLYGON_RASTERIZATION_MODE_DEFAULT            = 0, /**< Every pixel of a triangle is drawn whole. */
+    PVK_POLYGON_RASTERIZATION_MODE_RECTANGULAR_SMOOTH = 3  /**< Antialiased: the pixels along a triangle's border are blended by how much of the pixel the triangle covers. GS PRIM.AA1. */
+} PvkPolygonRasterizationMode;
+
+/**
+ * @brief PS2 only: triangle edge drawing of a pipeline, chained to PvkPipelineRasterizationStateCreateInfo::pNext.
+ *
+ * Vulkan has no state for this. Without the struct a pipeline draws
+ * PVK_POLYGON_RASTERIZATION_MODE_DEFAULT triangles. With
+ * PVK_POLYGON_RASTERIZATION_MODE_RECTANGULAR_SMOOTH a pipeline with a
+ * triangle topology and blendEnable 0 draws with GS PRIM.AA1: the GS works
+ * out how much of each pixel along a triangle's border the triangle covers
+ * and blends the triangle's color into the attachment by that amount (GS
+ * ALPHA (Cs - Cd) * As + Cd, the coverage standing in for As). Inside the
+ * triangle the coverage is whole, so the triangle is opaque whatever the
+ * fragment's alpha.
+ *
+ * A border pixel blends with what the attachment holds when the triangle is
+ * drawn, so what lies behind an edge has to be drawn before the triangle.
+ * A pipeline with blendEnable draws without PRIM.AA1, since the GS takes the
+ * coverage only where the fragment's alpha is 1.0 and draws every other
+ * border at the fragment's alpha. Points, lines and sprites ignore the
+ * struct.
+ */
+typedef struct PvkPipelineRasterizationPolygonStateCreateInfo {
+    PvkStructureType sType;               /**< PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_POLYGON_STATE_CREATE_INFO. */
+    const void      *pNext;               /**< NULL or the next struct of the chain. */
+    PvkPolygonRasterizationMode polygonRasterizationMode; /**< How triangle edges are drawn. */
+} PvkPipelineRasterizationPolygonStateCreateInfo;
+
+/**
+ * @brief Culling and line drawing.
+ *
+ * sType set and the rest zero means no culling, counter-clockwise front faces
+ * and default lines. Only triangle
  * topologies cull; points, lines and sprites ignore it. The GS cannot cull, so
  * the vertex shader's epilogue computes each triangle's signed area in screen
  * space when its last vertex is transformed and, for a culled one, sets the
@@ -1534,6 +1700,8 @@ typedef enum PvkFrontFace {
  * alternating winding and a fan's shared hub are followed per batch.
  */
 typedef struct PvkPipelineRasterizationStateCreateInfo {
+    PvkStructureType sType; /**< PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO. */
+    const void  *pNext;     /**< NULL, or a chain of PvkPipelineRasterizationLineStateCreateInfo and PvkPipelineRasterizationPolygonStateCreateInfo. */
     PvkCullMode  cullMode;  /**< Triangles to discard. */
     PvkFrontFace frontFace; /**< Winding of a front-facing triangle. */
 } PvkPipelineRasterizationStateCreateInfo;
@@ -1623,14 +1791,17 @@ typedef struct PvkPipelineColorBlendStateCreateInfo {
 /**
  * @brief Pipeline state that is set while recording instead of at creation.
  *
- * The three the GS can change between draws. A pipeline that lists one
- * ignores the value in its create info; the matching pvkCmdSet*() must have
- * been called in the command buffer before a draw with it.
+ * The three the GS can change between draws, and the line stipple. A pipeline
+ * that lists one ignores the value in its create info; the matching
+ * pvkCmdSet*() must have been called in the command buffer before a draw with
+ * it. The line stipple is read only by a pipeline with stippledLineEnable,
+ * which no pipeline has, so a draw does not need pvkCmdSetLineStipple().
  */
 typedef enum PvkDynamicState {
     PVK_DYNAMIC_STATE_VIEWPORT        = 0, /**< PvkGraphicsPipelineCreateInfo::viewport is set by pvkCmdSetViewport(). */
     PVK_DYNAMIC_STATE_SCISSOR         = 1, /**< PvkGraphicsPipelineCreateInfo::scissor is set by pvkCmdSetScissor(). */
-    PVK_DYNAMIC_STATE_BLEND_CONSTANTS = 4  /**< PvkPipelineColorBlendStateCreateInfo::blendConstants is set by pvkCmdSetBlendConstants(). */
+    PVK_DYNAMIC_STATE_BLEND_CONSTANTS = 4, /**< PvkPipelineColorBlendStateCreateInfo::blendConstants is set by pvkCmdSetBlendConstants(). */
+    PVK_DYNAMIC_STATE_LINE_STIPPLE    = 1000259000 /**< PvkPipelineRasterizationLineStateCreateInfo::lineStippleFactor and lineStipplePattern are set by pvkCmdSetLineStipple(). */
 } PvkDynamicState;
 
 /** @brief Which state a pipeline leaves dynamic. All zeros means none. */
@@ -1706,7 +1877,7 @@ typedef struct PvkGraphicsPipelineCreateInfo {
     PvkViewport                    viewport;       /**< Viewport, unless PVK_DYNAMIC_STATE_VIEWPORT is dynamic. */
     PvkRect2D                      scissor;        /**< Pixels the draws may write, clipped to the attachment, unless PVK_DYNAMIC_STATE_SCISSOR is dynamic; a zero width or height means the whole attachment level, which a secondary command buffer recorded with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT does not know, so its draws need a real rectangle. GS SCISSOR. */
     PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none. Sets the depth range the viewport maps to. */
-    PvkPipelineRasterizationStateCreateInfo rasterization; /**< Back-face culling. */
+    PvkPipelineRasterizationStateCreateInfo rasterization; /**< Back-face culling and, through its pNext, line drawing. */
     PvkFormat                      stencilAttachmentFormat; /**< Format of the stencil attachment the pipeline draws with: the color attachment's PVK_FORMAT_CT32 or PVK_FORMAT_CT16, or PVK_FORMAT_UNDEFINED for none. With a stencil attachment every draw keeps the color pixel's top alpha bit for the stencil, see PvkRenderingInfo. */
     PvkPipelineDepthStencilStateCreateInfo depthStencil; /**< Depth and stencil test and write control. */
     PvkPipelineColorBlendStateCreateInfo   colorBlend;   /**< Blending with the color attachment and the channels written. */
@@ -1738,7 +1909,9 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  * depthAttachmentFormat, the comparison must be one the GS can do (see
  * PvkCompareOp) and the blend factors must fit the GS equation (see
  * PvkPipelineColorBlendAttachmentState), and colorWriteMask may hold only
- * PvkColorComponentFlagBits. A vertex shader of more than 2044 VU1
+ * PvkColorComponentFlagBits. rasterization needs its sType, and a line
+ * rasterization mode chained to it needs its feature turned on at
+ * pvkCreateDevice() (see PvkPipelineRasterizationLineStateCreateInfo). A vertex shader of more than 2044 VU1
  * instructions is rejected with PVK_ERROR_INVALID_SHADER: the last 4 of
  * VU1's 2048 hold the frame routine. The states listed in dynamicState
  * are read from the command buffer instead (see PvkDynamicState). Every
@@ -2331,6 +2504,19 @@ void pvkCmdSetScissor(PvkCommandBuffer cmd, uint32_t firstScissor, uint32_t scis
  * @param blendConstants RGBA, each 0..1; [3] becomes ALPHA.FIX (1 = 128).
  */
 void pvkCmdSetBlendConstants(PvkCommandBuffer cmd, const float blendConstants[4]);
+
+/**
+ * @brief Sets the line stipple for the following draws with a pipeline that has PVK_DYNAMIC_STATE_LINE_STIPPLE.
+ *
+ * The values stay set for the rest of the command buffer. They are read by a
+ * pipeline with stippledLineEnable; the GS has no line pattern, so no
+ * pipeline has it and nothing is sent to the GS.
+ *
+ * @param cmd The command buffer.
+ * @param lineStippleFactor Repeat count of each pattern bit, 1 to 256.
+ * @param lineStipplePattern The pattern's 16 bits.
+ */
+void pvkCmdSetLineStipple(PvkCommandBuffer cmd, uint32_t lineStippleFactor, uint16_t lineStipplePattern);
 
 /**
  * @brief Sets push constants for the following draws.

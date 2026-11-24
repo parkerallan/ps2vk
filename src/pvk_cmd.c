@@ -1544,6 +1544,20 @@ void pvkCmdSetBlendConstants(PvkCommandBuffer cmd, const float blendConstants[4]
     cmd->gsStateDirty = 1;
 }
 
+void pvkCmdSetLineStipple(PvkCommandBuffer cmd, uint32_t lineStippleFactor, uint16_t lineStipplePattern)
+{
+    if (!cmd_graphics(cmd, "pvkCmdSetLineStipple"))
+        return;
+    if (lineStippleFactor < 1 || lineStippleFactor > 256) {
+        pvk_error("pvkCmdSetLineStipple: lineStippleFactor %u is not 1 to 256\n", (unsigned)lineStippleFactor);
+        cmd->failed = 1;
+        return;
+    }
+    cmd->lineStippleFactor  = lineStippleFactor;
+    cmd->lineStipplePattern = lineStipplePattern;
+    cmd->dynamicSet        |= PVK_DYNAMIC_LINE_STIPPLE_BIT;
+}
+
 void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_t stageFlags,
                          uint32_t offset, uint32_t size, const void *data)
 {
@@ -1773,7 +1787,8 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         return 0;
     }
 
-    missing = p->dynamic & ~cmd->dynamicSet;
+    /* No pipeline has stippledLineEnable, so none reads the line stipple. */
+    missing = p->dynamic & ~cmd->dynamicSet & ~PVK_DYNAMIC_LINE_STIPPLE_BIT;
     if (!p->blendFix)
         missing &= ~(1u << PVK_DYNAMIC_STATE_BLEND_CONSTANTS);
     if (missing) {

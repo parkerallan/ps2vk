@@ -41,6 +41,12 @@ struct PvkInstance_T {
     struct PvkPhysicalDevice_T physicalDevice;
 };
 
+/* How every struct of a pNext chain starts. */
+struct PvkBaseStructure {
+    PvkStructureType         sType;
+    struct PvkBaseStructure *pNext;
+};
+
 /* What pvkGetPhysicalDeviceProperties reports; every size check reads it. */
 extern const PvkPhysicalDeviceLimits pvk_limits;
 
@@ -159,7 +165,8 @@ struct PvkDevice_T {
     int       families[PVK_MAX_QUEUE_FAMILIES]; /* asked for at pvkCreateDevice */
     PvkSwapchain swapchain;   /* the one swapchain, or NULL: pvk_queue_wait_idle drains its flips */
     PvkPhysicalDeviceFeatures features;
-    uint32_t vramCount;       /* taken VRAM ranges, sorted by start: swapchain framebuffers and type 1 allocations */
+    PvkPhysicalDeviceLineRasterizationFeatures lineFeatures; /* turned on at pvkCreateDevice */
+    uint32_t vramCount;      /* taken VRAM ranges, sorted by start: swapchain framebuffers and type 1 allocations */
     struct PvkVramRange vram[PVK_MAX_VRAM_ALLOCATIONS];
     PvkQueryPool queryPools[PVK_MAX_QUERY_POOLS]; /* by the number a SIGNAL ID carries, or NULL */
     struct PvkReadbackRun readback;
@@ -316,6 +323,10 @@ struct PvkSampler_T {
     uint32_t fst;        /* PRIM.FST: coordinates in texels, stored as UV */
 };
 
+/* PRIM.AA1: the GS scales the alpha of the border pixels of a line or triangle by their coverage. */
+#define PVK_PRIM_AA1 (1ULL << 7)
+/* Bit of PVK_DYNAMIC_STATE_LINE_STIPPLE in a `dynamic` mask; the other states are 1 << their value. */
+#define PVK_DYNAMIC_LINE_STIPPLE_BIT (1u << 5)
 /* PRIM.FST, ORed into a pipeline's prim for a draw with such a sampler. */
 #define PVK_PRIM_FST (1ULL << 8)
 /* PRIM.CTXT: the draw uses the GS's second register set (FRAME_2, ZBUF_2, TEST_2, ...). */
@@ -486,6 +497,8 @@ struct PvkCommandBuffer_T {
     int         viewportDirty; /* VU1's viewport transform differs from `viewport` */
     PvkRect2D   scissor;      /* set with pvkCmdSetScissor */
     float       blendConstants[4]; /* set with pvkCmdSetBlendConstants */
+    uint32_t    lineStippleFactor; /* set with pvkCmdSetLineStipple */
+    uint16_t    lineStipplePattern;
     int         recording;
     int         rendering;
     int         failed;       /* a recording error makes the buffer unusable */

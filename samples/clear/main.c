@@ -61,7 +61,7 @@ int main(void)
                (unsigned)memory.memoryTypes[i].propertyFlags);
     /* Queue family 0 is the graphics queue (pvkGetPhysicalDeviceQueueFamilyProperties lists it). */
     PvkDeviceQueueCreateInfo queueInfo = { .queueFamilyIndex = 0, .queueCount = 1 };
-    PvkDeviceCreateInfo deviceInfo = { .queueCreateInfoCount = 1, .queueCreateInfos = &queueInfo };
+    PvkDeviceCreateInfo deviceInfo = { .sType = PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .queueCreateInfos = &queueInfo };
     CHECK(pvkCreateDevice(physicalDevice, &deviceInfo, &device));
     pvkGetDeviceQueue(device, 0, 0, &queue);
 
