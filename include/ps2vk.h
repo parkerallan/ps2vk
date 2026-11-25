@@ -48,6 +48,7 @@ typedef enum PvkResult {
  */
 typedef enum PvkStructureType {
     PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO                            = 3,          /**< PvkDeviceCreateInfo. */
+    PVK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO                     = 16,         /**< PvkShaderModuleCreateInfo. */
     PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO      = 23,         /**< PvkPipelineRasterizationStateCreateInfo. */
     PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2                    = 1000059000, /**< PvkPhysicalDeviceFeatures2. */
     PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2                  = 1000059001, /**< PvkPhysicalDeviceProperties2. */
@@ -1316,7 +1317,7 @@ typedef enum PvkSpecConstantType {
  * @brief A specialization constant of a vertex shader (layout(constant_id = n) in the GLSL) and where it sits in the VU1 code.
  *
  * shaderc loads the constant with an LOI instruction whose 32-bit immediate is
- * the default from the GLSL. The microcode in the ELF keeps that default;
+ * the default from the GLSL. The microcode in the shader module keeps that default;
  * pvkCreateGraphicsPipeline() writes the value the stage's
  * PvkSpecializationInfo gives it over the immediate in the pipeline's own copy
  * of the code, as the float VU1 computes with. A vector constant has one entry
@@ -1342,16 +1343,16 @@ typedef struct PvkShaderSpecConstant {
  * PvkShaderSpecConstant); a branch or loop count that depends on one stays a
  * branch, since its value is only known when the pipeline is created.
  *
- * Applications never fill this in by hand: shaderc emits a .c file defining
- * one of these, and the application passes its address to
- * pvkCreateShaderModule().
+ * Applications never fill this in by hand: shaderc writes a .pvs file (see
+ * PvkPvsHeader), and pvkCreateShaderModule() builds one of these from the
+ * file's bytes.
  */
 typedef struct PvkShaderCode {
     PvkShaderStage stage;                  /**< Vertex or fragment. */
     const char    *name;                   /**< Source file name, for error messages. */
     const char    *entryPoint;             /**< Name of its entry point, as the GLSL declares it (main). */
 
-    const uint32_t *vu1CodeStart;          /**< Vertex: start of the VU1 microcode, linked into the ELF. */
+    const uint32_t *vu1CodeStart;          /**< Vertex: start of the VU1 microcode, copied out of the .pvs file. */
     const uint32_t *vu1CodeEnd;            /**< Vertex: end of the VU1 microcode. */
     const uint32_t *vu1Convert;            /**< Vertex: the input conversion block in the microcode, preceded by one load per input: a branch, its delay slot, then 4 instructions per input (itof0 with loi scale, muli with loi -1, maxi, mul by VF00). pvkCreateGraphicsPipeline() rewrites the block in its copy of the code for each attribute's format and points each load at the input's qword of the vertex or the instance. */
     uint32_t        vu1ClampCount;         /**< Vertex: number of entries in vu1Clamps. */
@@ -1382,9 +1383,82 @@ typedef struct PvkShaderCode {
     uint32_t        fogColor;              /**< Fragment: GS FOGCOL, the constant the shader mixes with: red in bits 0-7, green in bits 8-15, blue in bits 16-23. */
 } PvkShaderCode;
 
-/** @brief Parameters for pvkCreateShaderModule(). */
+/** @brief The first word of a .pvs file: "PVS1". */
+#define PVK_PVS_MAGIC   0x31535650u
+/** @brief The .pvs layout version PvkPvsHeader describes. */
+#define PVK_PVS_VERSION 1u
+
+/** @brief One specialization constant of a vertex shader in a .pvs file. */
+typedef struct PvkPvsSpecConstant {
+    uint32_t constantID; /**< The constant_id. */
+    uint32_t word;       /**< Word offset in the microcode of the LOI immediate holding its default. */
+    uint32_t type;       /**< PvkSpecConstantType. */
+} PvkPvsSpecConstant;
+
+/**
+ * @brief The header of a .pvs file: a compiled shader as tools/shaderc writes it and pvkCreateShaderModule() reads it.
+ *
+ * The header is followed by the shader's name and entry point (NUL-terminated
+ * strings) and, for a vertex shader, the word offsets of its run-time index
+ * clamps, its specialization constants and its VU1 microcode. Every value is
+ * a little-endian 32-bit word and every offset counts bytes from the start of
+ * the file. The fields from inputCount on are the PvkShaderCode fields of the
+ * same names.
+ *
+ * For a vertex shader, shaderc writes the VU1 assembly, runs dvp-as on it and
+ * puts the assembled microcode into the file.
+ */
+typedef struct PvkPvsHeader {
+    uint32_t magic;            /**< PVK_PVS_MAGIC. */
+    uint32_t version;          /**< PVK_PVS_VERSION. */
+    uint32_t fileBytes;        /**< Size of the whole file, a multiple of 4. */
+    uint32_t stage;            /**< PvkShaderStage. */
+    uint32_t nameOffset;       /**< The source file name. */
+    uint32_t entryPointOffset; /**< The entry point's name. */
+    uint32_t codeOffset;       /**< Vertex: the VU1 microcode. */
+    uint32_t codeWords;        /**< Vertex: its size in 32-bit words. */
+    uint32_t convertWord;      /**< Vertex: word offset of the input conversion block in the microcode. */
+    uint32_t clampCount;       /**< Vertex: number of run-time index clamps. */
+    uint32_t clampsOffset;     /**< Vertex: their word offsets in the microcode, one uint32_t each. */
+    uint32_t specCount;        /**< Vertex: number of specialization constants. */
+    uint32_t specsOffset;      /**< Vertex: the PvkPvsSpecConstant entries. */
+    uint32_t inputCount;       /**< PvkShaderCode::inputCount. */
+    uint32_t inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< PvkShaderCode::inputLocations. */
+    int32_t  colorOutputLocation;    /**< PvkShaderCode::colorOutputLocation. */
+    int32_t  texcoordOutputLocation; /**< PvkShaderCode::texcoordOutputLocation. */
+    int32_t  fogOutputLocation;      /**< PvkShaderCode::fogOutputLocation. */
+    uint32_t pushConstantBytes;      /**< PvkShaderCode::pushConstantBytes. */
+    uint32_t uniformBlockCount;      /**< PvkShaderCode::uniformBlockCount. */
+    PvkShaderUniformBlock uniformBlocks[PVK_MAX_UNIFORM_BLOCKS]; /**< PvkShaderCode::uniformBlocks. */
+    int32_t  colorInputLocation;     /**< PvkShaderCode::colorInputLocation. */
+    int32_t  texcoordInputLocation;  /**< PvkShaderCode::texcoordInputLocation. */
+    uint32_t gouraud;                /**< PvkShaderCode::gouraud. */
+    uint32_t textured;               /**< PvkShaderCode::textured. */
+    uint32_t textureFunction;        /**< PvkShaderCode::textureFunction. */
+    int32_t  samplerBinding;         /**< PvkShaderCode::samplerBinding. */
+    int32_t  samplerSet;             /**< PvkShaderCode::samplerSet. */
+    uint32_t alphaTest;              /**< PvkShaderCode::alphaTest. */
+    uint32_t alphaTestFunction;      /**< PvkShaderCode::alphaTestFunction. */
+    uint32_t alphaTestReference;     /**< PvkShaderCode::alphaTestReference. */
+    int32_t  fogInputLocation;       /**< PvkShaderCode::fogInputLocation. */
+    uint32_t fog;                    /**< PvkShaderCode::fog. */
+    uint32_t fogColor;               /**< PvkShaderCode::fogColor. */
+} PvkPvsHeader;
+
+/**
+ * @brief Parameters for pvkCreateShaderModule().
+ *
+ * pCode holds the bytes of a .pvs file (see PvkPvsHeader), which the
+ * application has read from a file or keeps in its own data. The module
+ * copies what it needs, so the bytes may be freed once
+ * pvkCreateShaderModule() returns.
+ */
 typedef struct PvkShaderModuleCreateInfo {
-    const PvkShaderCode *code; /**< Shader generated by tools/shaderc. */
+    PvkStructureType sType;    /**< PVK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO. */
+    const void      *pNext;    /**< NULL. */
+    uint32_t         flags;    /**< 0. */
+    size_t           codeSize; /**< Bytes in pCode: the size of the .pvs file. */
+    const uint32_t  *pCode;    /**< The .pvs file's contents. */
 } PvkShaderModuleCreateInfo;
 
 /** @brief Part of the push constant range that one or more shader stages read. */
@@ -1861,8 +1935,8 @@ typedef struct PvkPipelineShaderStageCreateInfo {
  * the program the command buffer last uploaded is that same copy. A program
  * stays in EE RAM for as long as the cache or a pipeline refers to it, so a
  * cache may be destroyed before the pipelines made with it. There is no
- * program data to carry between runs (every program is patched from code in
- * the ELF), so initialData is accepted and ignored, as Vulkan allows for
+ * program data to carry between runs (every program is patched from a shader
+ * module's code), so initialData is accepted and ignored, as Vulkan allows for
  * cache data an implementation does not recognize.
  */
 typedef struct PvkPipelineCacheCreateInfo {
@@ -1892,11 +1966,18 @@ typedef struct PvkGraphicsPipelineCreateInfo {
 } PvkGraphicsPipelineCreateInfo;
 
 /**
- * @brief Wraps a shader compiled by tools/shaderc.
+ * @brief Creates a shader module from the bytes of a .pvs file compiled by tools/shaderc.
+ *
+ * Checks the bytes against the .pvs layout (PvkPvsHeader) and copies the
+ * shader out of them. A pipeline created from the module keeps what it needs
+ * of the shader, so the module may be destroyed once its pipelines exist.
+ *
  * @param device The device.
  * @param info Shader module parameters.
  * @param[out] module The new shader module.
- * @return PVK_SUCCESS, PVK_ERROR_INVALID_SHADER or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ * @return PVK_SUCCESS; PVK_ERROR_VALIDATION_FAILED for a wrong sType or nonzero flags;
+ *         PVK_ERROR_INVALID_SHADER for bytes that are no .pvs file of this version, are
+ *         cut short, or hold a vertex shader without microcode; or PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
 PvkResult pvkCreateShaderModule(PvkDevice device, const PvkShaderModuleCreateInfo *info, PvkShaderModule *module);
 

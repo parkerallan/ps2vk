@@ -1,0 +1,16 @@
+name = fog_modulate.frag
+entryPoint = main
+stage = fragment
+colorInputLocation = 0
+texcoordInputLocation = 1
+gouraud = 1
+textured = 1
+textureFunction = 0
+samplerBinding = 0
+samplerSet = 0
+alphaTest = 1
+alphaTestFunction = 5
+alphaTestReference = 64
+fogInputLocation = 2
+fog = 1
+fogColor = 0x331a1a

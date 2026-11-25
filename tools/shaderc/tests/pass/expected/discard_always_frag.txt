@@ -1,0 +1,16 @@
+name = discard_always.frag
+entryPoint = main
+stage = fragment
+colorInputLocation = -1
+texcoordInputLocation = -1
+gouraud = 0
+textured = 0
+textureFunction = 0
+samplerBinding = -1
+samplerSet = -1
+alphaTest = 1
+alphaTestFunction = 0
+alphaTestReference = 0
+fogInputLocation = -1
+fog = 0
+fogColor = 0x000000

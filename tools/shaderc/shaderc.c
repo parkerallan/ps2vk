@@ -1,8 +1,13 @@
 /*
  * ps2vk-shaderc: compiles SPIR-V (glslangValidator -V) for the PS2.
  *
- *   .vert --glslangValidator--> .spv --shaderc--> .vsm + .c --dvp-as--> .o + .c  (VU1 microcode + PvkShaderCode)
- *   .frag --glslangValidator--> .spv --shaderc--> .c                            (GS settings in a PvkShaderCode)
+ *   .vert --glslangValidator--> .spv --shaderc--> .pvs  (VU1 microcode)
+ *   .frag --glslangValidator--> .spv --shaderc--> .pvs  (GS settings)
+ *
+ * A .pvs file (PvkPvsHeader in ps2vk.h) is what pvkCreateShaderModule() takes.
+ * For a vertex shader shaderc writes VU1 assembly, runs dvp-as on it to get
+ * the microcode and deletes the assembly. --listing also writes <output_base>.txt:
+ * the .pvs file as text, followed by that assembly.
  *
  * shaderc first runs spirv-opt (SPIRV-Tools) on its input to inline function
  * calls, turn local variables into plain values and unroll loops with a
@@ -37,7 +42,7 @@
  * Anything else is rejected with an error that says why, the way a Vulkan
  * driver rejects a shader that uses a feature the device lacks.
  *
- * Usage: shaderc input.spv -o output_base
+ * Usage: shaderc [--listing] input.spv -o output_base
  */
 #include <stdarg.h>
 #include <stdint.h>
@@ -2699,6 +2704,140 @@ static FILE *open_out(const char *base, const char *ext)
     return f;
 }
 
+/* Writes <base>.pvs: the header, the two names, the clamp offsets, the specialization
+ * constants and the microcode, in that order. `code` is NULL for a fragment shader. */
+static void write_pvs(const char *base, PvkPvsHeader *h, const char *name, const char *entry,
+                      const uint32_t *code, const uint32_t *clamps, const PvkPvsSpecConstant *specs)
+{
+    static const char zero[4];
+    char path[1024];
+    size_t nameLen = strlen(name) + 1, entryLen = strlen(entry) + 1;
+    size_t strings = (nameLen + entryLen + 3) & ~(size_t)3;
+    FILE *f;
+
+    h->magic            = PVK_PVS_MAGIC;
+    h->version          = PVK_PVS_VERSION;
+    h->nameOffset       = (uint32_t)sizeof(*h);
+    h->entryPointOffset = h->nameOffset + (uint32_t)nameLen;
+    h->clampsOffset     = h->nameOffset + (uint32_t)strings;
+    h->specsOffset      = h->clampsOffset + h->clampCount * 4;
+    h->codeOffset       = h->specsOffset + h->specCount * (uint32_t)sizeof(*specs);
+    if (!code)
+        h->codeWords = 0;
+    h->fileBytes        = h->codeOffset + h->codeWords * 4;
+
+    snprintf(path, sizeof(path), "%s.pvs", base);
+    f = fopen(path, "wb");
+    if (!f)
+        fail("cannot write %s", path);
+    fwrite(h, sizeof(*h), 1, f);
+    fwrite(name, 1, nameLen, f);
+    fwrite(entry, 1, entryLen, f);
+    fwrite(zero, 1, strings - nameLen - entryLen, f);
+    if (h->clampCount)
+        fwrite(clamps, 4, h->clampCount, f);
+    if (h->specCount)
+        fwrite(specs, sizeof(*specs), h->specCount, f);
+    if (h->codeWords)
+        fwrite(code, 4, h->codeWords, f);
+    if (ferror(f) || fclose(f))
+        fail("cannot write %s", path);
+}
+
+/* A whole file in memory, 4 zero bytes after it. */
+static uint8_t *read_file(const char *path, size_t *size)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *data;
+    long n;
+
+    if (!f)
+        fail("cannot open %s", path);
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    data = calloc((size_t)n + 4, 1);
+    if (!data || fread(data, 1, (size_t)n, f) != (size_t)n)
+        fail("cannot read %s", path);
+    fclose(f);
+    *size = (size_t)n;
+    return data;
+}
+
+static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint32_t rd16(const uint8_t *p) { return p[0] | p[1] << 8; }
+
+/* The 32-bit ELF object dvp-as wrote: its .vutext section and its symbols. */
+typedef struct {
+    const uint8_t *data, *text, *syms, *strs;
+    size_t size, textSize, symCount, strSize;
+    uint32_t textIndex;
+} VuObject;
+
+static void read_vu_object(const char *path, VuObject *o)
+{
+    const uint8_t *sh, *names;
+    uint32_t shoff, shentsize, shnum, shstrndx;
+
+    memset(o, 0, sizeof(*o));
+    o->data = read_file(path, &o->size);
+    if (o->size < 52 || memcmp(o->data, "\177ELF\1\1", 6))
+        fail("%s is not a 32-bit little-endian ELF object from dvp-as", path);
+    shoff     = rd32(o->data + 32);
+    shentsize = rd16(o->data + 46);
+    shnum     = rd16(o->data + 48);
+    shstrndx  = rd16(o->data + 50);
+    if (shentsize < 40 || shstrndx >= shnum || shoff + (size_t)shnum * shentsize > o->size)
+        fail("%s: corrupt ELF section table", path);
+    names = o->data + rd32(o->data + shoff + shstrndx * shentsize + 16);
+    for (uint32_t i = 0; i < shnum; i++) {
+        uint32_t type, off, size, link;
+
+        sh   = o->data + shoff + i * shentsize;
+        type = rd32(sh + 4);
+        off  = rd32(sh + 16);
+        size = rd32(sh + 20);
+        link = rd32(sh + 24);
+        if (type != 8 /* NOBITS */ && off + (size_t)size > o->size)
+            fail("%s: corrupt ELF section", path);
+        if (!strcmp((const char *)names + rd32(sh), ".vutext")) {
+            o->text      = o->data + off;
+            o->textSize  = size;
+            o->textIndex = i;
+        } else if (type == 2 /* SYMTAB */ && link < shnum) {
+            const uint8_t *str = o->data + shoff + link * shentsize;
+
+            o->syms     = o->data + off;
+            o->symCount = size / 16;
+            o->strs     = o->data + rd32(str + 16);
+            o->strSize  = rd32(str + 20);
+        }
+    }
+    if (!o->text || !o->syms)
+        fail("%s has no .vutext section or no symbols; assemble the .vsm with dvp-as", path);
+}
+
+/* Byte offset in .vutext of the label <sym><suffix>. */
+static uint32_t vu_label(const char *path, const VuObject *o, const char *sym, const char *suffix)
+{
+    char name[320];
+
+    snprintf(name, sizeof(name), "%s%s", sym, suffix);
+    for (size_t i = 0; i < o->symCount; i++) {
+        const uint8_t *s = o->syms + i * 16;
+        uint32_t n = rd32(s);
+
+        if (n < o->strSize && rd16(s + 14) == o->textIndex && !strcmp((const char *)o->strs + n, name)) {
+            if (rd32(s + 4) > o->textSize || rd32(s + 4) % 4)
+                fail("%s: label %s lies outside the microcode", path, name);
+            return rd32(s + 4);
+        }
+    }
+    fail("%s has no label %s; it was not assembled from this shader's .vsm", path, name);
+    return 0;
+}
+
+
 /* Upper (FMAC) and lower (load/store/integer/branch) instruction of one VU1 cycle. */
 static void vu(FILE *f, const char *upper, const char *lower, const char *comment)
 {
@@ -3844,114 +3983,95 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         fprintf(f, "\t\t.global\t%s_Spec%d\n", sym, i);
     fclose(f);
 
-    f = open_out(base, ".c");
-    fprintf(f, "/* Generated by ps2vk-shaderc from %s. Do not edit. */\n", g_src);
-    fprintf(f, "#include \"ps2vk.h\"\n\n");
-    fprintf(f, "extern uint32_t %s_CodeStart __attribute__((section(\".vudata\")));\n", sym);
-    fprintf(f, "extern uint32_t %s_Convert __attribute__((section(\".vudata\")));\n", sym);
-    fprintf(f, "extern uint32_t %s_CodeEnd __attribute__((section(\".vudata\")));\n", sym);
-    for (i = 0; i < g_clamps; i++)
-        fprintf(f, "extern uint32_t %s_Clamp%d __attribute__((section(\".vudata\")));\n", sym, i);
-    for (i = 0; i < g_specCount; i++)
-        fprintf(f, "extern uint32_t %s_Spec%d __attribute__((section(\".vudata\")));\n", sym, i);
-    if (g_clamps) {
-        fprintf(f, "\nstatic const uint32_t *const %s_Clamps[] = {", sym);
-        for (i = 0; i < g_clamps; i++)
-            fprintf(f, "%s&%s_Clamp%d", i ? ", " : " ", sym, i);
-        fprintf(f, " };\n");
+    {
+        PvkPvsHeader h;
+        PvkPvsSpecConstant specs[MAX_SPECS];
+        uint32_t *clamps = calloc((size_t)g_clamps + 1, sizeof(uint32_t));
+        char obj[1100], cmd[2400], suffix[32];
+        uint32_t start, end;
+        VuObject o;
+
+        if (!clamps)
+            fail("out of memory");
+        /* dvp-as turns the .vsm into microcode; the labels give each offset in it. */
+        g_line = 0;
+        snprintf(obj, sizeof(obj), "%s_vu1.o", base);
+        snprintf(cmd, sizeof(cmd), "dvp-as \"%s.vsm\" -o \"%s\"", base, obj);
+        if (system(cmd) != 0)
+            fail("dvp-as failed on %s.vsm (the ps2dev toolchain must be on PATH)", base);
+        read_vu_object(obj, &o);
+        start = vu_label(obj, &o, sym, "_CodeStart");
+        end   = vu_label(obj, &o, sym, "_CodeEnd");
+        if (end <= start)
+            fail("%s holds no microcode", obj);
+
+        memset(&h, 0, sizeof(h));
+        h.stage       = PVK_SHADER_STAGE_VERTEX;
+        h.codeWords   = (end - start) / 4;
+        h.convertWord = (vu_label(obj, &o, sym, "_Convert") - start) / 4;
+        h.clampCount  = (uint32_t)g_clamps;
+        for (i = 0; i < g_clamps; i++) {
+            snprintf(suffix, sizeof(suffix), "_Clamp%d", i);
+            clamps[i] = (vu_label(obj, &o, sym, suffix) - start) / 4;
+        }
+        h.specCount = (uint32_t)g_specCount;
+        for (i = 0; i < g_specCount; i++) {
+            snprintf(suffix, sizeof(suffix), "_Spec%d", i);
+            specs[i].constantID = (uint32_t)g_specs[i].id;
+            specs[i].word       = (vu_label(obj, &o, sym, suffix) - start) / 4;
+            specs[i].type       = (uint32_t)g_specs[i].type;
+        }
+        h.inputCount = (uint32_t)sh->inputCount;
+        for (i = 0; i < sh->inputCount; i++)
+            h.inputLocations[i] = (uint32_t)sh->inputs[i].location;
+        h.colorOutputLocation    = sh->colorValue ? sh->colorLocation : -1;
+        h.texcoordOutputLocation = sh->texcoordValue ? sh->texcoordLocation : -1;
+        h.fogOutputLocation      = sh->fogValue ? sh->fogLocation : -1;
+        h.pushConstantBytes      = sh->pushBytes;
+        h.uniformBlockCount      = (uint32_t)sh->uniformCount;
+        for (i = 0; i < sh->uniformCount; i++) {
+            h.uniformBlocks[i].set     = (uint32_t)sh->uniforms[i].set;
+            h.uniformBlocks[i].binding = (uint32_t)sh->uniforms[i].binding;
+            h.uniformBlocks[i].qword   = sh->uniforms[i].qword;
+            h.uniformBlocks[i].bytes   = sh->uniforms[i].bytes;
+        }
+        h.colorInputLocation = h.texcoordInputLocation = h.fogInputLocation = -1;
+        h.samplerBinding = h.samplerSet = -1;
+        write_pvs(base, &h, g_src, sh->entryPoint, (const uint32_t *)(o.text + start), clamps, specs);
+        remove(obj);
+        free((void *)o.data);
+        free(clamps);
     }
-    if (g_specCount) {
-        fprintf(f, "\nstatic const PvkShaderSpecConstant %s_SpecConstants[] = {\n", sym);
-        for (i = 0; i < g_specCount; i++)
-            fprintf(f, "    { .constantID = %d, .vu1Word = &%s_Spec%d, .type = %s },\n",
-                    g_specs[i].id, sym, i, spec_type_names[g_specs[i].type]);
-        fprintf(f, "};\n");
-    }
-    fprintf(f, "\nconst PvkShaderCode %s = {\n", sym);
-    fprintf(f, "    .stage = PVK_SHADER_STAGE_VERTEX,\n");
-    fprintf(f, "    .name = \"%s\",\n", g_src);
-    fprintf(f, "    .entryPoint = \"%s\",\n", sh->entryPoint);
-    fprintf(f, "    .vu1CodeStart = &%s_CodeStart,\n", sym);
-    fprintf(f, "    .vu1CodeEnd = &%s_CodeEnd,\n", sym);
-    fprintf(f, "    .vu1Convert = &%s_Convert,\n", sym);
-    if (g_clamps) {
-        fprintf(f, "    .vu1ClampCount = %d,\n", g_clamps);
-        fprintf(f, "    .vu1Clamps = %s_Clamps,\n", sym);
-    }
-    if (g_specCount) {
-        fprintf(f, "    .vu1SpecConstantCount = %d,\n", g_specCount);
-        fprintf(f, "    .vu1SpecConstants = %s_SpecConstants,\n", sym);
-    }
-    fprintf(f, "    .inputCount = %d,\n", sh->inputCount);
-    fprintf(f, "    .inputLocations = {");
-    for (i = 0; i < sh->inputCount; i++)
-        fprintf(f, "%s%d", i ? ", " : " ", sh->inputs[i].location);
-    fprintf(f, " },\n");
-    fprintf(f, "    .colorOutputLocation = %d,\n", sh->colorValue ? sh->colorLocation : -1);
-    fprintf(f, "    .texcoordOutputLocation = %d,\n", sh->texcoordValue ? sh->texcoordLocation : -1);
-    fprintf(f, "    .fogOutputLocation = %d,\n", sh->fogValue ? sh->fogLocation : -1);
-    fprintf(f, "    .pushConstantBytes = %u,\n", (unsigned)sh->pushBytes);
-    fprintf(f, "    .uniformBlockCount = %d,\n", sh->uniformCount);
-    if (sh->uniformCount) {
-        fprintf(f, "    .uniformBlocks = {\n");
-        for (i = 0; i < sh->uniformCount; i++)
-            fprintf(f, "        { .set = %d, .binding = %d, .qword = %u, .bytes = %u }, /* %s */\n",
-                    sh->uniforms[i].set, sh->uniforms[i].binding, (unsigned)sh->uniforms[i].qword,
-                    (unsigned)sh->uniforms[i].bytes, sh->uniforms[i].name);
-        fprintf(f, "    },\n");
-    }
-    fprintf(f, "    .colorInputLocation = -1,\n");
-    fprintf(f, "    .texcoordInputLocation = -1,\n");
-    fprintf(f, "    .fogInputLocation = -1,\n");
-    fprintf(f, "};\n");
-    fclose(f);
 }
 
-static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base, const char *sym)
+static void emit_fragment(const Shader *sh, const IdInfo *ids, const char *base)
 {
-    FILE *f = open_out(base, ".c");
     int texel = sh->colorValue ? ids[sh->colorValue].texel : TEXEL_NONE;
     int usesColor = sh->colorValue && (texel == TEXEL_NONE || texel == TEXEL_SAMPLE_TIMES_COLOR);
     int usesTexture = texel != TEXEL_NONE;
     int atst = 0, aref = 0;
+    PvkPvsHeader h;
 
     if (sh->discard)
         frag_alpha_test(sh, ids, &atst, &aref);
 
-    fprintf(f, "/* Generated by ps2vk-shaderc from %s. Do not edit. */\n", g_src);
-    fprintf(f, "#include \"ps2vk.h\"\n\n");
-    if (!sh->colorValue)
-        fprintf(f, "/* discard: every pixel fails the GS alpha test. */\n");
-    else if (texel == TEXEL_NONE)
-        fprintf(f, "/* outColor = interpolated color: Gouraud shading, no texture. */\n");
-    else if (texel == TEXEL_SAMPLE)
-        fprintf(f, "/* outColor = texture sample: GS decal, the vertex color is ignored. */\n");
-    else
-        fprintf(f, "/* outColor = texture sample * interpolated color: GS modulate. */\n");
-    fprintf(f, "const PvkShaderCode %s = {\n", sym);
-    fprintf(f, "    .stage = PVK_SHADER_STAGE_FRAGMENT,\n");
-    fprintf(f, "    .name = \"%s\",\n", g_src);
-    fprintf(f, "    .entryPoint = \"%s\",\n", sh->entryPoint);
-    fprintf(f, "    .colorOutputLocation = -1,\n");
-    fprintf(f, "    .texcoordOutputLocation = -1,\n");
-    fprintf(f, "    .fogOutputLocation = -1,\n");
-    fprintf(f, "    .colorInputLocation = %d,\n",
-            usesColor && sh->colorInput >= 0 ? sh->inputs[sh->colorInput].location : -1);
-    fprintf(f, "    .texcoordInputLocation = %d,\n",
-            usesTexture ? sh->inputs[sh->texcoordInput].location : -1);
-    fprintf(f, "    .gouraud = %d,\n", usesColor ? 1 : 0);
-    fprintf(f, "    .textured = %d,\n", usesTexture ? 1 : 0);
-    fprintf(f, "    .textureFunction = %d,\n", usesTexture ? sh->textureFunction : 0);
-    fprintf(f, "    .samplerBinding = %d,\n", usesTexture ? sh->samplerBinding : -1);
-    fprintf(f, "    .samplerSet = %d,\n", usesTexture ? sh->samplerSet : -1);
-    fprintf(f, "    .alphaTest = %d,\n", sh->discard ? 1 : 0);
-    fprintf(f, "    .alphaTestFunction = %d,\n", atst);
-    fprintf(f, "    .alphaTestReference = %d,\n", aref);
-    fprintf(f, "    .fogInputLocation = %d,\n", sh->fogged ? sh->inputs[sh->fogInput].location : -1);
-    fprintf(f, "    .fog = %d,\n", sh->fogged ? 1 : 0);
-    fprintf(f, "    .fogColor = 0x%06x,\n", sh->fogged ? (unsigned)sh->fogColor : 0u);
-    fprintf(f, "};\n");
-    fclose(f);
+    memset(&h, 0, sizeof(h));
+    h.stage = PVK_SHADER_STAGE_FRAGMENT;
+    h.colorOutputLocation = h.texcoordOutputLocation = h.fogOutputLocation = -1;
+    h.colorInputLocation    = usesColor && sh->colorInput >= 0 ? sh->inputs[sh->colorInput].location : -1;
+    h.texcoordInputLocation = usesTexture ? sh->inputs[sh->texcoordInput].location : -1;
+    h.gouraud               = usesColor ? 1 : 0;           /* GS PRIM.IIP */
+    h.textured              = usesTexture ? 1 : 0;         /* GS PRIM.TME */
+    h.textureFunction       = usesTexture ? (uint32_t)sh->textureFunction : 0; /* 0 modulate, 1 decal */
+    h.samplerBinding        = usesTexture ? sh->samplerBinding : -1;
+    h.samplerSet            = usesTexture ? sh->samplerSet : -1;
+    h.alphaTest             = sh->discard ? 1 : 0;
+    h.alphaTestFunction     = (uint32_t)atst;
+    h.alphaTestReference    = (uint32_t)aref;
+    h.fogInputLocation      = sh->fogged ? sh->inputs[sh->fogInput].location : -1;
+    h.fog                   = sh->fogged ? 1 : 0;
+    h.fogColor              = sh->fogged ? sh->fogColor : 0;
+    write_pvs(base, &h, g_src, sh->entryPoint, NULL, NULL, NULL);
 }
 
 /* C identifier from the output path's file name: "build/tri.vert" -> "tri_vert". */
@@ -3970,6 +4090,94 @@ static void symbol_name(const char *base, char *out, size_t size)
         out[0] = '_';
 }
 
+/* A .pvs file read back, checked far enough for shaderc's own use. */
+static PvkPvsHeader *read_pvs(const char *path, size_t *size)
+{
+    PvkPvsHeader *h = (PvkPvsHeader *)read_file(path, size);
+
+    if (*size < sizeof(*h) || h->magic != PVK_PVS_MAGIC || h->version != PVK_PVS_VERSION ||
+        h->fileBytes != *size || h->nameOffset >= *size || h->entryPointOffset >= *size ||
+        h->clampsOffset + (size_t)h->clampCount * 4 > *size ||
+        h->specsOffset + (size_t)h->specCount * sizeof(PvkPvsSpecConstant) > *size ||
+        h->codeOffset + (size_t)h->codeWords * 4 > *size)
+        fail("%s is not a .pvs file of this shaderc", path);
+    return h;
+}
+
+/* shaderc --listing: <base>.txt, the .pvs file read back as text and, for a vertex
+ * shader, the VU1 assembly its microcode was assembled from. */
+static void write_listing(const char *base)
+{
+    char path[1100];
+    size_t size;
+    const PvkPvsHeader *h;
+    const uint8_t *file;
+    const PvkPvsSpecConstant *specs;
+    const uint32_t *clamps;
+    FILE *f, *vsm;
+    int c;
+
+    snprintf(path, sizeof(path), "%s.pvs", base);
+    h      = read_pvs(path, &size);
+    file   = (const uint8_t *)h;
+    specs  = (const PvkPvsSpecConstant *)(file + h->specsOffset);
+    clamps = (const uint32_t *)(file + h->clampsOffset);
+    f      = open_out(base, ".txt");
+
+    fprintf(f, "name = %s\n", (const char *)file + h->nameOffset);
+    fprintf(f, "entryPoint = %s\n", (const char *)file + h->entryPointOffset);
+    if (h->stage == PVK_SHADER_STAGE_VERTEX) {
+        fprintf(f, "stage = vertex\n");
+        fprintf(f, "codeWords = %u\n", (unsigned)h->codeWords);
+        fprintf(f, "convertWord = %u\n", (unsigned)h->convertWord);
+        fprintf(f, "clamps =");
+        for (uint32_t i = 0; i < h->clampCount; i++)
+            fprintf(f, " %u", (unsigned)clamps[i]);
+        fprintf(f, "\n");
+        for (uint32_t i = 0; i < h->specCount; i++)
+            fprintf(f, "specConstant = { constantID %u, word %u, %s }\n", (unsigned)specs[i].constantID,
+                   (unsigned)specs[i].word, specs[i].type < 4 ? spec_type_names[specs[i].type] : "?");
+        fprintf(f, "inputLocations =");
+        for (uint32_t i = 0; i < h->inputCount && i < PVK_MAX_VERTEX_INPUTS; i++)
+            fprintf(f, " %u", (unsigned)h->inputLocations[i]);
+        fprintf(f, "\n");
+        fprintf(f, "colorOutputLocation = %d\n", (int)h->colorOutputLocation);
+        fprintf(f, "texcoordOutputLocation = %d\n", (int)h->texcoordOutputLocation);
+        fprintf(f, "fogOutputLocation = %d\n", (int)h->fogOutputLocation);
+        fprintf(f, "pushConstantBytes = %u\n", (unsigned)h->pushConstantBytes);
+        for (uint32_t i = 0; i < h->uniformBlockCount && i < PVK_MAX_UNIFORM_BLOCKS; i++)
+            fprintf(f, "uniformBlock = { set %u, binding %u, qword %u, bytes %u }\n",
+                   (unsigned)h->uniformBlocks[i].set, (unsigned)h->uniformBlocks[i].binding,
+                   (unsigned)h->uniformBlocks[i].qword, (unsigned)h->uniformBlocks[i].bytes);
+    } else {
+        fprintf(f, "stage = fragment\n");
+        fprintf(f, "colorInputLocation = %d\n", (int)h->colorInputLocation);
+        fprintf(f, "texcoordInputLocation = %d\n", (int)h->texcoordInputLocation);
+        fprintf(f, "gouraud = %u\n", (unsigned)h->gouraud);
+        fprintf(f, "textured = %u\n", (unsigned)h->textured);
+        fprintf(f, "textureFunction = %u\n", (unsigned)h->textureFunction);
+        fprintf(f, "samplerBinding = %d\n", (int)h->samplerBinding);
+        fprintf(f, "samplerSet = %d\n", (int)h->samplerSet);
+        fprintf(f, "alphaTest = %u\n", (unsigned)h->alphaTest);
+        fprintf(f, "alphaTestFunction = %u\n", (unsigned)h->alphaTestFunction);
+        fprintf(f, "alphaTestReference = %u\n", (unsigned)h->alphaTestReference);
+        fprintf(f, "fogInputLocation = %d\n", (int)h->fogInputLocation);
+        fprintf(f, "fog = %u\n", (unsigned)h->fog);
+        fprintf(f, "fogColor = 0x%06x\n", (unsigned)h->fogColor);
+    }
+    snprintf(path, sizeof(path), "%s.vsm", base);
+    vsm = fopen(path, "r");
+    if (vsm) {
+        fputc('\n', f);
+        while ((c = fgetc(vsm)) != EOF)
+            fputc(c, f);
+        fclose(vsm);
+    }
+    if (ferror(f) || fclose(f))
+        fail("cannot write %s.txt", base);
+    free((void *)h);
+}
+
 int main(int argc, char **argv)
 {
     const char *in = NULL, *outBase = NULL;
@@ -3977,17 +4185,19 @@ int main(int argc, char **argv)
     uint32_t *code;
     size_t words;
     Shader sh;
-    char sym[256];
-    int i;
+    char sym[256], vsm[1100];
+    int i, listing = 0;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc)
             outBase = argv[++i];
+        else if (!strcmp(argv[i], "--listing"))
+            listing = 1;
         else
             in = argv[i];
     }
     if (!in || !outBase) {
-        fprintf(stderr, "usage: shaderc input.spv -o output_base\n");
+        fprintf(stderr, "usage: shaderc [--listing] input.spv -o output_base\n");
         return 2;
     }
 
@@ -4015,7 +4225,12 @@ int main(int argc, char **argv)
     if (sh.execModel == ExecVertex)
         emit_vertex(&sh, ids, outBase, sym);
     else
-        emit_fragment(&sh, ids, outBase, sym);
+        emit_fragment(&sh, ids, outBase);
+
+    if (listing)
+        write_listing(outBase);
+    snprintf(vsm, sizeof(vsm), "%s.vsm", outBase);
+    remove(vsm);
 
     free(code);
     return 0;

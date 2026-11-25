@@ -295,6 +295,10 @@ struct PvkBuffer_T {
     size_t size;
 };
 
+/* A shader built from a .pvs file stays alive while a module, pipeline or program refers to it. */
+void pvk_shader_retain(const PvkShaderCode *code);
+void pvk_shader_release(const PvkShaderCode *code);
+
 struct PvkShaderModule_T {
     const PvkShaderCode *code;
 };

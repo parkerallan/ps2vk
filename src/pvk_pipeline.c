@@ -798,6 +798,7 @@ static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const 
     if (!p->program)
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
     p->program->vs   = vs;
+    pvk_shader_retain(vs);
     p->program->refs = 1;
     p->program->code = memalign(16, words * 4);
     if (!p->program->code)
@@ -925,6 +926,7 @@ static void program_release(struct PvkProgram *prog)
 {
     if (!prog || --prog->refs)
         return;
+    pvk_shader_release(prog->vs);
     free(prog->code);
     free(prog);
 }
@@ -1028,7 +1030,9 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
     memset(p, 0, sizeof(*p));
 
     p->vs           = vs;
+    pvk_shader_retain(vs);
     p->fs           = fs;
+    pvk_shader_retain(fs);
     p->ate          = fs->alphaTest;
     p->atst         = fs->alphaTestFunction;
     p->aref         = fs->alphaTestReference;
@@ -1084,6 +1088,8 @@ void pvkDestroyPipeline(PvkDevice device, PvkPipeline pipeline)
     if (!pipeline)
         return;
     program_release(pipeline->program);
+    pvk_shader_release(pipeline->vs);
+    pvk_shader_release(pipeline->fs);
     free(pipeline);
 }
 

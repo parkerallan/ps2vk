@@ -1,0 +1,16 @@
+name = discard_else.frag
+entryPoint = main
+stage = fragment
+colorInputLocation = -1
+texcoordInputLocation = 0
+gouraud = 0
+textured = 1
+textureFunction = 1
+samplerBinding = 0
+samplerSet = 0
+alphaTest = 1
+alphaTestFunction = 5
+alphaTestReference = 64
+fogInputLocation = -1
+fog = 0
+fogColor = 0x000000
