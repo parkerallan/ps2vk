@@ -1,0 +1,68 @@
+#version 450
+
+// One step of the wave equation on a band of 3 rows of the 160x78 height grid. A row
+// is 40 vec4s, so each invocation updates the 4 neighbouring cells held in the x, y,
+// z, w of one vec4. The application dispatches once per band.
+layout(local_size_x = 8) in;
+
+// The band's rows plus the row above and below it; past the grid's top and bottom
+// edges those rows are padding that stays 0.
+layout(std430, set = 0, binding = 0) readonly buffer Current {
+    vec4 h[];
+} cur;
+
+// The band's rows: the previous step's heights on entry and this step's on exit.
+layout(std430, set = 0, binding = 1) buffer Next {
+    vec4 h[];
+} next;
+
+// The band's rows as the mesh reads them, one vec4 per cell: height, light, slope across, slope along.
+layout(std430, set = 0, binding = 2) writeonly buffer Surface {
+    vec4 s[];
+} surface;
+
+layout(push_constant) uniform Push {
+    vec4 drop; // x: the column a drop lands on; y: its row, counted from the band's first row; z: its strength (0 = none); w: 1 / radius^2
+} pc;
+
+const uint ROW = 40u; // vec4s per row
+
+void main()
+{
+    uint c = gl_GlobalInvocationID.x;
+    uint r = gl_GlobalInvocationID.y;
+    uint i = r * ROW + c;
+    uint ci = i + ROW;
+
+    // The four neighbours of every cell; the grid's left and right edges reflect.
+    vec4 h     = cur.h[ci];
+    vec4 west  = cur.h[c > 0u ? ci - 1u : ci];
+    vec4 east  = cur.h[c < ROW - 1u ? ci + 1u : ci];
+    vec4 north = cur.h[ci - ROW];
+    vec4 south = cur.h[ci + ROW];
+    float wx = c > 0u ? west.w : h.x;
+    float ex = c < ROW - 1u ? east.x : h.w;
+    vec4 l = vec4(wx, h.xyz);
+    vec4 e = vec4(h.yzw, ex);
+
+    // New height from the neighbours and the previous height; 0.2 sets how fast the ripples spread.
+    vec4 wave = h * 2.0 + (l + e + north + south - h * 4.0) * 0.2 - next.h[i];
+
+    // A drop pushes the surface down in a cone around the cell it lands on.
+    vec4 x = vec4(float(c * 4u)) + vec4(0.0, 1.0, 2.0, 3.0);
+    vec4 dx = x - vec4(pc.drop.x);
+    float dy = float(r) - pc.drop.y;
+    vec4 d2 = dx * dx + vec4(dy * dy);
+    wave -= pc.drop.z * max(vec4(0.0), vec4(1.0) - d2 * pc.drop.w);
+    wave *= 0.88;
+    next.h[i] = wave;
+
+    // The slopes, and light from the north-west: the slope towards it brightens the cell.
+    vec4 across = l - e;
+    vec4 along = north - south;
+    vec4 light = clamp(vec4(0.35) + (across + along) * 0.6, vec4(0.0), vec4(1.0));
+    surface.s[i * 4u] = vec4(wave.x, light.x, across.x, along.x);
+    surface.s[i * 4u + 1u] = vec4(wave.y, light.y, across.y, along.y);
+    surface.s[i * 4u + 2u] = vec4(wave.z, light.z, across.z, along.z);
+    surface.s[i * 4u + 3u] = vec4(wave.w, light.w, across.w, along.w);
+}

@@ -54,21 +54,24 @@ static const char *check_pvs(const PvkPvsHeader *h, size_t codeSize)
         return "the .pvs file is of another version; recompile it with this ps2vk's shaderc";
     if (h->fileBytes < sizeof(*h) || h->fileBytes > codeSize || h->fileBytes % 4)
         return "the .pvs file is cut short";
-    if (h->stage != PVK_SHADER_STAGE_VERTEX && h->stage != PVK_SHADER_STAGE_FRAGMENT)
+    if (h->stage != PVK_SHADER_STAGE_VERTEX && h->stage != PVK_SHADER_STAGE_FRAGMENT &&
+        h->stage != PVK_SHADER_STAGE_COMPUTE_BIT)
         return "the .pvs file names no shader stage";
     if (!string_at(h, h->nameOffset) || !string_at(h, h->entryPointOffset))
         return "the .pvs file's names run past its end";
     if (h->stage == PVK_SHADER_STAGE_FRAGMENT)
         return NULL;
     if (!h->codeWords)
-        return "the vertex shader has no microcode";
+        return "the vertex or compute shader has no microcode";
     if (h->codeOffset % 4 || h->clampsOffset % 4 || h->specsOffset % 4 ||
         !inside(h, h->codeOffset, (size_t)h->codeWords * 4) ||
         !inside(h, h->clampsOffset, (size_t)h->clampCount * 4) ||
         !inside(h, h->specsOffset, (size_t)h->specCount * sizeof(PvkPvsSpecConstant)))
         return "the .pvs file's microcode runs past its end";
     if (h->convertWord >= h->codeWords || h->inputCount > PVK_MAX_VERTEX_INPUTS ||
-        h->uniformBlockCount > PVK_MAX_UNIFORM_BLOCKS)
+        h->uniformBlockCount > PVK_MAX_UNIFORM_BLOCKS || h->storageBlockCount > PVK_MAX_STORAGE_BLOCKS ||
+        (h->stage == PVK_SHADER_STAGE_COMPUTE_BIT && (h->inputCount ||
+         !h->localSize[0] || !h->localSize[1] || !h->localSize[2])))
         return "the .pvs file's header is corrupt";
     for (i = 0; i < h->clampCount; i++)
         if (((const uint32_t *)((const char *)h + h->clampsOffset))[i] >= h->codeWords)
@@ -142,7 +145,7 @@ PvkResult pvkCreateShaderModule(PvkDevice device, const PvkShaderModuleCreateInf
     sc.stage      = (PvkShaderStage)h->stage;
     sc.name       = strings;
     sc.entryPoint = strings + nameLen;
-    if (h->stage == PVK_SHADER_STAGE_VERTEX) {
+    if (h->stage != PVK_SHADER_STAGE_FRAGMENT) {
         memcpy(code, (const char *)h + h->codeOffset, (size_t)h->codeWords * 4);
         for (i = 0; i < h->clampCount; i++)
             clamps[i] = code + fileClamps[i];
@@ -153,7 +156,7 @@ PvkResult pvkCreateShaderModule(PvkDevice device, const PvkShaderModuleCreateInf
         }
         sc.vu1CodeStart         = code;
         sc.vu1CodeEnd           = code + h->codeWords;
-        sc.vu1Convert           = code + h->convertWord;
+        sc.vu1Convert           = h->stage == PVK_SHADER_STAGE_VERTEX ? code + h->convertWord : NULL;
         sc.vu1ClampCount        = h->clampCount;
         sc.vu1Clamps            = clamps;
         sc.vu1SpecConstantCount = h->specCount;
@@ -180,6 +183,9 @@ PvkResult pvkCreateShaderModule(PvkDevice device, const PvkShaderModuleCreateInf
     sc.fogInputLocation       = h->fogInputLocation;
     sc.fog                    = h->fog;
     sc.fogColor               = h->fogColor;
+    memcpy(sc.localSize, h->localSize, sizeof(sc.localSize));
+    sc.storageBlockCount      = h->storageBlockCount;
+    memcpy(sc.storageBlocks, h->storageBlocks, sizeof(sc.storageBlocks));
 
     data->refs = 1;
     data->code = sc;

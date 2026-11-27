@@ -1,0 +1,15 @@
+#version 450
+
+layout(local_size_x = 8) in;
+
+shared vec4 tmp[8];
+
+layout(std430, binding = 0) buffer Data {
+    vec4 v[];
+} data;
+
+void main()
+{
+    tmp[gl_LocalInvocationIndex] = data.v[gl_GlobalInvocationID.x];
+    data.v[gl_GlobalInvocationID.x] = tmp[0];
+}

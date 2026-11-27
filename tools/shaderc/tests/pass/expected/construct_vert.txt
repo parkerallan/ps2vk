@@ -91,7 +91,7 @@ construct_vert_Convert:
 construct_vert_body:
 ; shader body
          NOP                                      move.xyz      VF06,VF10                  ; line 11: OpCompositeConstruct (a vector constructor)
-         addw.w        VF06,VF00,VF00w            NOP
+         maxw.w        VF06,VF00,VF00w            NOP
          mulx.w        VF07,VF11,VF05x            NOP                                      ; line 12: OpFMul (multiplication)
          NOP                                      move.xy       VF08,VF11                  ; line 12: OpCompositeConstruct (a vector constructor)
          sub.z         VF08,VF00,VF00             NOP

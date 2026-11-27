@@ -17,6 +17,17 @@
  *   512 output:  per instance a GIF tag, then per vertex RGBAQ, XYZ2, or ST (UV
  *       for a sampler with unnormalized coordinates), RGBAQ, XYZ2 when the
  *       vertex shader writes a texture coordinate; one XGKICK sends them all
+ *
+ * A compute dispatch lays the memory out its own way; the next draw sends the
+ * graphics layout again.
+ *
+ *   0   dispatch header: 4 qwords written by pvkCmdDispatch
+ *   4   push constants, as above
+ *   12  invocation: 3 qwords the microcode writes before each invocation, then
+ *       1 more header qword
+ *   16  uniform buffers: the compute shader's uniform blocks, placed as above
+ *   16 + the qwords those take: storage blocks, one after another in (set,
+ *       binding) order, each the bound buffer range in whole qwords
  */
 #ifndef PS2VK_VU1_LAYOUT_H
 #define PS2VK_VU1_LAYOUT_H
@@ -61,6 +72,18 @@
 #define PVK_VU1_TEXCOORD_REG      19
 
 #define PVK_VU1_MEMORY_QWORDS     1024
+
+#define PVK_VU1_COMPUTE_GROUPS    0   /* x, y, z: floats, gl_NumWorkGroups */
+#define PVK_VU1_COMPUTE_COUNTS    1   /* x, y, z: ints, work groups along each axis */
+#define PVK_VU1_COMPUTE_BASES     2   /* x..w: ints, first qword of each storage block */
+#define PVK_VU1_COMPUTE_LAST      3   /* x..w: floats, qwords from the first to the last element
+                                         of each block's runtime array */
+#define PVK_VU1_COMPUTE_WORKGROUP 12  /* x, y, z: floats, gl_WorkGroupID */
+#define PVK_VU1_COMPUTE_LOCAL     13  /* x, y, z: floats, gl_LocalInvocationID; w: gl_LocalInvocationIndex */
+#define PVK_VU1_COMPUTE_GLOBAL    14  /* x, y, z: floats, gl_GlobalInvocationID */
+#define PVK_VU1_COMPUTE_LENGTHS   15  /* x..w: floats, elements in each block's runtime array */
+#define PVK_VU1_STORAGE_ADDR      16  /* plus the qwords of the shader's uniform blocks */
+#define PVK_VU1_STORAGE_BASE_REG  9   /* VI09..VI12 hold the storage blocks' first qwords */
 
 /* VU1 micro memory, in instruction pairs; the last 4 hold the routine that XGKICKs the frame packet. */
 #define PVK_VU1_MICRO_PAIRS       2048

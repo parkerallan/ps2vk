@@ -1,0 +1,26 @@
+#version 450
+
+// Every invocation ID, length(), a uniform block, a fixed array picked at run time,
+// a matrix read whole, a vec2 past field x and an int member written from a count.
+layout(local_size_x = 4, local_size_y = 2, local_size_z = 1) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    mat4 transform;
+} params;
+
+layout(std430, set = 0, binding = 1) buffer Out {
+    int count;
+    float pad;
+    vec2 scale;
+    vec4 table[4];
+    vec4 result[];
+} o;
+
+void main()
+{
+    uint i = gl_LocalInvocationIndex + gl_WorkGroupID.x * 8u;
+    vec4 ids = vec4(gl_GlobalInvocationID.x, gl_LocalInvocationID.y, gl_NumWorkGroups.x, float(o.result.length()));
+    vec4 t = o.table[gl_LocalInvocationID.x];
+    o.result[i] = params.transform * (ids + t) * o.scale.y;
+    o.count = int(gl_NumWorkGroups.x) * 8;
+}

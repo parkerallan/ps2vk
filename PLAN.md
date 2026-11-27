@@ -111,7 +111,7 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | ✓ | `discard` | `OpKill`, `OpTerminateInvocation` or `OpDemoteToHelperInvocation`, alone or under a comparison of the written color's alpha with a constant | GS alpha test `TEST.ATE`/`ATST`/`AREF`; `alphaTest`, `alphaTestFunction`, `alphaTestReference` in `PvkShaderCode`. *Only works with the alpha value: the GS alpha test reads nothing else* |
 | ✓ | Fog via `mix` | `OpExtInst` `FMix` of a constant `vec3`, the color's `.rgb` and the `float` input; a `float` `Output` variable in the vertex shader | GS `PRIM.FGE` + `FOGCOL`, the vertex shader's float per vertex in the GS `FOG` register; `fog`, `fogColor`, `fogInputLocation`, `fogOutputLocation` in `PvkShaderCode`. *Only works with a constant fog color, and alpha is not fogged* |
 | ✓ | Runtime shader files | `vkCreateShaderModule` with `codeSize` and `pCode` | `shaderc` writes a `.pvs` file per shader (`PvkPvsHeader`); `pvkCreateShaderModule` takes the file's bytes |
-| | Compute shaders | `ExecutionModel GLCompute` | VU0 microcode (see VU0) |
+| ✓ | Compute shaders | `ExecutionModel GLCompute` with `LocalSize`, std430 storage blocks, `OpArrayLength`, the `GlobalInvocationId`, `LocalInvocationId`, `WorkgroupId`, `NumWorkgroups` and `LocalInvocationIndex` built-ins | VU1 microcode: the vertex body compiler inside loops over the work groups and each group's invocations, which store the IDs as floats in VU1 memory before each invocation; a storage access is `LQ`/`SQ` from the block's first qword in VI09-VI12, a run-time index through VI08. *Invocations run one after another: no `shared` variables or `barrier()`* |
 
 ## Shader stages
 
@@ -120,12 +120,12 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | | Mesh shaders: shaders that generate geometry | `VK_EXT_mesh_shader` | Vertex shader that emits extra vertices | VU1 writes more output vertices than it reads |
 | | Tessellation: subdivide triangles | Tessellation control and evaluation shaders | VU1 shader extension | VU1 subdivides triangles before the epilogue |
 
-## VU0
+## Compute
 
 | Status | Feature | Vulkan | ps2vk | PS2 implementation |
 | --- | --- | --- | --- | --- |
-| | Compute queue and pipelines | `VkQueue` with `VK_QUEUE_COMPUTE_BIT`, `vkCreateComputePipelines`, `vkCmdDispatch` | Compute `PvkQueue`, `pvkCreateComputePipeline`, `pvkCmdDispatch` | VU0 micro mode fed by DMA channel 0 (VIF0) |
-| | Storage buffers for compute results | `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER` | `PVK_DESCRIPTOR_TYPE_STORAGE_BUFFER` | VU0 data memory copied back to EE RAM |
+| ✓ | Compute queue and pipelines | `VK_QUEUE_COMPUTE_BIT`, `vkCreateComputePipelines`, `VkPipelineBindPoint` in `vkCmdBindPipeline` and `vkCmdBindDescriptorSets`, `vkCmdDispatch`, `maxComputeWorkGroupCount`, `maxComputeWorkGroupSize` | `PVK_QUEUE_COMPUTE_BIT` on family 0, `pvkCreateComputePipelines`, `PvkPipelineBindPoint` in `pvkCmdBindPipeline` and `pvkCmdBindDescriptorSets`, `pvkCmdDispatch`, the same limits | VIF1 uploads the program, a header with the group counts and block addresses, the blocks, then `MSCAL`; the next draw sends the graphics program, constants and uniform blocks again. *VU1 also runs the vertex shaders, so draws and dispatches take turns* |
+| ✓ | Storage buffers for compute results | `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`, `maxStorageBufferRange`, `VK_ACCESS_SHADER_WRITE_BIT`, `VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT` | `PVK_DESCRIPTOR_TYPE_STORAGE_BUFFER`, `maxStorageBufferRange` = 16128, `PVK_ACCESS_SHADER_WRITE_BIT`, `PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT` | Each bound range goes into VU1 data memory by DMA REF. After a dispatch that writes a block the chain stops at a GS SIGNAL; the INTC_GS handler copies the range from VU1 data memory (0x1100C000) into the buffer and starts the chain again. *A dispatch's blocks share 16128 bytes* |
 
 ## Samples
 
@@ -139,3 +139,4 @@ These are what `vkCreateShaderModule` / `pvkCreateShaderModule` must accept. The
 | | Skinning | Bone matrices, animation |
 | ✓ | Render to texture | Two passes in one command buffer: a cube with flat face colors spins fast inside a 256×256 CT32 color attachment image with its own Z16 depth buffer, then a second cube on screen is textured with that image, so every face is a window onto the first cube. One vertex shader (color and texture coordinate out) with two fragment shaders, two pipelines with the viewport and depth format of their target |
 | | PBR materials | Material system, image-based lighting |
+| ✓ | Water | Ripples on a 160×78 surface whose edges lie out of view: each frame a compute shader on VU1 steps the wave equation and works out each cell's light and slope, 4 cells per invocation in the lanes of a vec4, one dispatch per band of 3 rows bound as buffer sub-ranges. Two height buffers swap roles through two sets of descriptor sets, raindrops arrive as a push constant, and the draw reads the heights, light and slopes straight from a storage buffer as vertex attributes of a depth-tested indexed mesh (only the quads on screen, as the camera stays still) that reflects a sky texture with a moon, bent by the slope, the moon also drawn in the sky |

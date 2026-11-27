@@ -1,7 +1,7 @@
 #!/bin/sh
 # Shader compiler tests. Run with `make test`.
 #
-#   pass/  happy path shaders that must compile (shaderc runs dvp-as on a vertex shader's VU1 code);
+#   pass/  happy path shaders that must compile (shaderc runs dvp-as on a vertex or compute shader's VU1 code);
 #          the listing (shaderc --listing: the .pvs file as text, then the VU1 assembly) must match
 #          pass/expected/
 #   fail/  unhappy path shaders that must be rejected; the error message must match
@@ -25,7 +25,8 @@ bad()  { failed=$((failed + 1)); echo "FAIL $1: $2"; }
 
 # ---------------------------------------------------------------- must compile
 cd "$HERE/pass"
-for src in *.vert *.frag; do
+for src in *.vert *.frag *.comp; do
+    [ -e "$src" ] || continue
     name=$(echo "$src" | tr . _)
 
     if ! glslangValidator -V -g -o "$OUT/$src.spv" "$src" >"$OUT/$name.glslang"; then
@@ -50,7 +51,8 @@ done
 
 # ---------------------------------------------------------------- must be rejected
 cd "$HERE/fail"
-for src in *.vert *.frag; do
+for src in *.vert *.frag *.comp; do
+    [ -e "$src" ] || continue
     if ! glslangValidator -V -g -o "$OUT/$src.spv" "$src" >"$OUT/$src.glslang"; then
         bad "$src" "glslangValidator failed: $(cat "$OUT/$src.glslang")"
         continue

@@ -1,0 +1,1 @@
+compute_float_index.comp:11: error: compute shader indexes an array of 4-byte elements in storage block 'data' at run time; VU1 addresses qwords, so make the elements whole 16-byte qwords (vec4, mat4, a struct of 16, 32, ... bytes)

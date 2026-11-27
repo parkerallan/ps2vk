@@ -1,7 +1,7 @@
 name = loop_break.vert
 entryPoint = main
 stage = vertex
-codeWords = 284
+codeWords = 288
 convertWord = 70
 clamps = 110
 inputLocations = 0
@@ -128,7 +128,8 @@ loop_break_vert_L47:
          NOP                                      NOP                                      ; branch delay slot
 loop_break_vert_L17:
          NOP                                      move.x        VF05,VF08                  ; line 26: OpCompositeConstruct (a vector constructor)
-         addx.yzw      VF05,VF00,VF08x            NOP
+         addx.yz       VF05,VF00,VF08x            NOP
+         mulx.w        VF05,VF00,VF08x            NOP
          NOP                                      move.xyzw     VF20,VF10                  ; gl_Position
          NOP                                      move.xyzw     VF21,VF05                  ; color output, location 0
 ; epilogue: perspective divide, viewport, GS formats, store

@@ -15,6 +15,13 @@ const PvkPhysicalDeviceLimits pvk_limits = {
     .maxPerStageDescriptorSamplers       = 1,
     .maxPerStageDescriptorUniformBuffers = PVK_MAX_UNIFORM_BLOCKS,
     .maxPerStageDescriptorSampledImages  = 1,
+    .maxStorageBufferRange               = PVK_MAX_STORAGE_BYTES,
+    .maxPerStageDescriptorStorageBuffers = PVK_MAX_STORAGE_BLOCKS,
+    .maxComputeWorkGroupCount            = { 65535, 65535, 65535 },
+    .maxComputeWorkGroupInvocations      = PVK_MAX_COMPUTE_WORK_GROUP_SIZE * PVK_MAX_COMPUTE_WORK_GROUP_SIZE *
+                                           PVK_MAX_COMPUTE_WORK_GROUP_SIZE,
+    .maxComputeWorkGroupSize             = { PVK_MAX_COMPUTE_WORK_GROUP_SIZE, PVK_MAX_COMPUTE_WORK_GROUP_SIZE,
+                                             PVK_MAX_COMPUTE_WORK_GROUP_SIZE },
     .maxVertexInputAttributes            = PVK_MAX_VERTEX_INPUTS,
     .maxVertexInputBindings              = PVK_MAX_VERTEX_BINDINGS,
     .maxViewports                        = 1,
@@ -25,6 +32,7 @@ const PvkPhysicalDeviceLimits pvk_limits = {
     .maxColorAttachments                 = 1,
     .maxDrawIndirectCount                = 0xffffffffu,
     .minUniformBufferOffsetAlignment     = 16,
+    .minStorageBufferOffsetAlignment     = 16,
     .minMemoryMapAlignment               = 64,
     .maxSamplerLodBias                   = 127.9375f,
     .maxSamplerAnisotropy                = 1.0f,
@@ -143,9 +151,9 @@ void pvkGetPhysicalDeviceMemoryProperties(PvkPhysicalDevice physicalDevice, PvkP
     properties->memoryHeaps[1].flags = PVK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 }
 
-/* Family 0 feeds VIF1 (PATH2), family 1 the GIF channel (PATH3). */
+/* Family 0 feeds VIF1 (PATH2) and so VU1, family 1 the GIF channel (PATH3). */
 static const PvkQueueFamilyProperties queue_families[PVK_MAX_QUEUE_FAMILIES] = {
-    { PVK_QUEUE_GRAPHICS_BIT | PVK_QUEUE_TRANSFER_BIT, 1, 32, { 1, 1, 1 } },
+    { PVK_QUEUE_GRAPHICS_BIT | PVK_QUEUE_COMPUTE_BIT | PVK_QUEUE_TRANSFER_BIT, 1, 32, { 1, 1, 1 } },
     { PVK_QUEUE_TRANSFER_BIT, 1, 32, { 1, 1, 1 } },
 };
 

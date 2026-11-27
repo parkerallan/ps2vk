@@ -100,7 +100,7 @@ builtin_scalar_vert_body:
          NOP                                      move.x        VF05,VF07                  ; line 22: OpCompositeConstruct (a vector constructor)
          addx.y        VF05,VF00,VF09x            NOP
          NOP                                      move.z        VF05,VF08
-         addw.w        VF05,VF00,VF00w            NOP
+         maxw.w        VF05,VF00,VF00w            NOP
          NOP                                      move.xyzw     VF20,VF06                  ; gl_Position
          NOP                                      move.xyzw     VF21,VF05                  ; color output, location 0
 ; epilogue: perspective divide, viewport, GS formats, store

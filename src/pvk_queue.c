@@ -24,6 +24,9 @@
 #define VIF1_STAT_FDR 0x00800000u /* FIFO direction: GS to EE */
 #define VIF1_STAT_FQC 0x1F000000u /* qwords in the FIFO */
 
+/* VU1 data memory as the EE sees it. */
+#define VU1_DATA ((const volatile uint8_t *)0x1100C000)
+
 /* Most qwords one start of the VIF1 channel reads back (QWC is 16 bits). */
 #define PVK_READBACK_CHUNK_QWORDS 32768
 
@@ -146,6 +149,35 @@ static void readback_read_chunk(PvkDevice dev)
     *D1_CHCR = (*D1_CHCR & 0x30) | 0x100;
 }
 
+static void readback_begin(PvkDevice dev, PvkQueue queue);
+
+/* A dispatch's chain stopped after VU1 finished: copies the storage blocks it wrote into their
+ * buffers (written back from the data cache, since DMA reads them next) and lets the chain go on. */
+static void vu1_copy(PvkDevice dev)
+{
+    struct PvkReadbackRun *run = &dev->readback;
+    const struct PvkReadback *rb = run->rb;
+    PvkQueue queue = run->queue;
+    uint32_t i;
+
+    for (i = 0; i < rb->vu1Count; i++) {
+        uint8_t *dst = rb->vu1[i].dst;
+        memcpy(dst, (const void *)(VU1_DATA + rb->vu1[i].qword * 16), rb->vu1[i].bytes);
+        iSyncDCache(dst, dst + rb->vu1[i].bytes);
+    }
+    queue->ring[queue->head].readbackNext++;
+    run->stage = 0;
+    *queue->qwc  = 0;
+    *queue->tadr = DMA_SET_TADR((u32)rb->resume, 0);
+    *queue->chcr = DMA_SET_CHCR(1, 1, (*queue->chcr >> 4) & 3, queue->family == 0, 0, 1, 0);
+    if (run->pending) {
+        queue = run->pending;
+        run->pending = NULL;
+        readback_begin(dev, queue);
+    }
+    pvk_device_kick(dev);
+}
+
 /* Stage 1: once both channels are idle, sends the region's setup packet down VIF1. */
 static void readback_step(PvkDevice dev)
 {
@@ -153,6 +185,10 @@ static void readback_step(PvkDevice dev)
 
     if (*D1_CHCR & 0x100)
         return;
+    if (run->rb->vu1Count) {
+        vu1_copy(dev);
+        return;
+    }
     if (dev->families[1] && (*D2_CHCR & 0x100)) {
         /* An upload in flight keeps the GS transfer registers: let it finish first. */
         if (!run->unmasked) {

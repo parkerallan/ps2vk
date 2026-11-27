@@ -101,7 +101,7 @@ builtin_reduce_vert_body:
          NOP                                      waitq
          addq.x        VF05,VF00,Q                NOP
          NOP                                      move.xyz      VF08,VF07                  ; line 17: OpCompositeConstruct (a vector constructor)
-         addx.w        VF08,VF00,VF05x            NOP
+         mulx.w        VF08,VF00,VF05x            NOP
          mul.xyz       VF05,VF11,VF11             NOP                                      ; line 18: normalize()
          addy.x        VF05,VF05,VF05y            NOP
          addz.x        VF05,VF05,VF05z            NOP
@@ -112,7 +112,8 @@ builtin_reduce_vert_body:
          addy.x        VF07,VF07,VF07y            NOP
          addz.x        VF07,VF07,VF07z            NOP
          NOP                                      move.x        VF05,VF07                  ; line 18: OpCompositeConstruct (a vector constructor)
-         addx.yzw      VF05,VF00,VF07x            NOP
+         addx.yz       VF05,VF00,VF07x            NOP
+         mulx.w        VF05,VF00,VF07x            NOP
          mul.xyzw      VF05,VF05,VF10             NOP                                      ; line 18: OpFMul (multiplication)
          NOP                                      move.xyzw     VF20,VF08                  ; gl_Position
          NOP                                      move.xyzw     VF21,VF05                  ; color output, location 0

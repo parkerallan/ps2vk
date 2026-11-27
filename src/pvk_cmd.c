@@ -16,6 +16,7 @@ static qword_t *cmd_open_gs(PvkCommandBuffer cmd);
 static void cmd_close_gs(PvkCommandBuffer cmd, qword_t *end);
 static void cmd_release_copies(PvkCommandBuffer cmd);
 static int array_grow(PvkCommandBuffer cmd, void **array, uint32_t count, uint32_t *cap, size_t size);
+static int cmd_graphics(PvkCommandBuffer cmd, const char *who);
 
 /* Make sure `qwords` more fit in the chain; mark the buffer failed if not. */
 static int cmd_reserve(PvkCommandBuffer cmd, uint32_t qwords)
@@ -134,6 +135,31 @@ static void cmd_close_gif(PvkCommandBuffer cmd, qword_t *end)
 static PvkQueue pool_queue(PvkCommandPool pool)
 {
     return pool->family ? &pool->device->transfer : &pool->device->queue;
+}
+
+/* Fails the recording when the command needs the family with compute (family 0, the one that feeds VU1). */
+static int cmd_compute(PvkCommandBuffer cmd, const char *who)
+{
+    if (cmd->pool->family == 0)
+        return 1;
+    pvk_error("%s: the command buffer is from a pool of the transfer family (1), which has no compute\n", who);
+    cmd->failed = 1;
+    return 0;
+}
+
+/* A bind point argument: one of the two, and the one of the pipeline's kind when there is one. */
+static int cmd_bind_point(PvkCommandBuffer cmd, const char *who, PvkPipelineBindPoint point, PvkPipeline pipeline)
+{
+    if (point != PVK_PIPELINE_BIND_POINT_GRAPHICS && point != PVK_PIPELINE_BIND_POINT_COMPUTE) {
+        pvk_error("%s: pipelineBindPoint %d is not a PvkPipelineBindPoint\n", who, (int)point);
+    } else if (pipeline && pipeline->compute != (point == PVK_PIPELINE_BIND_POINT_COMPUTE)) {
+        pvk_error("%s: a %s pipeline bound at PVK_PIPELINE_BIND_POINT_%s\n", who,
+                  pipeline->compute ? "compute" : "graphics", point == PVK_PIPELINE_BIND_POINT_COMPUTE ? "COMPUTE" : "GRAPHICS");
+    } else {
+        return point == PVK_PIPELINE_BIND_POINT_COMPUTE ? cmd_compute(cmd, who) : cmd_graphics(cmd, who);
+    }
+    cmd->failed = 1;
+    return 0;
 }
 
 /* Fails the recording when the command needs the graphics family. */
@@ -291,6 +317,9 @@ static void cmd_reset_state(PvkCommandBuffer cmd)
     memset(&cmd->pushLayout, 0, sizeof(cmd->pushLayout));
     cmd->dynamicSet   = 0;
     cmd->viewportDirty = 0;
+    cmd->computePipeline = NULL;
+    memset(cmd->computeSets, 0, sizeof(cmd->computeSets));
+    cmd->vu1Compute   = 0;
 }
 
 static int is_depth_format(PvkFormat format)
@@ -769,13 +798,21 @@ static void cmd_gs_state(PvkCommandBuffer cmd, const PvkRect2D *scissor)
     cmd->gsStateDirty = 0;
 }
 
-void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_t firstSet,
-                              uint32_t setCount, const PvkDescriptorSet *sets)
+void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineBindPoint pipelineBindPoint, PvkPipelineLayout layout,
+                              uint32_t firstSet, uint32_t setCount, const PvkDescriptorSet *sets,
+                              uint32_t dynamicOffsetCount, const uint32_t *pDynamicOffsets)
 {
     uint32_t i;
 
-    if (!cmd_graphics(cmd, "pvkCmdBindDescriptorSets"))
+    (void)pDynamicOffsets;
+    if (!cmd_bind_point(cmd, "pvkCmdBindDescriptorSets", pipelineBindPoint, NULL))
         return;
+    if (dynamicOffsetCount) {
+        pvk_error("pvkCmdBindDescriptorSets: dynamicOffsetCount is %u, but the sets hold no dynamic descriptors\n",
+                  (unsigned)dynamicOffsetCount);
+        cmd->failed = 1;
+        return;
+    }
     if (firstSet + setCount > layout->setLayoutCount || firstSet + setCount > pvk_limits.maxBoundDescriptorSets) {
         pvk_error("pvkCmdBindDescriptorSets: sets %u to %u, but the pipeline layout has %u set layouts\n",
                   (unsigned)firstSet, (unsigned)(firstSet + setCount), (unsigned)layout->setLayoutCount);
@@ -789,6 +826,11 @@ void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, ui
             cmd->failed = 1;
             return;
         }
+    }
+    if (pipelineBindPoint == PVK_PIPELINE_BIND_POINT_COMPUTE) {
+        for (i = 0; i < setCount; i++)
+            cmd->computeSets[firstSet + i] = sets[i];
+        return;
     }
     for (i = 0; i < setCount; i++)
         cmd->sets[firstSet + i] = sets[i];
@@ -1279,7 +1321,7 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
     } else if (srcStageMask & PVK_GS_STAGES) {
         cmd_flush(cmd);
     } else if (srcStageMask & (PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT | PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                               PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT)) {
+                               PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)) {
         packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
         packet2_vif_flushe(&cmd->packet, 0);
         packet2_vif_nop(&cmd->packet, 0);
@@ -1289,7 +1331,8 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
 
 
 #define PVK_ALL_STAGES (PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | \
-                        PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT | PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT | PVK_GS_STAGES)
+                        PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT | PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT | \
+                        PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | PVK_GS_STAGES)
 
 /* Open a GS packet on the command buffer's path: DIRECT (PATH2) or the GIF channel (PATH3). */
 static qword_t *cmd_open_gs(PvkCommandBuffer cmd)
@@ -1472,17 +1515,17 @@ void pvkCmdExecuteCommands(PvkCommandBuffer cmd, uint32_t count, const PvkComman
     cmd_reset_state(cmd);
 }
 
-void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
+/* Sends a graphics pipeline's program and constants to VU1: at the bind, and at the first draw
+ * after a dispatch replaced them. */
+static int cmd_load_pipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
 {
     u32 *start = (u32 *)pipeline->program->code;
     u32 *end   = (u32 *)pipeline->program->codeEnd;
     float context[PVK_VU1_CONTEXT_QWORDS * 4];
     uint32_t i;
 
-    if (!cmd_graphics(cmd, "pvkCmdBindPipeline"))
-        return;
     if (!cmd_reserve(cmd, packet2_utils_get_packet_size_for_program(start, end) + 8))
-        return;
+        return 0;
 
     /* Upload the vertex shader (VIF waits for VU1 to stop first), or only wait when this
      * recording already uploaded the program; then the per-pipeline constants. */
@@ -1501,6 +1544,22 @@ void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline)
     for (i = 0; i < PVK_VU1_CONTEXT_QWORDS * 4; i++)
         packet2_add_float(&cmd->packet, context[i]);
     packet2_utils_vu_close_unpack(&cmd->packet);
+    cmd->vu1Compute    = 0;
+    cmd->uniformsDirty = 1; /* a dispatch's blocks are where the uniform blocks were */
+    return 1;
+}
+
+void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipelineBindPoint pipelineBindPoint, PvkPipeline pipeline)
+{
+    if (!cmd_bind_point(cmd, "pvkCmdBindPipeline", pipelineBindPoint, pipeline))
+        return;
+    /* A compute pipeline goes to VU1 with each dispatch, since draws use VU1 in between. */
+    if (pipeline->compute) {
+        cmd->computePipeline = pipeline;
+        return;
+    }
+    if (!cmd_load_pipeline(cmd, pipeline))
+        return;
 
     cmd->pipeline      = pipeline;
     cmd->gsStateDirty  = 1; /* its depth test and write mask */
@@ -1577,9 +1636,10 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_
         return;
     }
     mask = pvk_push_word_mask(offset, size);
-    if (!stageFlags || stageFlags & ~(PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT)
+    if (!stageFlags || stageFlags & ~(PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT | PVK_SHADER_STAGE_COMPUTE_BIT)
         || ((stageFlags & PVK_SHADER_STAGE_VERTEX) && (layout->pushWords[0] & mask) != mask)
-        || ((stageFlags & PVK_SHADER_STAGE_FRAGMENT) && (layout->pushWords[1] & mask) != mask)) {
+        || ((stageFlags & PVK_SHADER_STAGE_FRAGMENT) && (layout->pushWords[1] & mask) != mask)
+        || ((stageFlags & PVK_SHADER_STAGE_COMPUTE_BIT) && (layout->pushWords[2] & mask) != mask)) {
         pvk_error("pvkCmdPushConstants: bytes %u to %u are not in the layout's push constant "
                   "ranges for stage flags 0x%x\n", (unsigned)offset, (unsigned)(offset + size),
                   (unsigned)stageFlags);
@@ -1751,6 +1811,8 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
         cmd->failed = 1;
         return 0;
     }
+    if (cmd->vu1Compute && !cmd_load_pipeline(cmd, p))
+        return 0;
     if (cmd->secondaryContents) {
         pvk_error("%s in a rendering begun with PVK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT: "
                   "its draws come from pvkCmdExecuteCommands\n", name);
@@ -2412,4 +2474,171 @@ void pvkCmdDrawIndexedIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t of
         draw_indexed(cmd, "pvkCmdDrawIndexedIndirect", c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset,
                      c.firstInstance);
     }
+}
+
+/* The buffer range the compute shader's block at (set, binding) reads, from the descriptor set
+ * bound there at the compute bind point; NULL fails the buffer. */
+static const struct PvkDescriptorSlot *compute_slot(PvkCommandBuffer cmd, uint32_t set, uint32_t slot,
+                                                    const char *what, uint32_t binding, uint32_t bytes)
+{
+    const PvkPipeline p = cmd->computePipeline;
+    PvkDescriptorSet s = cmd->computeSets[set];
+    const struct PvkDescriptorSlot *d;
+
+    if (!s || !pvk_set_layout_compatible(&s->layout, &p->layout->setLayouts[set])) {
+        pvk_error("pvkCmdDispatch: compute shader '%s' has a %s block at set %u, binding %u, but %s at set index "
+                  "%u of PVK_PIPELINE_BIND_POINT_COMPUTE\n", p->vs->name, what, (unsigned)set, (unsigned)binding,
+                  s ? "a set with another layout is bound" : "no descriptor set is bound", (unsigned)set);
+    } else if (!(d = &s->slots[slot])->buffer) {
+        pvk_error("pvkCmdDispatch: binding %u of the descriptor set at index %u was never written with "
+                  "pvkUpdateDescriptorSets\n", (unsigned)binding, (unsigned)set);
+    } else if (d->range < bytes || d->offset + (d->range + 15) / 16 * 16 > d->buffer->size) {
+        pvk_error("pvkCmdDispatch: the %s block at set %u, binding %u of compute shader '%s' is %u bytes, but the "
+                  "bound buffer range holds %u\n", what, (unsigned)set, (unsigned)binding, p->vs->name,
+                  (unsigned)bytes, (unsigned)d->range);
+    } else {
+        return d;
+    }
+    cmd->failed = 1;
+    return NULL;
+}
+
+void pvkCmdDispatch(PvkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
+{
+    static const char who[] = "pvkCmdDispatch";
+    const PvkPipeline p = cmd->computePipeline;
+    const struct PvkDescriptorSlot *uslot[PVK_MAX_UNIFORM_BLOCKS], *sslot[PVK_MAX_STORAGE_BLOCKS];
+    struct PvkReadback rb = { 0 };
+    const PvkShaderCode *cs;
+    uint32_t i, done, next = PVK_VU1_UNIFORM_ADDR, base[4] = { 0 }, qwords[4] = { 0 }, chunks = 0;
+    float last[4] = { 0 }, lengths[4] = { 0 };
+    u32 *start, *end;
+
+    if (!cmd_compute(cmd, who))
+        return;
+    if (cmd->rendering) {
+        pvk_error("pvkCmdDispatch must be called outside pvkCmdBeginRendering/pvkCmdEndRendering\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (!p) {
+        pvk_error("pvkCmdDispatch needs a pipeline bound at PVK_PIPELINE_BIND_POINT_COMPUTE\n");
+        cmd->failed = 1;
+        return;
+    }
+    if (groupCountX > pvk_limits.maxComputeWorkGroupCount[0] || groupCountY > pvk_limits.maxComputeWorkGroupCount[1] ||
+        groupCountZ > pvk_limits.maxComputeWorkGroupCount[2]) {
+        pvk_error("pvkCmdDispatch: %u x %u x %u work groups; at most %u along each axis (maxComputeWorkGroupCount)\n",
+                  (unsigned)groupCountX, (unsigned)groupCountY, (unsigned)groupCountZ,
+                  (unsigned)pvk_limits.maxComputeWorkGroupCount[0]);
+        cmd->failed = 1;
+        return;
+    }
+    cs = p->vs;
+    if (cs->pushConstantBytes > cmd->pushSet || (cs->pushConstantBytes && !pvk_layout_push_compatible(&cmd->pushLayout, p->layout))) {
+        pvk_error("pvkCmdDispatch: compute shader '%s' reads %u bytes of push constants but only %u were set with "
+                  "pvkCmdPushConstants through the pipeline's layout\n", cs->name, (unsigned)cs->pushConstantBytes,
+                  (unsigned)cmd->pushSet);
+        cmd->failed = 1;
+        return;
+    }
+
+    /* The uniform blocks where shaderc placed them, then the storage blocks one after another. */
+    for (i = 0; i < cs->uniformBlockCount; i++) {
+        const PvkShaderUniformBlock *u = &cs->uniformBlocks[i];
+        if (!(uslot[i] = compute_slot(cmd, u->set, p->uniformSlots[i], "uniform", u->binding, u->bytes)))
+            return;
+        if (PVK_VU1_UNIFORM_ADDR + u->qword + (u->bytes + 15) / 16 > next)
+            next = PVK_VU1_UNIFORM_ADDR + u->qword + (u->bytes + 15) / 16;
+    }
+    for (i = 0; i < cs->storageBlockCount; i++) {
+        const PvkShaderStorageBlock *s = &cs->storageBlocks[i];
+        if (!(sslot[i] = compute_slot(cmd, s->set, p->storageSlots[i], "storage", s->binding, s->bytes)))
+            return;
+        qwords[i] = (uint32_t)((sslot[i]->range + 15) / 16);
+        base[i]   = next;
+        next     += qwords[i];
+        chunks   += (qwords[i] + PVK_MAX_UNPACK_QWORDS - 1) / PVK_MAX_UNPACK_QWORDS;
+        if (s->arrayStride && sslot[i]->range > s->arrayOffset)
+            lengths[i] = (float)((sslot[i]->range - s->arrayOffset) / s->arrayStride);
+        last[i] = lengths[i] > 0.0f ? lengths[i] - 1.0f : 0.0f;
+        if (s->written) {
+            rb.vu1[rb.vu1Count].dst   = (uint8_t *)sslot[i]->buffer->data + sslot[i]->offset;
+            rb.vu1[rb.vu1Count].qword = base[i];
+            rb.vu1[rb.vu1Count].bytes = (uint32_t)sslot[i]->range;
+            rb.vu1Count++;
+        }
+    }
+    if (next > PVK_VU1_MEMORY_QWORDS) {
+        pvk_error("pvkCmdDispatch: compute shader '%s' has uniform and storage blocks of %u bytes together; a "
+                  "dispatch has %u (maxStorageBufferRange)\n", cs->name, (unsigned)(next - PVK_VU1_UNIFORM_ADDR) * 16,
+                  (unsigned)pvk_limits.maxStorageBufferRange);
+        cmd->failed = 1;
+        return;
+    }
+    if (!groupCountX || !groupCountY || !groupCountZ)
+        return;
+
+    start = (u32 *)p->program->code;
+    end   = (u32 *)p->program->codeEnd;
+    if (!cmd_reserve(cmd, packet2_utils_get_packet_size_for_program(start, end) + 32 +
+                          2 * (cs->uniformBlockCount + chunks)) ||
+        (rb.vu1Count && !array_grow(cmd, (void **)&cmd->readbacks, cmd->readbackCount, &cmd->readbackCap,
+                                    sizeof(*cmd->readbacks))))
+        return;
+
+    /* The program (VIF waits for VU1 to stop first), the header, the blocks straight from the buffers, the start. */
+    if (cmd->program == p->program)
+        cmd_flush(cmd);
+    else
+        packet2_vif_add_micro_program(&cmd->packet, 0, start, end);
+    cmd->program    = p->program;
+    cmd->vu1Compute = 1;
+    packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_COMPUTE_GROUPS, 0);
+    packet2_add_float(&cmd->packet, (float)groupCountX);
+    packet2_add_float(&cmd->packet, (float)groupCountY);
+    packet2_add_float(&cmd->packet, (float)groupCountZ);
+    packet2_add_float(&cmd->packet, 0.0f);
+    packet2_add_u32(&cmd->packet, groupCountX);
+    packet2_add_u32(&cmd->packet, groupCountY);
+    packet2_add_u32(&cmd->packet, groupCountZ);
+    packet2_add_u32(&cmd->packet, 0);
+    for (i = 0; i < 4; i++)
+        packet2_add_u32(&cmd->packet, base[i]);
+    for (i = 0; i < 4; i++)
+        packet2_add_float(&cmd->packet, last[i]);
+    packet2_utils_vu_close_unpack(&cmd->packet);
+    packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_COMPUTE_LENGTHS, 0);
+    for (i = 0; i < 4; i++)
+        packet2_add_float(&cmd->packet, lengths[i]);
+    packet2_utils_vu_close_unpack(&cmd->packet);
+    for (i = 0; i < cs->uniformBlockCount; i++)
+        packet2_utils_vu_add_unpack_data(&cmd->packet, PVK_VU1_UNIFORM_ADDR + cs->uniformBlocks[i].qword,
+                                         (uint8_t *)uslot[i]->buffer->data + uslot[i]->offset,
+                                         (cs->uniformBlocks[i].bytes + 15) / 16, 0);
+    for (i = 0; i < cs->storageBlockCount; i++) {
+        for (done = 0; done < qwords[i]; done += PVK_MAX_UNPACK_QWORDS) {
+            uint32_t n = qwords[i] - done < PVK_MAX_UNPACK_QWORDS ? qwords[i] - done : PVK_MAX_UNPACK_QWORDS;
+            packet2_utils_vu_add_unpack_data(&cmd->packet, base[i] + done,
+                                             (uint8_t *)sslot[i]->buffer->data + sslot[i]->offset + (size_t)done * 16, n, 0);
+        }
+    }
+    packet2_utils_vu_add_start_program(&cmd->packet, 0);
+    if (!rb.vu1Count)
+        return;
+
+    /* The DIRECT block's FLUSH waits for the program to end; the SIGNAL stops the chain here
+     * until the INTC_GS handler has copied the written blocks out of VU1 data memory. */
+    {
+        qword_t *q = cmd_open_direct(cmd);
+        q = gs_ad(q, GIF_SET_TAG(1, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+        q = gs_ad(q, GS_SET_SIGNAL(PVK_READBACK_SIGNAL_BIT | cmd->pool->family << 8, 0xFFFFFFFF), GS_REG_SIGNAL);
+        cmd_close_direct(cmd, q);
+    }
+    packet2_chain_open_end(&cmd->packet, 0, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_chain_close_tag(&cmd->packet);
+    rb.resume = (qword_t *)cmd->packet.next;
+    cmd->readbacks[cmd->readbackCount++] = rb;
 }

@@ -226,7 +226,7 @@ int main(void)
             },
         };
         pvkCmdBeginRendering(cmd, &rendering);
-        pvkCmdBindPipeline(cmd, pipeline);
+        pvkCmdBindPipeline(cmd, PVK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(mvp), mvp);
         pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);

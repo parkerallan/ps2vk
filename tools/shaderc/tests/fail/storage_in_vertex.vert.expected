@@ -1,0 +1,1 @@
+storage_in_vertex.vert: error: 'data' is a storage buffer; storage buffers are only available in compute shaders

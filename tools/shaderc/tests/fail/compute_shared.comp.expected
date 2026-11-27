@@ -1,0 +1,1 @@
+compute_shared.comp: error: compute shader declares shared variable 'tmp'; VU1 runs a work group's invocations one after another, so there is no shared memory to share

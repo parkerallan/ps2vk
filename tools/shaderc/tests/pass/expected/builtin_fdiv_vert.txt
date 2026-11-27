@@ -97,7 +97,7 @@ builtin_fdiv_vert_body:
          addq.x        VF06,VF00,Q                NOP
          NOP                                      move.xy       VF07,VF05                  ; line 12: OpCompositeConstruct (a vector constructor)
          addx.z        VF07,VF00,VF06x            NOP
-         addw.w        VF07,VF00,VF00w            NOP
+         maxw.w        VF07,VF00,VF00w            NOP
          NOP                                      rsqrt         Q,VF00w,VF10w              ; line 13: inversesqrt()
          NOP                                      waitq
          addq.x        VF05,VF00,Q                NOP

@@ -143,7 +143,7 @@ if_component_vert_L35:
          NOP                                      ibeq          VI13,VI00,if_component_vert_L43
          NOP                                      NOP                                      ; branch delay slot
          NOP                                      move.xyz      VF08,VF06                  ; line 16: OpCompositeInsert (a component write)
-         addx.w        VF08,VF00,VF05x            NOP
+         mulx.w        VF08,VF00,VF05x            NOP
          NOP                                      move.xyzw     VF07,VF08                  ; line 16: value of this path
 if_component_vert_L43:
          NOP                                      move.xyzw     VF20,VF10                  ; gl_Position

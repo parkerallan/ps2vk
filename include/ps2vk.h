@@ -19,7 +19,7 @@ extern "C" {
 /* ======================================================================== */
 /**
  * @defgroup common Results and formats
- * @brief Result codes and data formats used throughout the API.
+ * @brief Result codes, data formats, structure types and allocation callbacks used throughout the API.
  * @{
  */
 
@@ -50,6 +50,7 @@ typedef enum PvkStructureType {
     PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO                            = 3,          /**< PvkDeviceCreateInfo. */
     PVK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO                     = 16,         /**< PvkShaderModuleCreateInfo. */
     PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO      = 23,         /**< PvkPipelineRasterizationStateCreateInfo. */
+    PVK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO                  = 29,         /**< PvkComputePipelineCreateInfo. */
     PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2                    = 1000059000, /**< PvkPhysicalDeviceFeatures2. */
     PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2                  = 1000059001, /**< PvkPhysicalDeviceProperties2. */
     PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES   = 1000259000, /**< PvkPhysicalDeviceLineRasterizationFeatures. */
@@ -57,6 +58,55 @@ typedef enum PvkStructureType {
     PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES = 1000259002, /**< PvkPhysicalDeviceLineRasterizationProperties. */
     PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_POLYGON_STATE_CREATE_INFO = 2000000000 /**< PS2 only: PvkPipelineRasterizationPolygonStateCreateInfo. */
 } PvkStructureType;
+
+/** @brief How long an allocation made through PvkAllocationCallbacks lives. */
+typedef enum PvkSystemAllocationScope {
+    PVK_SYSTEM_ALLOCATION_SCOPE_COMMAND  = 0, /**< Until the call that made it returns. */
+    PVK_SYSTEM_ALLOCATION_SCOPE_OBJECT   = 1, /**< As long as the object being created. */
+    PVK_SYSTEM_ALLOCATION_SCOPE_CACHE    = 2, /**< As long as a pipeline cache. */
+    PVK_SYSTEM_ALLOCATION_SCOPE_DEVICE   = 3, /**< As long as the device. */
+    PVK_SYSTEM_ALLOCATION_SCOPE_INSTANCE = 4  /**< As long as the instance. */
+} PvkSystemAllocationScope;
+
+/** @brief What memory reported to the internal allocation notifications holds. */
+typedef enum PvkInternalAllocationType {
+    PVK_INTERNAL_ALLOCATION_TYPE_EXECUTABLE = 0 /**< Code. */
+} PvkInternalAllocationType;
+
+/** @brief Returns size bytes aligned to alignment, or NULL when out of memory. */
+typedef void *(*PFN_pvkAllocationFunction)(void *pUserData, size_t size, size_t alignment,
+                                           PvkSystemAllocationScope allocationScope);
+/** @brief Resizes pOriginal to size bytes aligned to alignment, keeping its contents. */
+typedef void *(*PFN_pvkReallocationFunction)(void *pUserData, void *pOriginal, size_t size, size_t alignment,
+                                             PvkSystemAllocationScope allocationScope);
+/** @brief Frees memory the allocation or reallocation function returned; NULL does nothing. */
+typedef void (*PFN_pvkFreeFunction)(void *pUserData, void *pMemory);
+/** @brief Tells the application of memory the library allocated itself. */
+typedef void (*PFN_pvkInternalAllocationNotification)(void *pUserData, size_t size,
+                                                      PvkInternalAllocationType allocationType,
+                                                      PvkSystemAllocationScope allocationScope);
+/** @brief Tells the application of memory the library freed itself. */
+typedef void (*PFN_pvkInternalFreeNotification)(void *pUserData, size_t size, PvkInternalAllocationType allocationType,
+                                                PvkSystemAllocationScope allocationScope);
+
+/**
+ * @brief Host memory allocation callbacks for pvkCreateComputePipelines().
+ *
+ * A pipeline created with callbacks gets its struct and its VU1 program from
+ * pfnAllocation with PVK_SYSTEM_ALLOCATION_SCOPE_OBJECT. pvkDestroyPipeline()
+ * given the same callbacks frees the struct with pfnFree. The program may be
+ * shared through a PvkPipelineCache with pipelines created later, so it keeps
+ * a copy of the callbacks and frees itself with them when the last pipeline
+ * or cache holding it lets go; the callbacks must stay valid until then.
+ */
+typedef struct PvkAllocationCallbacks {
+    void                                 *pUserData;             /**< Passed to every callback. */
+    PFN_pvkAllocationFunction             pfnAllocation;         /**< Allocates. */
+    PFN_pvkReallocationFunction           pfnReallocation;       /**< Reallocates; ps2vk does not call it. */
+    PFN_pvkFreeFunction                   pfnFree;               /**< Frees. */
+    PFN_pvkInternalAllocationNotification pfnInternalAllocation; /**< NULL, or told of the library's own allocations; ps2vk makes none it reports. */
+    PFN_pvkInternalFreeNotification       pfnInternalFree;       /**< NULL, or told of the library's own frees; ps2vk makes none it reports. */
+} PvkAllocationCallbacks;
 
 /**
  * @brief Data formats for vertex attributes and images.
@@ -221,6 +271,11 @@ typedef enum PvkPhysicalDeviceType {
  * | maxDescriptorSetBindings (PS2 only) | PVK_MAX_DESCRIPTOR_BINDINGS | the binding table of a set |
  * | maxPerStageDescriptorSamplers, maxPerStageDescriptorSampledImages | 1 | the GS has one TEX0 |
  * | maxPerStageDescriptorUniformBuffers | PVK_MAX_UNIFORM_BLOCKS | shaderc's block table |
+ * | maxStorageBufferRange | PVK_MAX_STORAGE_BYTES | VU1 data memory (16384 bytes) less the dispatch header, the push constants and the invocation qwords |
+ * | maxPerStageDescriptorStorageBuffers | PVK_MAX_STORAGE_BLOCKS | one VU1 integer register holds each block's address |
+ * | maxComputeWorkGroupCount | 65535 per axis | a 16-bit VU1 integer register counts an axis's work groups |
+ * | maxComputeWorkGroupSize | PVK_MAX_COMPUTE_WORK_GROUP_SIZE per axis | VU1 keeps the invocation IDs as floats, exact below 16777216 |
+ * | maxComputeWorkGroupInvocations | PVK_MAX_COMPUTE_WORK_GROUP_SIZE cubed | VU1 keeps gl_LocalInvocationIndex as a float, exact below 16777216 |
  * | maxVertexInputAttributes | PVK_MAX_VERTEX_INPUTS | one VU1 input qword each |
  * | maxVertexInputBindings | PVK_MAX_VERTEX_BINDINGS | one DMA REF per binding per batch |
  * | maxViewports | 1 | one XYOFFSET/SCISSOR pair |
@@ -229,7 +284,7 @@ typedef enum PvkPhysicalDeviceType {
  * | maxFramebufferWidth, maxFramebufferHeight | 2048 | FRAME.FBW in 64-pixel units, DISPLAY height |
  * | maxColorAttachments | 1 | one FRAME register |
  * | maxDrawIndirectCount | 4294967295 | the EE reads each command when the draw is recorded |
- * | minUniformBufferOffsetAlignment, minMemoryMapAlignment | 16, 64 | a VIF UNPACK qword, a cache line |
+ * | minUniformBufferOffsetAlignment, minStorageBufferOffsetAlignment, minMemoryMapAlignment | 16, 16, 64 | a VIF UNPACK qword, a VIF UNPACK qword, a cache line |
  * | maxSamplerLodBias | 127.9375 | TEX1.K is signed 7.4 fixed point |
  * | maxSamplerAnisotropy | 1 | none |
  * | pointSizeRange, lineWidthRange | 1 to 1 | GS points and lines are one pixel |
@@ -247,6 +302,11 @@ typedef struct PvkPhysicalDeviceLimits {
     uint32_t maxPerStageDescriptorSamplers;       /**< Samplers one shader stage reads. */
     uint32_t maxPerStageDescriptorUniformBuffers; /**< Uniform buffers one shader stage reads. */
     uint32_t maxPerStageDescriptorSampledImages;  /**< Sampled images one shader stage reads. */
+    uint32_t maxStorageBufferRange;               /**< Largest storage buffer range, in bytes. */
+    uint32_t maxPerStageDescriptorStorageBuffers; /**< Storage buffers one shader stage reads and writes. */
+    uint32_t maxComputeWorkGroupCount[3];         /**< Largest groupCountX, groupCountY and groupCountZ of pvkCmdDispatch(). */
+    uint32_t maxComputeWorkGroupInvocations;      /**< Most invocations in one work group: the product of a compute shader's local sizes. */
+    uint32_t maxComputeWorkGroupSize[3];          /**< Largest local_size_x, local_size_y and local_size_z of a compute shader. */
     uint32_t maxVertexInputAttributes;            /**< Vertex attributes a pipeline declares. */
     uint32_t maxVertexInputBindings;              /**< Vertex buffer bindings a pipeline declares. */
     uint32_t maxViewports;                        /**< Viewports a pipeline has. */
@@ -256,7 +316,8 @@ typedef struct PvkPhysicalDeviceLimits {
     uint32_t maxFramebufferHeight;                /**< Tallest color or depth attachment. */
     uint32_t maxColorAttachments;                 /**< Color attachments of one rendering pass. */
     uint32_t maxDrawIndirectCount;                /**< Largest drawCount of pvkCmdDrawIndirect() and pvkCmdDrawIndexedIndirect(). */
-    size_t   minUniformBufferOffsetAlignment;     /**< Alignment of PvkDescriptorBufferInfo::offset. */
+    size_t   minUniformBufferOffsetAlignment;     /**< Alignment of PvkDescriptorBufferInfo::offset for a uniform buffer. */
+    uint64_t minStorageBufferOffsetAlignment;     /**< Alignment of PvkDescriptorBufferInfo::offset for a storage buffer. */
     size_t   minMemoryMapAlignment;               /**< Alignment of what pvkMapMemory() returns. */
     float    maxSamplerLodBias;                   /**< Largest magnitude of PvkSamplerCreateInfo::mipLodBias. */
     float    maxSamplerAnisotropy;                /**< Largest anisotropy; 1 means none. */
@@ -287,14 +348,15 @@ typedef struct PvkPhysicalDeviceProperties {
  * pvkGetPhysicalDeviceFeatures() says which the hardware supports; every
  * feature is off unless the application enables it in PvkDeviceCreateInfo,
  * and pvkCreateDevice() fails with PVK_ERROR_FEATURE_NOT_PRESENT for one the
- * hardware lacks. With robustBufferAccess a vertex shader's run-time index
- * into a block array (see PvkShaderUniformBlock) is clamped to the array, so
- * an index past the end reads the last element; the PS2 pays 3 to 4 VU1
- * instructions per indexed read for it. Off, such a read takes whatever VU1
- * memory follows the array, undefined. With multiDrawIndirect an indirect
- * draw takes a drawCount above 1; with drawIndirectFirstInstance an indirect
- * command's firstInstance may be nonzero. The EE reads every command, so both
- * cost nothing on the PS2.
+ * hardware lacks. With robustBufferAccess a vertex or compute shader's
+ * run-time index into a block array (see PvkShaderUniformBlock and
+ * PvkShaderStorageBlock) is clamped to the array, so an index past the end
+ * reads or writes the last element; the PS2 pays 3 to 4 VU1 instructions per
+ * indexed access for it. Off, such an access takes whatever VU1 memory
+ * follows the array, undefined. With multiDrawIndirect an indirect draw takes
+ * a drawCount above 1; with drawIndirectFirstInstance an indirect command's
+ * firstInstance may be nonzero. The EE reads every command, so both cost
+ * nothing on the PS2.
  */
 typedef struct PvkPhysicalDeviceFeatures {
     uint32_t robustBufferAccess;       /**< Nonzero: run-time indices into block arrays are clamped. */
@@ -408,6 +470,7 @@ typedef struct PvkPhysicalDeviceMemoryProperties {
 /** @brief What a queue family's queues can do. */
 typedef enum PvkQueueFlagBits {
     PVK_QUEUE_GRAPHICS_BIT = 0x00000001, /**< Draws: pvkCmdBeginRendering() and everything inside it. */
+    PVK_QUEUE_COMPUTE_BIT  = 0x00000002, /**< Dispatches: pvkCmdDispatch(). */
     PVK_QUEUE_TRANSFER_BIT = 0x00000004  /**< Copies: pvkCmdCopyBufferToImage() and pvkCmdCopyImageToBuffer(). A graphics family has it too. */
 } PvkQueueFlagBits;
 /** @brief Bitmask of PvkQueueFlagBits. */
@@ -430,7 +493,9 @@ typedef struct PvkExtent3D {
 /**
  * @brief One queue family: a kind of queue and how many of it the device has.
  *
- * Family 0 is the graphics queue: VIF1 and PATH2, GRAPHICS and TRANSFER.
+ * Family 0 is the graphics queue: VIF1 and PATH2, GRAPHICS, COMPUTE and
+ * TRANSFER; VIF1 is the one way into VU1, which runs the vertex and the
+ * compute shaders, so a draw and a dispatch take turns on it.
  * Family 1 is the transfer queue: the GIF DMA channel and PATH3, TRANSFER
  * only. Each has one queue; family 0 alone presents.
  */
@@ -1233,15 +1298,16 @@ typedef struct PvkShaderModule_T  *PvkShaderModule;
 typedef struct PvkPipelineLayout_T *PvkPipelineLayout;
 /** @brief The shape of a descriptor set: which bindings it has and what each holds (see @ref descriptors). */
 typedef struct PvkDescriptorSetLayout_T *PvkDescriptorSetLayout;
-/** @brief A vertex shader (VU1 code) plus GS state, created ahead of time. */
+/** @brief A vertex shader (VU1 code) plus GS state, or a compute shader (VU1 code), created ahead of time. */
 typedef struct PvkPipeline_T      *PvkPipeline;
 /** @brief Holds the VU1 programs of the pipelines created through it, so pipelines with the same program share one copy (see PvkPipelineCacheCreateInfo). */
 typedef struct PvkPipelineCache_T *PvkPipelineCache;
 
 /** @brief Shader stages. The values are bits, so they can be ORed into a stage mask. */
 typedef enum PvkShaderStage {
-    PVK_SHADER_STAGE_VERTEX   = 1, /**< Runs on VU1. */
-    PVK_SHADER_STAGE_FRAGMENT = 2  /**< Becomes GS settings. */
+    PVK_SHADER_STAGE_VERTEX      = 1,   /**< Runs on VU1, once per vertex of a draw. */
+    PVK_SHADER_STAGE_FRAGMENT    = 2,   /**< Becomes GS settings. */
+    PVK_SHADER_STAGE_COMPUTE_BIT = 0x20 /**< Runs on VU1, once per invocation of a pvkCmdDispatch(). */
 } PvkShaderStage;
 
 /**
@@ -1282,6 +1348,15 @@ typedef enum PvkPrimitiveTopology {
 /** @brief VU1 memory set aside for a vertex shader's uniform blocks together, in bytes. */
 #define PVK_MAX_UNIFORM_BYTES 1024
 
+/** @brief Most storage blocks one compute shader can declare. */
+#define PVK_MAX_STORAGE_BLOCKS 4
+
+/** @brief VU1 data memory a dispatch's storage blocks and uniform blocks share, in bytes: 1008 of its 1024 qwords. */
+#define PVK_MAX_STORAGE_BYTES 16128
+
+/** @brief Largest local_size_x, local_size_y and local_size_z of a compute shader. */
+#define PVK_MAX_COMPUTE_WORK_GROUP_SIZE 256
+
 /**
  * @brief A uniform block of a vertex shader and where VU1 keeps it.
  *
@@ -1304,6 +1379,40 @@ typedef struct PvkShaderUniformBlock {
     uint32_t qword;   /**< First qword of the block in the uniform area. */
     uint32_t bytes;   /**< Size of the block, std140. */
 } PvkShaderUniformBlock;
+
+/**
+ * @brief A storage block of a compute shader and how its buffer range is used.
+ *
+ * pvkCmdDispatch() copies the buffer range bound to each block into VU1 data
+ * memory, one block after another in (set, binding) order behind the
+ * shader's uniform blocks, and copies a block the shader writes back into
+ * the buffer when VU1 has finished. Each range is rounded up to 16 bytes;
+ * the ranges of one dispatch and the shader's uniform blocks together take
+ * at most PVK_MAX_STORAGE_BYTES.
+ *
+ * A block (std430) holds float, int, uint, vec2, vec3, vec4 and matrix
+ * members, structs of those and arrays of any of them; its last member may
+ * be a runtime array, whose length() is the bound range's bytes past
+ * arrayOffset divided by arrayStride. A float, int, uint or vector is read
+ * or written alone, a struct of those also whole, a matrix is read whole or
+ * by column and written by column. An array element or matrix column may be
+ * picked at run time by an int or uint, one such index per access. VU1 forms
+ * the address in an integer register, so those elements must be whole
+ * 16-byte qwords (vec4, matrices, structs of 16, 32, ... bytes) and a
+ * vector's component cannot be picked. The index is clamped to the array
+ * only when the device has PvkPhysicalDeviceFeatures::robustBufferAccess.
+ * VU1 computes with floats: an int or uint member is converted when
+ * arithmetic reads it and when a computed value is stored to it, exact up to
+ * 16777216.
+ */
+typedef struct PvkShaderStorageBlock {
+    uint32_t set;         /**< Descriptor set index of the block (0 when the GLSL names none). */
+    uint32_t binding;     /**< Its binding number. */
+    uint32_t bytes;       /**< Size of the block without its runtime array: the smallest range that may be bound. */
+    uint32_t arrayOffset; /**< Byte offset of its runtime array. */
+    uint32_t arrayStride; /**< Bytes per element of the runtime array, or 0 when the block has none. */
+    uint32_t written;     /**< Nonzero when the shader stores to the block: the dispatch copies the range back into the buffer. */
+} PvkShaderStorageBlock;
 
 /** @brief What a specialization constant of a vertex shader holds. VU1 computes with floats, so the pipeline converts the value to one. */
 typedef enum PvkSpecConstantType {
@@ -1348,25 +1457,25 @@ typedef struct PvkShaderSpecConstant {
  * file's bytes.
  */
 typedef struct PvkShaderCode {
-    PvkShaderStage stage;                  /**< Vertex or fragment. */
+    PvkShaderStage stage;                  /**< Vertex, fragment or compute. */
     const char    *name;                   /**< Source file name, for error messages. */
     const char    *entryPoint;             /**< Name of its entry point, as the GLSL declares it (main). */
 
-    const uint32_t *vu1CodeStart;          /**< Vertex: start of the VU1 microcode, copied out of the .pvs file. */
-    const uint32_t *vu1CodeEnd;            /**< Vertex: end of the VU1 microcode. */
+    const uint32_t *vu1CodeStart;          /**< Vertex and compute: start of the VU1 microcode, copied out of the .pvs file. */
+    const uint32_t *vu1CodeEnd;            /**< Vertex and compute: end of the VU1 microcode. */
     const uint32_t *vu1Convert;            /**< Vertex: the input conversion block in the microcode, preceded by one load per input: a branch, its delay slot, then 4 instructions per input (itof0 with loi scale, muli with loi -1, maxi, mul by VF00). pvkCreateGraphicsPipeline() rewrites the block in its copy of the code for each attribute's format and points each load at the input's qword of the vertex or the instance. */
-    uint32_t        vu1ClampCount;         /**< Vertex: number of entries in vu1Clamps. */
-    const uint32_t *const *vu1Clamps;      /**< Vertex: the run-time index clamps in the microcode, 3 instruction pairs each, NOP'd in the pipeline's copy unless the device has robustBufferAccess. */
-    uint32_t        vu1SpecConstantCount;  /**< Vertex: number of entries in vu1SpecConstants. */
-    const PvkShaderSpecConstant *vu1SpecConstants; /**< Vertex: its specialization constants, each the LOI immediate in the microcode that holds its default; pvkCreateGraphicsPipeline() overwrites the immediate in its copy of the code with the value the stage's PvkSpecializationInfo gives it. */
+    uint32_t        vu1ClampCount;         /**< Vertex and compute: number of entries in vu1Clamps. */
+    const uint32_t *const *vu1Clamps;      /**< Vertex and compute: the run-time index clamps in the microcode, 3 instruction pairs each, NOP'd in the pipeline's copy unless the device has robustBufferAccess. */
+    uint32_t        vu1SpecConstantCount;  /**< Vertex and compute: number of entries in vu1SpecConstants. */
+    const PvkShaderSpecConstant *vu1SpecConstants; /**< Vertex and compute: its specialization constants, each the LOI immediate in the microcode that holds its default; pvkCreateGraphicsPipeline() or pvkCreateComputePipelines() overwrites the immediate in its copy of the code with the value the stage's PvkSpecializationInfo gives it. */
     uint32_t        inputCount;            /**< Vertex: number of inputs, each one vec4. */
     uint32_t        inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< Vertex: input locations, in the order VU1 reads them. */
     int32_t         colorOutputLocation;   /**< Vertex: location of the color output, or -1 if none. */
     int32_t         texcoordOutputLocation;/**< Vertex: location of the vec2 texture coordinate output, or -1 if none. When set, VU1 emits ST (or UV for a sampler with unnormalizedCoordinates), RGBAQ, XYZ2 per vertex instead of RGBAQ, XYZ2. */
     int32_t         fogOutputLocation;     /**< Vertex: location of the float output, the fog amount, or -1 if none. When set, VU1 clamps the value to 0..1 (0 = all fog, 1 = no fog, in 256 steps) and emits it per vertex in the GS FOG register, between RGBAQ and XYZ2; the GS interpolates it across the primitive. */
-    uint32_t        pushConstantBytes;     /**< Vertex: size of its push constant block, 0 if it has none. */
-    uint32_t        uniformBlockCount;     /**< Vertex: number of entries in uniformBlocks. */
-    PvkShaderUniformBlock uniformBlocks[PVK_MAX_UNIFORM_BLOCKS]; /**< Vertex: its uniform blocks, in (set, binding) order. */
+    uint32_t        pushConstantBytes;     /**< Vertex and compute: size of its push constant block, 0 if it has none. */
+    uint32_t        uniformBlockCount;     /**< Vertex and compute: number of entries in uniformBlocks. */
+    PvkShaderUniformBlock uniformBlocks[PVK_MAX_UNIFORM_BLOCKS]; /**< Vertex and compute: its uniform blocks, in (set, binding) order. */
 
     int32_t         colorInputLocation;   /**< Fragment: location of the color input it uses, or -1 if none. */
     int32_t         texcoordInputLocation; /**< Fragment: location of the vec2 input it samples with, or -1 if it does not sample. */
@@ -1381,12 +1490,16 @@ typedef struct PvkShaderCode {
     int32_t         fogInputLocation;      /**< Fragment: location of the float input it fogs by, or -1 if it does not fog. */
     uint32_t        fog;                   /**< Fragment: GS PRIM.FGE, 1 when the shader mixes the red, green and blue of the color it writes with a constant vec3 by its float input, and keeps the alpha; shaderc rejects any other mix(). */
     uint32_t        fogColor;              /**< Fragment: GS FOGCOL, the constant the shader mixes with: red in bits 0-7, green in bits 8-15, blue in bits 16-23. */
+
+    uint32_t        localSize[3];          /**< Compute: local_size_x, local_size_y and local_size_z, the invocations of one work group along each axis. The microcode holds the loops over a dispatch's work groups and over these. */
+    uint32_t        storageBlockCount;     /**< Compute: number of entries in storageBlocks. */
+    PvkShaderStorageBlock storageBlocks[PVK_MAX_STORAGE_BLOCKS]; /**< Compute: its storage blocks, in (set, binding) order. */
 } PvkShaderCode;
 
 /** @brief The first word of a .pvs file: "PVS1". */
 #define PVK_PVS_MAGIC   0x31535650u
 /** @brief The .pvs layout version PvkPvsHeader describes. */
-#define PVK_PVS_VERSION 1u
+#define PVK_PVS_VERSION 2u
 
 /** @brief One specialization constant of a vertex shader in a .pvs file. */
 typedef struct PvkPvsSpecConstant {
@@ -1399,14 +1512,14 @@ typedef struct PvkPvsSpecConstant {
  * @brief The header of a .pvs file: a compiled shader as tools/shaderc writes it and pvkCreateShaderModule() reads it.
  *
  * The header is followed by the shader's name and entry point (NUL-terminated
- * strings) and, for a vertex shader, the word offsets of its run-time index
- * clamps, its specialization constants and its VU1 microcode. Every value is
- * a little-endian 32-bit word and every offset counts bytes from the start of
- * the file. The fields from inputCount on are the PvkShaderCode fields of the
- * same names.
+ * strings) and, for a vertex or compute shader, the word offsets of its
+ * run-time index clamps, its specialization constants and its VU1 microcode.
+ * Every value is a little-endian 32-bit word and every offset counts bytes
+ * from the start of the file. The fields from inputCount on are the
+ * PvkShaderCode fields of the same names.
  *
- * For a vertex shader, shaderc writes the VU1 assembly, runs dvp-as on it and
- * puts the assembled microcode into the file.
+ * For a vertex or compute shader, shaderc writes the VU1 assembly, runs
+ * dvp-as on it and puts the assembled microcode into the file.
  */
 typedef struct PvkPvsHeader {
     uint32_t magic;            /**< PVK_PVS_MAGIC. */
@@ -1415,13 +1528,13 @@ typedef struct PvkPvsHeader {
     uint32_t stage;            /**< PvkShaderStage. */
     uint32_t nameOffset;       /**< The source file name. */
     uint32_t entryPointOffset; /**< The entry point's name. */
-    uint32_t codeOffset;       /**< Vertex: the VU1 microcode. */
-    uint32_t codeWords;        /**< Vertex: its size in 32-bit words. */
+    uint32_t codeOffset;       /**< Vertex and compute: the VU1 microcode. */
+    uint32_t codeWords;        /**< Vertex and compute: its size in 32-bit words. */
     uint32_t convertWord;      /**< Vertex: word offset of the input conversion block in the microcode. */
-    uint32_t clampCount;       /**< Vertex: number of run-time index clamps. */
-    uint32_t clampsOffset;     /**< Vertex: their word offsets in the microcode, one uint32_t each. */
-    uint32_t specCount;        /**< Vertex: number of specialization constants. */
-    uint32_t specsOffset;      /**< Vertex: the PvkPvsSpecConstant entries. */
+    uint32_t clampCount;       /**< Vertex and compute: number of run-time index clamps. */
+    uint32_t clampsOffset;     /**< Vertex and compute: their word offsets in the microcode, one uint32_t each. */
+    uint32_t specCount;        /**< Vertex and compute: number of specialization constants. */
+    uint32_t specsOffset;      /**< Vertex and compute: the PvkPvsSpecConstant entries. */
     uint32_t inputCount;       /**< PvkShaderCode::inputCount. */
     uint32_t inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< PvkShaderCode::inputLocations. */
     int32_t  colorOutputLocation;    /**< PvkShaderCode::colorOutputLocation. */
@@ -1443,6 +1556,9 @@ typedef struct PvkPvsHeader {
     int32_t  fogInputLocation;       /**< PvkShaderCode::fogInputLocation. */
     uint32_t fog;                    /**< PvkShaderCode::fog. */
     uint32_t fogColor;               /**< PvkShaderCode::fogColor. */
+    uint32_t localSize[3];           /**< PvkShaderCode::localSize. */
+    uint32_t storageBlockCount;      /**< PvkShaderCode::storageBlockCount. */
+    PvkShaderStorageBlock storageBlocks[PVK_MAX_STORAGE_BLOCKS]; /**< PvkShaderCode::storageBlocks. */
 } PvkPvsHeader;
 
 /**
@@ -1463,7 +1579,7 @@ typedef struct PvkShaderModuleCreateInfo {
 
 /** @brief Part of the push constant range that one or more shader stages read. */
 typedef struct PvkPushConstantRange {
-    uint32_t stageFlags; /**< PvkShaderStage values ORed together. Only the vertex stage can read push constants on the PS2. */
+    uint32_t stageFlags; /**< PvkShaderStage values ORed together. Only the vertex and compute stages can read push constants on the PS2. */
     uint32_t offset;     /**< First byte of the range; a multiple of 4. */
     uint32_t size;       /**< Bytes in the range; a multiple of 4, offset + size at most PVK_MAX_PUSH_CONSTANT_BYTES. */
 } PvkPushConstantRange;
@@ -1487,13 +1603,14 @@ typedef struct PvkPipelineLayoutCreateInfo {
  * The layout says which bytes of the 128-byte push constant range each shader
  * stage may read, which on the PS2 is the VU1 memory pvkCmdPushConstants()
  * writes, and which descriptor sets the shaders expect. A pipeline's vertex
- * shader must have its push constant block inside the layout's vertex ranges,
- * pvkCmdPushConstants() may only write bytes the layout gives the stages it
- * names, a fragment shader's sampler2D must be a combined image sampler
- * binding in the set layout at its set index, and each of the vertex shader's
- * uniform blocks must be a uniform buffer binding, for the vertex stage, in
- * the set layout at its set index. The set layouts are copied, so they may be
- * destroyed afterwards.
+ * or compute shader must have its push constant block inside the layout's
+ * ranges for its stage, pvkCmdPushConstants() may only write bytes the layout
+ * gives the stages it names, a fragment shader's sampler2D must be a combined
+ * image sampler binding in the set layout at its set index, and each of the
+ * vertex or compute shader's uniform blocks must be a uniform buffer binding,
+ * and each of a compute shader's storage blocks a storage buffer binding, for
+ * its stage, in the set layout at its set index. The set layouts are copied,
+ * so they may be destroyed afterwards.
  *
  * @param device The device.
  * @param info Layout parameters.
@@ -1916,13 +2033,13 @@ typedef struct PvkSpecializationInfo {
 } PvkSpecializationInfo;
 
 /**
- * @brief One shader stage of a graphics pipeline.
+ * @brief One shader stage of a pipeline.
  */
 typedef struct PvkPipelineShaderStageCreateInfo {
-    PvkShaderStage               stage;              /**< PVK_SHADER_STAGE_VERTEX or PVK_SHADER_STAGE_FRAGMENT; the module's stage. */
+    PvkShaderStage               stage;              /**< PVK_SHADER_STAGE_VERTEX or PVK_SHADER_STAGE_FRAGMENT in a graphics pipeline, PVK_SHADER_STAGE_COMPUTE_BIT in a compute pipeline; the module's stage. */
     PvkShaderModule              module;             /**< The shader for that stage. */
     const char                  *name;               /**< Entry point to run: the module's PvkShaderCode::entryPoint. */
-    const PvkSpecializationInfo *specializationInfo; /**< Values for the shader's specialization constants, or NULL to keep every default. Only a vertex shader has any. */
+    const PvkSpecializationInfo *specializationInfo; /**< Values for the shader's specialization constants, or NULL to keep every default. Only a vertex or compute shader has any. */
 } PvkPipelineShaderStageCreateInfo;
 
 /**
@@ -1977,7 +2094,8 @@ typedef struct PvkGraphicsPipelineCreateInfo {
  * @param[out] module The new shader module.
  * @return PVK_SUCCESS; PVK_ERROR_VALIDATION_FAILED for a wrong sType or nonzero flags;
  *         PVK_ERROR_INVALID_SHADER for bytes that are no .pvs file of this version, are
- *         cut short, or hold a vertex shader without microcode; or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ *         cut short, or hold a vertex or compute shader without microcode; or
+ *         PVK_ERROR_OUT_OF_HOST_MEMORY.
  */
 PvkResult pvkCreateShaderModule(PvkDevice device, const PvkShaderModuleCreateInfo *info, PvkShaderModule *module);
 
@@ -2023,6 +2141,51 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
 PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, const PvkGraphicsPipelineCreateInfo *info,
                                     PvkPipeline *pipeline);
 
+/** @brief Parameters for one pipeline of pvkCreateComputePipelines(). */
+typedef struct PvkComputePipelineCreateInfo {
+    PvkStructureType                 sType;              /**< PVK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO. */
+    const void                      *pNext;              /**< NULL. */
+    uint32_t                         flags;              /**< 0. */
+    PvkPipelineShaderStageCreateInfo stage;              /**< The PVK_SHADER_STAGE_COMPUTE_BIT stage. */
+    PvkPipelineLayout                layout;             /**< Layout whose compute push constant ranges cover the shader's block and whose set layouts hold its uniform and storage blocks. */
+    PvkPipeline                      basePipelineHandle; /**< Ignored: flags has no derivative bit, so no pipeline is derived from another. */
+    int32_t                          basePipelineIndex;  /**< Ignored, as basePipelineHandle. */
+} PvkComputePipelineCreateInfo;
+
+/**
+ * @brief Creates compute pipelines.
+ *
+ * Creates one pipeline for each of the createInfoCount entries of
+ * pCreateInfos into the same entry of pPipelines. Every entry is tried; an
+ * entry that fails gets NULL and the call returns the first entry's failure.
+ *
+ * For each entry, checks the sType and flags, and that the stage holds a
+ * compute shader that matches the pipeline layout: its push constant block
+ * inside the layout's compute ranges, each uniform block a
+ * PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER binding and each storage block a
+ * PVK_DESCRIPTOR_TYPE_STORAGE_BUFFER binding for the compute stage in the set
+ * layout at its set index. The pipeline keeps its own copy of the shader's
+ * VU1 code with the stage's specialization constants written in (see
+ * PvkSpecializationInfo) and the run-time index clamps NOP'd unless the
+ * device has robustBufferAccess. A compute shader of more than 2044 VU1
+ * instructions is rejected with PVK_ERROR_INVALID_SHADER. When pipelineCache
+ * is not NULL and already holds a program identical to that copy, the
+ * pipeline shares the cached one (see PvkPipelineCacheCreateInfo). The
+ * pipeline is bound at PVK_PIPELINE_BIND_POINT_COMPUTE and destroyed with
+ * pvkDestroyPipeline().
+ *
+ * @param device The device.
+ * @param pipelineCache Cache the pipelines' programs are looked up in and added to, or NULL.
+ * @param createInfoCount Number of pipelines to create.
+ * @param pCreateInfos Parameters of each pipeline.
+ * @param pAllocator Callbacks the pipelines' memory is allocated with, or NULL (see PvkAllocationCallbacks).
+ * @param[out] pPipelines The new pipelines, createInfoCount of them.
+ * @return PVK_SUCCESS, PVK_ERROR_VALIDATION_FAILED, PVK_ERROR_INVALID_SHADER or PVK_ERROR_OUT_OF_HOST_MEMORY.
+ */
+PvkResult pvkCreateComputePipelines(PvkDevice device, PvkPipelineCache pipelineCache, uint32_t createInfoCount,
+                                    const PvkComputePipelineCreateInfo *pCreateInfos,
+                                    const PvkAllocationCallbacks *pAllocator, PvkPipeline *pPipelines);
+
 /**
  * @brief Creates a pipeline cache.
  * @param device The device.
@@ -2043,25 +2206,30 @@ void      pvkDestroyPipelineCache(PvkDevice device, PvkPipelineCache cache);
  * @brief Destroys a pipeline.
  * @param device The device.
  * @param pipeline Pipeline to destroy.
+ * @param pAllocator The callbacks the pipeline was created with, or NULL if it was created without.
  */
-void      pvkDestroyPipeline(PvkDevice device, PvkPipeline pipeline);
+void      pvkDestroyPipeline(PvkDevice device, PvkPipeline pipeline, const PvkAllocationCallbacks *pAllocator);
 
 /** @} */
 
 /* ======================================================================== */
 /**
  * @defgroup descriptors Descriptor sets
- * @brief Bundles of resources a pipeline's shaders read, bound in one call.
+ * @brief Bundles of resources a pipeline's shaders read or write, bound in one call.
  *
- * A descriptor set layout names the bindings a set has; a pipeline layout lists
- * the set layouts a pipeline expects; sets are allocated from a pool, filled
- * with pvkUpdateDescriptorSets() and bound with pvkCmdBindDescriptorSets().
- * A binding holds a combined image sampler, the texture a fragment shader's
- * sampler2D reads, or a uniform buffer, the memory behind a vertex shader's
- * uniform block. On the PS2 the bound set's image is written into GS TEX0
- * with the draw state, when the command is recorded; its buffers are sent to
- * VU1 memory ahead of the first draw after a bind, by DMA straight from the
- * buffer when the command buffer is submitted.
+ * A descriptor set layout names the bindings a set has; a pipeline layout
+ * lists the set layouts a pipeline expects; sets are allocated from a pool,
+ * filled with pvkUpdateDescriptorSets() and bound with
+ * pvkCmdBindDescriptorSets(). A binding holds a combined image sampler, the
+ * texture a fragment shader's sampler2D reads, a uniform buffer, the memory
+ * behind a vertex or compute shader's uniform block, or a storage buffer, the
+ * memory behind a compute shader's storage block. On the PS2 the bound set's
+ * image is written into GS TEX0 with the draw state, when the command is
+ * recorded; its uniform buffers are sent to VU1 memory ahead of the first
+ * draw after a bind and ahead of every dispatch, by DMA straight from the
+ * buffer when the command buffer is submitted; its storage buffers go to VU1
+ * memory ahead of every dispatch the same way and come back after it (see
+ * pvkCmdDispatch()).
  * @{
  */
 
@@ -2073,7 +2241,8 @@ typedef struct PvkDescriptorSet_T       *PvkDescriptorSet;
 /** @brief What a descriptor binding holds. */
 typedef enum PvkDescriptorType {
     PVK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER = 1, /**< An image view (and its color table) a sampler2D reads: GS TEX0. */
-    PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER         = 6  /**< Part of a PvkBuffer a vertex shader's uniform block reads: VIF UNPACK into VU1 memory. */
+    PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER         = 6, /**< Part of a PvkBuffer a vertex or compute shader's uniform block reads: VIF UNPACK into VU1 memory. */
+    PVK_DESCRIPTOR_TYPE_STORAGE_BUFFER         = 7  /**< Part of a PvkBuffer a compute shader's storage block reads and writes: VIF UNPACK into VU1 memory, and an EE copy out of it after the dispatch. */
 } PvkDescriptorType;
 
 /** @brief Most bindings in one descriptor set layout. */
@@ -2084,7 +2253,7 @@ typedef struct PvkDescriptorSetLayoutBinding {
     uint32_t          binding;         /**< The binding number the shader's layout(binding = n) names. */
     PvkDescriptorType descriptorType;  /**< What it holds. */
     uint32_t          descriptorCount; /**< Must be 1: binding arrays are not supported. */
-    uint32_t          stageFlags;      /**< PvkShaderStage values ORed together; a combined image sampler needs PVK_SHADER_STAGE_FRAGMENT, a uniform buffer PVK_SHADER_STAGE_VERTEX. */
+    uint32_t          stageFlags;      /**< PvkShaderStage values ORed together; a combined image sampler needs PVK_SHADER_STAGE_FRAGMENT, a uniform buffer PVK_SHADER_STAGE_VERTEX or PVK_SHADER_STAGE_COMPUTE_BIT (the stage of the shader that reads it), a storage buffer PVK_SHADER_STAGE_COMPUTE_BIT. */
 } PvkDescriptorSetLayoutBinding;
 
 /** @brief Parameters for pvkCreateDescriptorSetLayout(). */
@@ -2180,11 +2349,11 @@ typedef struct PvkDescriptorImageInfo {
     PvkImage     colorTable; /**< For a PVK_FORMAT_T8 or PVK_FORMAT_T4 image, the color table its indices read (256 entries, or 16 for T4); NULL for other formats. */
 } PvkDescriptorImageInfo;
 
-/** @brief The part of a buffer a uniform buffer binding reads. */
+/** @brief The part of a buffer a uniform buffer or storage buffer binding uses. */
 typedef struct PvkDescriptorBufferInfo {
     PvkBuffer buffer; /**< The buffer. */
     size_t    offset; /**< Byte offset of the block's first byte; a multiple of 16. */
-    size_t    range;  /**< Bytes from offset the block may read, or PVK_WHOLE_SIZE; at least the shader's block size. */
+    size_t    range;  /**< Bytes from offset the block may use, or PVK_WHOLE_SIZE; at least the shader's block size, and for a storage buffer at most PVK_MAX_STORAGE_BYTES. A storage block's runtime array has as many elements as fit in the range. */
 } PvkDescriptorBufferInfo;
 
 /** @brief One binding to fill in with pvkUpdateDescriptorSets(). */
@@ -2193,7 +2362,7 @@ typedef struct PvkWriteDescriptorSet {
     uint32_t                       dstBinding;     /**< The binding number within it. */
     PvkDescriptorType              descriptorType; /**< Must match the binding's type in the set's layout. */
     const PvkDescriptorImageInfo  *imageInfo;      /**< The image, for a combined image sampler. */
-    const PvkDescriptorBufferInfo *bufferInfo;     /**< The buffer range, for a uniform buffer. */
+    const PvkDescriptorBufferInfo *bufferInfo;     /**< The buffer range, for a uniform buffer or a storage buffer. */
 } PvkWriteDescriptorSet;
 
 /**
@@ -2205,7 +2374,10 @@ typedef struct PvkWriteDescriptorSet {
  * DMA when the command buffer is submitted, so the values in the buffer at
  * submit time are what the draws see. The data is laid out as
  * in the shader's block (std140): a mat4 is four 16-byte columns, a vec3 and
- * a float array element each take a 16-byte slot.
+ * a float array element each take a 16-byte slot. A storage buffer's range
+ * is read the same way, by DMA when the submitted command buffer reaches the
+ * dispatch, and laid out as in the shader's block (std430, see
+ * PvkShaderStorageBlock).
  *
  * @param device The device.
  * @param writeCount Number of entries in writes.
@@ -2218,7 +2390,7 @@ void      pvkUpdateDescriptorSets(PvkDevice device, uint32_t writeCount, const P
 /* ======================================================================== */
 /**
  * @defgroup commands Command buffers
- * @brief Recording drawing commands into a list the hardware runs later.
+ * @brief Recording drawing and compute commands into a list the hardware runs later.
  * @{
  */
 
@@ -2544,11 +2716,28 @@ void pvkCmdBeginRendering(PvkCommandBuffer cmd, const PvkRenderingInfo *info);
 void pvkCmdEndRendering(PvkCommandBuffer cmd);
 
 /**
- * @brief Binds a pipeline for the following draws.
+ * @brief What a bound pipeline and its descriptor sets are used by.
+ *
+ * A command buffer holds one pipeline and one table of descriptor sets per
+ * bind point; binding at one leaves the other as it was.
+ */
+typedef enum PvkPipelineBindPoint {
+    PVK_PIPELINE_BIND_POINT_GRAPHICS = 0, /**< The draws: a pipeline from pvkCreateGraphicsPipeline(). */
+    PVK_PIPELINE_BIND_POINT_COMPUTE  = 1  /**< The dispatches: a pipeline from pvkCreateComputePipelines(). */
+} PvkPipelineBindPoint;
+
+/**
+ * @brief Binds a pipeline for the following draws or dispatches.
+ *
+ * A graphics pipeline's program and constants go to VU1 here. A compute
+ * pipeline's go with each pvkCmdDispatch(), since the draws in between use
+ * the same VU1.
+ *
  * @param cmd The command buffer.
+ * @param pipelineBindPoint The bind point; must be the one of the pipeline's kind.
  * @param pipeline The pipeline.
  */
-void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipeline pipeline);
+void pvkCmdBindPipeline(PvkCommandBuffer cmd, PvkPipelineBindPoint pipelineBindPoint, PvkPipeline pipeline);
 
 /**
  * @brief Sets the viewport for the following draws with a pipeline that has PVK_DYNAMIC_STATE_VIEWPORT.
@@ -2607,13 +2796,14 @@ void pvkCmdSetBlendConstants(PvkCommandBuffer cmd, const float blendConstants[4]
 void pvkCmdSetLineStipple(PvkCommandBuffer cmd, uint32_t lineStippleFactor, uint16_t lineStipplePattern);
 
 /**
- * @brief Sets push constants for the following draws.
+ * @brief Sets push constants for the following draws and dispatches.
  *
  * The bytes written must lie in the layout's ranges for every stage in
  * stageFlags. The data is copied, so it may change after this call. The
  * values stay set across pvkCmdBindPipeline() as long as the new pipeline's
  * layout has the same push constant ranges; pvkCmdDraw() fails if the vertex
- * shader reads bytes that were not set with a matching layout.
+ * shader, and pvkCmdDispatch() if the compute shader, reads bytes that were
+ * not set with a matching layout. The one range serves both bind points.
  *
  * @param cmd The command buffer.
  * @param layout Pipeline layout the ranges come from.
@@ -2757,25 +2947,63 @@ void pvkCmdCopyImageToBuffer(PvkCommandBuffer commandBuffer, PvkImage srcImage, 
                              PvkBuffer dstBuffer, uint32_t regionCount, const PvkBufferImageCopy *pRegions);
 
 /**
- * @brief Binds descriptor sets for the following draws.
+ * @brief Binds descriptor sets for the following draws or dispatches.
  *
- * Set i of the array goes to set index firstSet + i, replacing whatever was
- * bound there. A draw reads the sets at the indices the fragment shader's
- * sampler2D and the vertex shader's uniform blocks name; each such set's
- * layout must have the same bindings as the pipeline layout's set layout at
- * that index, and the bindings must have been written. Texture coordinates
- * run 0..1 over the bound image. Sets may be bound before or after the
- * pipeline. The first draw after a bind of sets or a pipeline sends the
- * uniform blocks' buffers to VU1 again, after waiting for the running batch.
+ * Set i of the array goes to set index firstSet + i of the bind point's
+ * table, replacing whatever was bound there. A draw reads the sets at the
+ * indices the fragment shader's sampler2D and the vertex shader's uniform
+ * blocks name, a dispatch those the compute shader's uniform and storage
+ * blocks name; each such set's layout must have the same bindings as the
+ * pipeline layout's set layout at that index, and the bindings must have been
+ * written. Texture coordinates run 0..1 over the bound image. Sets may be
+ * bound before or after the pipeline. The first draw after a bind of sets or
+ * a pipeline sends the uniform blocks' buffers to VU1 again, after waiting
+ * for the running batch. ps2vk has no dynamic descriptor types, so the sets
+ * hold no dynamic descriptors and dynamicOffsetCount is 0.
  *
  * @param cmd The command buffer.
+ * @param pipelineBindPoint The bind point whose table the sets go into.
  * @param layout The pipeline layout the sets are used with (for the sets' expected layouts).
  * @param firstSet Set index of the first set.
  * @param setCount Number of sets; firstSet + setCount at most PVK_MAX_DESCRIPTOR_SETS.
  * @param sets The sets.
+ * @param dynamicOffsetCount Number of entries in pDynamicOffsets: 0.
+ * @param pDynamicOffsets NULL.
  */
-void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_t firstSet,
-                              uint32_t setCount, const PvkDescriptorSet *sets);
+void pvkCmdBindDescriptorSets(PvkCommandBuffer cmd, PvkPipelineBindPoint pipelineBindPoint, PvkPipelineLayout layout,
+                              uint32_t firstSet, uint32_t setCount, const PvkDescriptorSet *sets,
+                              uint32_t dynamicOffsetCount, const uint32_t *pDynamicOffsets);
+
+/**
+ * @brief Runs the bound compute pipeline's shader.
+ *
+ * The shader runs groupCountX × groupCountY × groupCountZ work groups, each
+ * the shader's local size of invocations, one invocation after another on
+ * VU1. The command needs a pipeline bound at PVK_PIPELINE_BIND_POINT_COMPUTE,
+ * the push constants its shader reads, and the descriptor sets bound at that
+ * bind point which its uniform and storage blocks name, each written with a
+ * range that holds the block (see PvkShaderStorageBlock for what the ranges
+ * may take together). The chain it records uploads the pipeline's program,
+ * then sends a header, the uniform blocks and every storage block's range to
+ * VU1 memory through VIF1, by DMA straight from the buffers when the
+ * submitted command buffer reaches the dispatch, and starts the program.
+ * For a shader that writes a storage block the chain then stops until VU1
+ * has finished and the EE has copied each written block's range from VU1
+ * data memory back into its buffer, so the commands recorded after the
+ * dispatch, and the application once the submission's fence is signaled,
+ * find the results in the buffer. A draw recorded after a dispatch sends the
+ * graphics pipeline's program, constants and uniform blocks to VU1 again. A
+ * count of 0 runs nothing.
+ *
+ * Must be called outside pvkCmdBeginRendering()/pvkCmdEndRendering(), in a
+ * command buffer of queue family 0, the family with PVK_QUEUE_COMPUTE_BIT.
+ *
+ * @param cmd The command buffer.
+ * @param groupCountX Work groups along x, at most 65535.
+ * @param groupCountY Work groups along y, at most 65535.
+ * @param groupCountZ Work groups along z, at most 65535.
+ */
+void pvkCmdDispatch(PvkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
 
 /**
  * @brief Draws vertices from the bound vertex buffers.
@@ -2914,6 +3142,7 @@ typedef enum PvkPipelineStageFlagBits {
     PVK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT    = 0x00000100, /**< Same point: GS TEST. */
     PVK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT     = 0x00000200, /**< Same point: GS TEST. */
     PVK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT = 0x00000400, /**< Same point: GS FRAME writes. */
+    PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT          = 0x00000800, /**< Same point: VU1 runs a dispatch as the chain runs, and the chain stops after a dispatch that writes storage blocks until they are back in their buffers. */
     PVK_PIPELINE_STAGE_TRANSFER_BIT                = 0x00001000, /**< Same point: image copies in the chain. */
     PVK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT          = 0x00002000, /**< Same point. */
     PVK_PIPELINE_STAGE_ALL_GRAPHICS_BIT            = 0x00008000, /**< Same point. */
@@ -2928,7 +3157,8 @@ typedef enum PvkAccessFlagBits {
     PVK_ACCESS_INDEX_READ_BIT                     = 0x00000002, /**< Indices read when the draw is recorded. */
     PVK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT          = 0x00000004, /**< Vertex buffers read by the VIF as the chain runs. */
     PVK_ACCESS_UNIFORM_READ_BIT                   = 0x00000008, /**< Uniform buffers read by the VIF as the chain runs. */
-    PVK_ACCESS_SHADER_READ_BIT                    = 0x00000020, /**< A texture sampled through GS TEX0; a barrier whose destination has this bit ends with a GS TEXFLUSH. */
+    PVK_ACCESS_SHADER_READ_BIT                    = 0x00000020, /**< A texture sampled through GS TEX0, or a storage buffer read by the VIF ahead of a dispatch; a barrier whose destination has this bit ends with a GS TEXFLUSH. */
+    PVK_ACCESS_SHADER_WRITE_BIT                   = 0x00000040, /**< A storage buffer written by a compute shader: back in the buffer before the chain goes past the dispatch. */
     PVK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT         = 0x00000100, /**< Pixels written through GS FRAME. */
     PVK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT = 0x00000400, /**< Depth written through GS ZBUF. */
     PVK_ACCESS_TRANSFER_READ_BIT                  = 0x00000800, /**< Texels read by pvkCmdCopyImageToBuffer(). */

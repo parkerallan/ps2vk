@@ -100,7 +100,8 @@ builtin_componentwise_vert_body:
          mini.xyzw     VF09,VF07,VF11             NOP                                      ; line 13: min()
          abs.xyzw      VF07,VF10                  NOP                                      ; line 13: abs()
          max.xyzw      VF18,VF07,VF11             NOP                                      ; line 13: max()
-         addw.xyzw     VF07,VF00,VF11w            NOP                                      ; line 13: OpCompositeConstruct (a vector constructor)
+         addw.xyz      VF07,VF00,VF11w            NOP                                      ; line 13: OpCompositeConstruct (a vector constructor)
+         mulw.w        VF07,VF00,VF11w            NOP
          mulaw.xyzw    ACC,VF09,VF00w             NOP                                      ; line 13: mix()
          sub.xyzw      VF19,VF18,VF09             NOP
          madd.xyzw     VF19,VF19,VF07             NOP

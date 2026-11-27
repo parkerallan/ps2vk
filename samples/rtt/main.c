@@ -456,7 +456,7 @@ int main(void)
             },
         };
         pvkCmdBeginRendering(cmd, &toTexture);
-        pvkCmdBindPipeline(cmd, innerPipeline);
+        pvkCmdBindPipeline(cmd, PVK_PIPELINE_BIND_POINT_GRAPHICS, innerPipeline);
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(innerMvp), innerMvp);
         pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);
@@ -495,8 +495,8 @@ int main(void)
             },
         };
         pvkCmdBeginRendering(cmd, &toScreen);
-        pvkCmdBindPipeline(cmd, outerPipeline);
-        pvkCmdBindDescriptorSets(cmd, layout, 0, 1, &descriptorSet);
+        pvkCmdBindPipeline(cmd, PVK_PIPELINE_BIND_POINT_GRAPHICS, outerPipeline);
+        pvkCmdBindDescriptorSets(cmd, PVK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &descriptorSet, 0, NULL);
         pvkCmdPushConstants(cmd, layout, PVK_SHADER_STAGE_VERTEX, 0, sizeof(outerMvp), outerMvp);
         pvkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &noOffset);
         pvkCmdBindIndexBuffer(cmd, indexBuffer, 0, PVK_INDEX_TYPE_UINT16);

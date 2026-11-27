@@ -87,7 +87,7 @@ struct PvkSubmission {
 #define PVK_READBACK_GO_BIT     0x10000000u
 #define PVK_READBACK_SETUP_QWORDS 8
 
-/* One pvkCmdCopyImageToBuffer region. The chain ends before it and goes on at `resume`. */
+/* One pvkCmdCopyImageToBuffer region, or the storage blocks a dispatch wrote. The chain ends before it and goes on at `resume`. */
 struct PvkReadback {
     qword_t  *setup;      /* VIF1 packet: MSKPATH3, FLUSHA, the transfer registers, a SIGNAL, TRXDIR = 1 */
     qword_t  *resume;     /* DMA tag the chain goes on from */
@@ -99,6 +99,12 @@ struct PvkReadback {
     uint32_t  rows, rowBytes, outPitch;  /* staged: rows, bytes copied per row, bytes between buffer rows */
     uint32_t  stagePitch, stageSkip;     /* staged: bytes between stage rows, bytes before the region in one */
     uint32_t  tableEntries, tableFirst;  /* a color table of that size: `rows` entries from tableFirst, rowBytes each */
+    uint32_t  vu1Count;   /* a dispatch's written storage blocks, copied out of VU1 data memory; 0 for an image region */
+    struct {
+        void    *dst;     /* where in the buffer */
+        uint32_t qword;   /* VU1 data memory qword the block starts at */
+        uint32_t bytes;
+    } vu1[PVK_MAX_STORAGE_BLOCKS];
 };
 
 /* A pvkCmdCopyBufferToImage region DMA cannot stream in place: packed into `stage` at submit. */
@@ -357,6 +363,7 @@ struct PvkDescriptorPool_T {
     uint32_t maxSets, usedSets;
     uint32_t maxImages, usedImages;   /* combined image samplers */
     uint32_t maxBuffers, usedBuffers; /* uniform buffers */
+    uint32_t maxStorage, usedStorage; /* storage buffers */
     struct PvkDescriptorSet_T *sets;  /* maxSets of them */
 };
 
@@ -364,7 +371,7 @@ struct PvkDescriptorPool_T {
  * read, one bit per word, plus the set layouts. Two layouts with equal masks
  * are push-constant compatible in Vulkan's sense. */
 struct PvkPipelineLayout_T {
-    uint32_t pushWords[2];    /* [0] vertex stage, [1] fragment stage */
+    uint32_t pushWords[3];    /* [0] vertex stage, [1] fragment stage, [2] compute stage */
     uint32_t setLayoutCount;
     struct PvkDescriptorSetLayout_T setLayouts[PVK_MAX_DESCRIPTOR_SETS];
 };
@@ -391,6 +398,8 @@ struct PvkVertexBinding {
 /* One patched copy of a vertex shader's VU1 code, shared by the pipelines
  * whose patching came out identical and by the cache that holds it. */
 struct PvkProgram {
+    PvkAllocationCallbacks alloc;    /* a compute pipeline's callbacks it and its code came from */
+    int                    hasAlloc;
     const PvkShaderCode *vs;
     uint32_t *code;
     uint32_t *codeEnd;
@@ -403,6 +412,10 @@ struct PvkPipelineCache_T {
 };
 
 struct PvkPipeline_T {
+    PvkAllocationCallbacks alloc;    /* the callbacks a compute pipeline was created with */
+    int                    hasAlloc;
+    int      compute;         /* a compute pipeline: vs is its compute shader, and nothing below uniformSlots applies */
+    uint32_t storageSlots[PVK_MAX_STORAGE_BLOCKS]; /* compute: bindings[] slot of each vs->storageBlocks[] entry in its set layout */
     const PvkShaderCode *vs;
     const PvkShaderCode *fs;
     PvkPipelineLayout    layout;
@@ -480,6 +493,9 @@ struct PvkCommandBuffer_T {
     packet2_t   packet;       /* VIF1 (family 0) or GIF channel (family 1) DMA chain, inside the pool's block */
     uint32_t    signalQw;     /* qword of the GS SIGNAL at a primary's end; its ID is set at submit */
     PvkPipeline pipeline;
+    PvkPipeline computePipeline; /* bound at PVK_PIPELINE_BIND_POINT_COMPUTE, or NULL */
+    PvkDescriptorSet computeSets[PVK_MAX_DESCRIPTOR_SETS]; /* the compute bind point's sets, or NULL */
+    int         vu1Compute;   /* VU1 holds a dispatch's program and memory: the next draw sends the graphics pipeline's again */
     const struct PvkProgram *program; /* the program last uploaded to VU1 in this recording, or NULL */
     PvkImageView colorView;   /* attachments of the current pvkCmdBeginRendering; NULL when inherited */
     PvkImageView depthView;   /* or NULL */

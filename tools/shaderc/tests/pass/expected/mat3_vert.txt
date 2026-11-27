@@ -95,7 +95,7 @@ mat3_vert_body:
          madday.xyz    ACC,VF07,VF11y             NOP
          maddz.xyz     VF06,VF08,VF11z            NOP
          NOP                                      move.xyz      VF07,VF06                  ; line 19: OpCompositeConstruct (a vector constructor)
-         addw.w        VF07,VF00,VF00w            NOP
+         maxw.w        VF07,VF00,VF00w            NOP
          NOP                                      move.xyzw     VF20,VF05                  ; gl_Position
          NOP                                      move.xyzw     VF21,VF07                  ; color output, location 0
 ; epilogue: perspective divide, viewport, GS formats, store

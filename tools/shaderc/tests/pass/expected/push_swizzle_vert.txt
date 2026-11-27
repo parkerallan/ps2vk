@@ -100,7 +100,8 @@ push_swizzle_vert_body:
          mul.xyzw      VF05,VF11,VF06             NOP                                      ; line 18: OpFMul (multiplication)
          NOP                                      lq            VF06,5(VI00)               ; push constants, bytes 16..31
          NOP                                      move.x        VF08,VF06                  ; line 18: OpCompositeConstruct (a vector constructor)
-         addx.yzw      VF08,VF00,VF06x            NOP
+         addx.yz       VF08,VF00,VF06x            NOP
+         mulx.w        VF08,VF00,VF06x            NOP
          add.xyzw      VF05,VF05,VF08             NOP                                      ; line 18: OpFAdd (addition)
          NOP                                      move.xyzw     VF20,VF07                  ; gl_Position
          NOP                                      move.xyzw     VF21,VF05                  ; color output, location 0

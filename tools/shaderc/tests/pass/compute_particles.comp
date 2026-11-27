@@ -1,0 +1,28 @@
+#version 450
+
+// A struct copied out of a runtime array, changed on one path and written back:
+// gl_GlobalInvocationID picks the element through VI08, clamped to length().
+layout(local_size_x = 8) in;
+
+struct Particle {
+    vec4 pos;
+    vec4 vel;
+};
+
+layout(std430, binding = 0) buffer Particles {
+    Particle p[];
+} particles;
+
+layout(push_constant) uniform Push {
+    float dt;
+} pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    Particle q = particles.p[i];
+    q.pos += q.vel * pc.dt;
+    if (q.pos.x > 1.0 || q.pos.x < -1.0)
+        q.vel.x = -q.vel.x;
+    particles.p[i] = q;
+}

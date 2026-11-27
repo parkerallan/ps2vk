@@ -452,7 +452,8 @@ uint32_t pvk_push_word_mask(uint32_t offset, uint32_t size)
 
 int pvk_layout_push_compatible(const struct PvkPipelineLayout_T *a, const struct PvkPipelineLayout_T *b)
 {
-    return a->pushWords[0] == b->pushWords[0] && a->pushWords[1] == b->pushWords[1];
+    return a->pushWords[0] == b->pushWords[0] && a->pushWords[1] == b->pushWords[1] &&
+           a->pushWords[2] == b->pushWords[2];
 }
 
 PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreateInfo *info, PvkPipelineLayout *layout)
@@ -489,7 +490,7 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
             free(l);
             return PVK_ERROR_VALIDATION_FAILED;
         }
-        if (!r->stageFlags || r->stageFlags & ~(PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT)) {
+        if (!r->stageFlags || r->stageFlags & ~(PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT | PVK_SHADER_STAGE_COMPUTE_BIT)) {
             pvk_error("pipeline layout: push constant range %u has stage flags 0x%x; use "
                       "PvkShaderStage values\n", (unsigned)i, (unsigned)r->stageFlags);
             free(l);
@@ -506,6 +507,8 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
             l->pushWords[0] |= mask;
         if (r->stageFlags & PVK_SHADER_STAGE_FRAGMENT)
             l->pushWords[1] |= mask;
+        if (r->stageFlags & PVK_SHADER_STAGE_COMPUTE_BIT)
+            l->pushWords[2] |= mask;
     }
 
     *layout = l;
@@ -881,13 +884,14 @@ static PvkResult check_specialization(const PvkSpecializationInfo *info, uint32_
 static PvkResult specialize(PvkPipeline p, const PvkSpecializationInfo *info)
 {
     const PvkShaderCode *vs = p->vs;
+    const char *stage = vs->stage == PVK_SHADER_STAGE_COMPUTE_BIT ? "compute" : "vertex";
     uint32_t i, j;
 
     for (i = 0; i < vs->vu1SpecConstantCount; i++) {
         const PvkShaderSpecConstant *c = &vs->vu1SpecConstants[i];
 
         if (c->vu1Word < vs->vu1CodeStart || c->vu1Word >= vs->vu1CodeEnd) {
-            pvk_error("pipeline: vertex shader '%s' has a specialization constant outside its code\n", vs->name);
+            pvk_error("pipeline: %s shader '%s' has a specialization constant outside its code\n", stage, vs->name);
             return PVK_ERROR_INVALID_SHADER;
         }
         for (j = 0; info && j < info->mapEntryCount; j++) {
@@ -898,8 +902,8 @@ static PvkResult specialize(PvkPipeline p, const PvkSpecializationInfo *info)
             if (e->constantID != c->constantID)
                 continue;
             if (e->size != 4) {
-                pvk_error("pipeline: specialization entry %u sets constant %u of vertex shader '%s' with %u "
-                          "bytes; it is 4 bytes\n", (unsigned)j, (unsigned)e->constantID, vs->name,
+                pvk_error("pipeline: specialization entry %u sets constant %u of %s shader '%s' with %u "
+                          "bytes; it is 4 bytes\n", (unsigned)j, (unsigned)e->constantID, stage, vs->name,
                           (unsigned)e->size);
                 return PVK_ERROR_VALIDATION_FAILED;
             }
@@ -911,8 +915,8 @@ static PvkResult specialize(PvkPipeline p, const PvkSpecializationInfo *info)
             default:                          memcpy(&v, &raw, sizeof(v)); break;
             }
             if (v != v || v - v != 0.0f) {
-                pvk_error("pipeline: specialization constant %u of vertex shader '%s' is infinite or NaN, "
-                          "which VU1 cannot represent\n", (unsigned)e->constantID, vs->name);
+                pvk_error("pipeline: specialization constant %u of %s shader '%s' is infinite or NaN, "
+                          "which VU1 cannot represent\n", (unsigned)e->constantID, stage, vs->name);
                 return PVK_ERROR_VALIDATION_FAILED;
             }
             memcpy(p->program->code + (c->vu1Word - vs->vu1CodeStart), &v, sizeof(v));
@@ -922,13 +926,28 @@ static PvkResult specialize(PvkPipeline p, const PvkSpecializationInfo *info)
     return PVK_SUCCESS;
 }
 
+/* Memory from the callbacks, or memalign() without them. */
+static void *host_alloc(const PvkAllocationCallbacks *alloc, size_t size)
+{
+    return alloc ? alloc->pfnAllocation(alloc->pUserData, size, 16, PVK_SYSTEM_ALLOCATION_SCOPE_OBJECT)
+                 : memalign(16, size);
+}
+
+static void host_free(const PvkAllocationCallbacks *alloc, void *memory)
+{
+    if (alloc)
+        alloc->pfnFree(alloc->pUserData, memory);
+    else
+        free(memory);
+}
+
 static void program_release(struct PvkProgram *prog)
 {
     if (!prog || --prog->refs)
         return;
     pvk_shader_release(prog->vs);
-    free(prog->code);
-    free(prog);
+    host_free(prog->hasAlloc ? &prog->alloc : NULL, prog->code);
+    host_free(prog->hasAlloc ? &prog->alloc : NULL, prog);
 }
 
 /* Replaces the pipeline's freshly patched program with the cache's identical
@@ -1041,7 +1060,7 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
         (res = setup_vertex_input(p, info, fmt, qword, instance)) != PVK_SUCCESS ||
         (res = copy_code(p, fmt, qword, instance, device->features.robustBufferAccess != 0)) != PVK_SUCCESS ||
         (res = specialize(p, vsSpec)) != PVK_SUCCESS) {
-        pvkDestroyPipeline(device, p);
+        pvkDestroyPipeline(device, p, NULL);
         return res;
     }
     if (cache)
@@ -1063,7 +1082,7 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
     if ((res = setup_dynamic(p, info)) != PVK_SUCCESS || (res = setup_depth(p, info)) != PVK_SUCCESS ||
         (res = setup_blend(p, info)) != PVK_SUCCESS || (res = setup_cull(p, info)) != PVK_SUCCESS ||
         (res = setup_stencil(p, info)) != PVK_SUCCESS || (res = setup_lines(p, device, info)) != PVK_SUCCESS) {
-        pvkDestroyPipeline(device, p);
+        pvkDestroyPipeline(device, p, NULL);
         return res;
     }
     /* Depth writes are ZBUF.ZMSK, set once per context by pvkCmdBeginRendering: no writes = context 2. */
@@ -1082,15 +1101,170 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
     return PVK_SUCCESS;
 }
 
-void pvkDestroyPipeline(PvkDevice device, PvkPipeline pipeline)
+/* The compute shader's push constant block must lie in the layout's compute ranges, each
+ * uniform block be a uniform buffer binding and each storage block a storage buffer binding,
+ * visible to the compute stage, in the set layout at its set index. Fills in the slots. */
+static PvkResult validate_compute_layout(PvkPipeline p, PvkPipelineLayout layout)
+{
+    const PvkShaderCode *cs = p->vs;
+    uint32_t needed = pvk_push_word_mask(0, cs->pushConstantBytes), i;
+
+    if (!layout) {
+        pvk_error("compute pipeline: layout is NULL; create one with pvkCreatePipelineLayout\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if ((layout->pushWords[2] & needed) != needed) {
+        pvk_error("compute pipeline: compute shader '%s' reads %u bytes of push constants, but the layout's "
+                  "compute stage ranges do not cover them\n", cs->name, (unsigned)cs->pushConstantBytes);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    for (i = 0; i < cs->uniformBlockCount + cs->storageBlockCount; i++) {
+        int uniform = i < cs->uniformBlockCount;
+        uint32_t set = uniform ? cs->uniformBlocks[i].set : cs->storageBlocks[i - cs->uniformBlockCount].set;
+        uint32_t binding = uniform ? cs->uniformBlocks[i].binding : cs->storageBlocks[i - cs->uniformBlockCount].binding;
+        PvkDescriptorType type = uniform ? PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : PVK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        const char *what = uniform ? "uniform" : "storage";
+        int slot = set < layout->setLayoutCount ? pvk_set_layout_find(&layout->setLayouts[set], binding) : -1;
+
+        if (slot < 0 || layout->setLayouts[set].bindings[slot].descriptorType != type ||
+            !(layout->setLayouts[set].bindings[slot].stageFlags & PVK_SHADER_STAGE_COMPUTE_BIT)) {
+            pvk_error("compute pipeline: compute shader '%s' has a %s block at set %u, binding %u, but the layout "
+                      "has no PVK_DESCRIPTOR_TYPE_%s_BUFFER binding there for the compute stage\n", cs->name, what,
+                      (unsigned)set, (unsigned)binding, uniform ? "UNIFORM" : "STORAGE");
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (uniform)
+            p->uniformSlots[i] = (uint32_t)slot;
+        else
+            p->storageSlots[i - cs->uniformBlockCount] = (uint32_t)slot;
+    }
+    return PVK_SUCCESS;
+}
+
+/* The pipeline's copy of the compute shader, with the run-time index clamps NOP'd unless the
+ * device has robustBufferAccess. */
+static PvkResult compute_code(PvkPipeline p, int robust)
+{
+    const PvkShaderCode *cs = p->vs;
+    size_t words = (size_t)(cs->vu1CodeEnd - cs->vu1CodeStart);
+    uint32_t i;
+
+    if (words / 2 > PVK_VU1_FRAME_ROUTINE) {
+        pvk_error("compute pipeline: compute shader '%s' is %u VU1 instructions; micro memory holds %u\n", cs->name,
+                  (unsigned)(words / 2), (unsigned)PVK_VU1_FRAME_ROUTINE);
+        return PVK_ERROR_INVALID_SHADER;
+    }
+    p->program = host_alloc(p->hasAlloc ? &p->alloc : NULL, sizeof(*p->program));
+    if (!p->program)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    memset(p->program, 0, sizeof(*p->program));
+    p->program->alloc    = p->alloc;
+    p->program->hasAlloc = p->hasAlloc;
+    p->program->vs   = cs;
+    pvk_shader_retain(cs);
+    p->program->refs = 1;
+    p->program->code = host_alloc(p->hasAlloc ? &p->alloc : NULL, words * 4);
+    if (!p->program->code)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    memcpy(p->program->code, cs->vu1CodeStart, words * 4);
+    p->program->codeEnd = p->program->code + words;
+    for (i = 0; i < cs->vu1ClampCount && !robust; i++) {
+        const uint32_t *c = cs->vu1Clamps[i];
+        if (c < cs->vu1CodeStart || c + 6 > cs->vu1CodeEnd) {
+            pvk_error("compute pipeline: compute shader '%s' has a run-time index clamp outside its code\n", cs->name);
+            return PVK_ERROR_INVALID_SHADER;
+        }
+        vu_nop(p->program->code + (c - cs->vu1CodeStart));
+        vu_nop(p->program->code + (c - cs->vu1CodeStart) + 2);
+        vu_nop(p->program->code + (c - cs->vu1CodeStart) + 4);
+    }
+    return PVK_SUCCESS;
+}
+
+/* One pipeline of pvkCreateComputePipelines(). */
+static PvkResult create_compute_pipeline(PvkDevice device, PvkPipelineCache cache,
+                                         const PvkComputePipelineCreateInfo *info,
+                                         const PvkAllocationCallbacks *alloc, PvkPipeline *pipeline)
+{
+    const PvkPipelineShaderStageCreateInfo *s = &info->stage;
+    const PvkShaderCode *cs = s->module ? s->module->code : NULL;
+    PvkPipeline p;
+    PvkResult res;
+
+    if (s->stage != PVK_SHADER_STAGE_COMPUTE_BIT || !cs || cs->stage != PVK_SHADER_STAGE_COMPUTE_BIT) {
+        pvk_error("compute pipeline: the stage must be PVK_SHADER_STAGE_COMPUTE_BIT with a compute shader's module\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (!s->name || !cs->entryPoint || strcmp(s->name, cs->entryPoint)) {
+        pvk_error("compute pipeline: the stage names entry point '%s', but module '%s' has '%s'\n",
+                  s->name ? s->name : "(null)", cs->name, cs->entryPoint ? cs->entryPoint : "(none)");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (info->sType != PVK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO) {
+        pvk_error("pvkCreateComputePipelines: sType is not PVK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (info->flags) {
+        pvk_error("pvkCreateComputePipelines: flags must be 0\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if ((res = check_specialization(s->specializationInfo, 0)) != PVK_SUCCESS)
+        return res;
+
+    p = host_alloc(alloc, sizeof(struct PvkPipeline_T));
+    if (!p)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    memset(p, 0, sizeof(*p));
+    if (alloc) {
+        p->alloc    = *alloc;
+        p->hasAlloc = 1;
+    }
+    p->compute = 1;
+    p->vs      = cs;
+    pvk_shader_retain(cs);
+    p->layout  = info->layout;
+    if ((res = validate_compute_layout(p, info->layout)) != PVK_SUCCESS ||
+        (res = compute_code(p, device->features.robustBufferAccess != 0)) != PVK_SUCCESS ||
+        (res = specialize(p, s->specializationInfo)) != PVK_SUCCESS) {
+        pvkDestroyPipeline(device, p, alloc);
+        return res;
+    }
+    if (cache)
+        program_intern(p, cache);
+    *pipeline = p;
+    return PVK_SUCCESS;
+}
+
+PvkResult pvkCreateComputePipelines(PvkDevice device, PvkPipelineCache pipelineCache, uint32_t createInfoCount,
+                                    const PvkComputePipelineCreateInfo *pCreateInfos,
+                                    const PvkAllocationCallbacks *pAllocator, PvkPipeline *pPipelines)
+{
+    PvkResult first = PVK_SUCCESS, res;
+    uint32_t i;
+
+    for (i = 0; i < createInfoCount; i++) {
+        pPipelines[i] = NULL;
+        res = create_compute_pipeline(device, pipelineCache, &pCreateInfos[i], pAllocator, &pPipelines[i]);
+        if (res != PVK_SUCCESS && first == PVK_SUCCESS)
+            first = res;
+    }
+    return first;
+}
+
+void pvkDestroyPipeline(PvkDevice device, PvkPipeline pipeline, const PvkAllocationCallbacks *pAllocator)
 {
     (void)device;
     if (!pipeline)
         return;
+    if ((pAllocator != NULL) != (pipeline->hasAlloc != 0)) {
+        pvk_error("pvkDestroyPipeline: the pipeline was created %s callbacks but is destroyed %s; it is freed the "
+                  "way it was allocated\n", pipeline->hasAlloc ? "with" : "without", pAllocator ? "with" : "without");
+        pAllocator = pipeline->hasAlloc ? &pipeline->alloc : NULL;
+    }
     program_release(pipeline->program);
     pvk_shader_release(pipeline->vs);
     pvk_shader_release(pipeline->fs);
-    free(pipeline);
+    host_free(pAllocator, pipeline);
 }
 
 PvkResult pvkCreatePipelineCache(PvkDevice device, const PvkPipelineCacheCreateInfo *info, PvkPipelineCache *cache)
