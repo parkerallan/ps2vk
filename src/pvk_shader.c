@@ -56,7 +56,8 @@ static const char *check_pvs(const PvkPvsHeader *h, size_t codeSize)
         return "the .pvs file is cut short";
     if (h->stage != PVK_SHADER_STAGE_VERTEX && h->stage != PVK_SHADER_STAGE_FRAGMENT &&
         h->stage != PVK_SHADER_STAGE_COMPUTE_BIT && h->stage != PVK_SHADER_STAGE_TASK_BIT_EXT &&
-        h->stage != PVK_SHADER_STAGE_MESH_BIT_EXT)
+        h->stage != PVK_SHADER_STAGE_MESH_BIT_EXT && h->stage != PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT &&
+        h->stage != PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)
         return "the .pvs file names no shader stage";
     if (!string_at(h, h->nameOffset) || !string_at(h, h->entryPointOffset))
         return "the .pvs file's names run past its end";
@@ -71,13 +72,22 @@ static const char *check_pvs(const PvkPvsHeader *h, size_t codeSize)
         return "the .pvs file's microcode runs past its end";
     if (h->convertWord >= h->codeWords || h->inputCount > PVK_MAX_VERTEX_INPUTS ||
         h->uniformBlockCount > PVK_MAX_UNIFORM_BLOCKS || h->storageBlockCount > PVK_MAX_STORAGE_BLOCKS ||
-        (h->stage != PVK_SHADER_STAGE_VERTEX && (h->inputCount ||
-         !h->localSize[0] || !h->localSize[1] || !h->localSize[2])))
+        (h->stage != PVK_SHADER_STAGE_VERTEX && h->stage != PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT &&
+         (h->inputCount || !h->localSize[0] || !h->localSize[1] || !h->localSize[2])))
         return "the .pvs file's header is corrupt";
     if (h->stage == PVK_SHADER_STAGE_MESH_BIT_EXT &&
         (h->meshPrimitiveVertices < 1 || h->meshPrimitiveVertices > 3 || !h->meshMaxVertices || !h->meshMaxPrimitives ||
          h->meshOutputAddress < PVK_VU1_PAYLOAD_ADDR || h->meshOutputAddress >= h->meshKickAddress ||
          h->meshKickAddress >= PVK_VU1_MEMORY_QWORDS))
+        return "the .pvs file's header is corrupt";
+    if ((h->stage == PVK_SHADER_STAGE_VERTEX &&
+         (h->epilogueWord + 8 > h->codeWords || h->epilogueWord < 2 || h->nextWord >= h->codeWords ||
+          h->kickWord >= h->codeWords)) ||
+        (h->stage == PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT &&
+         (!h->tessOutputVertices || h->tessOutputVertices > PVK_MAX_TESSELLATION_PATCH_SIZE ||
+          h->tessBaseAddress > PVK_VU1_TESS_CPIN || h->tessBaseAddress < PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER)) ||
+        (h->stage == PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT &&
+         (h->inputCount != 1 || h->tessDomain > 2 || h->tessSpacing > 2)))
         return "the .pvs file's header is corrupt";
     for (i = 0; i < h->clampCount; i++)
         if (((const uint32_t *)((const char *)h + h->clampsOffset))[i] >= h->codeWords)
@@ -162,7 +172,8 @@ PvkResult pvkCreateShaderModule(PvkDevice device, const PvkShaderModuleCreateInf
         }
         sc.vu1CodeStart         = code;
         sc.vu1CodeEnd           = code + h->codeWords;
-        sc.vu1Convert           = h->stage == PVK_SHADER_STAGE_VERTEX ? code + h->convertWord : NULL;
+        sc.vu1Convert           = h->stage == PVK_SHADER_STAGE_VERTEX ||
+                                  h->stage == PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT ? code + h->convertWord : NULL;
         sc.vu1ClampCount        = h->clampCount;
         sc.vu1Clamps            = clamps;
         sc.vu1SpecConstantCount = h->specCount;
@@ -199,6 +210,16 @@ PvkResult pvkCreateShaderModule(PvkDevice device, const PvkShaderModuleCreateInf
     sc.meshKickAddress        = h->meshKickAddress;
     sc.payloadBytes           = h->payloadBytes;
     sc.sharedBytes            = h->sharedBytes;
+    sc.vu1EpilogueWord        = h->epilogueWord;
+    sc.vu1NextWord            = h->nextWord;
+    sc.vu1KickWord            = h->kickWord;
+    sc.tessOutputVertices     = h->tessOutputVertices;
+    sc.tessBaseAddress        = h->tessBaseAddress;
+    sc.tessInputs             = h->tessInputs;
+    sc.tessDomain             = h->tessDomain;
+    sc.tessSpacing            = h->tessSpacing;
+    sc.tessClockwise          = h->tessClockwise;
+    sc.tessPointMode          = h->tessPointMode;
 
     data->refs = 1;
     data->code = sc;

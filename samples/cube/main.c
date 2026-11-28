@@ -476,7 +476,7 @@ int main(void)
                                                              | PVK_COLOR_COMPONENT_B_BIT | PVK_COLOR_COMPONENT_A_BIT } },
         .depthAttachmentFormat = PVK_FORMAT_Z24,
         .rasterization  = { .sType = PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-                            .cullMode = PVK_CULL_MODE_BACK_BIT, .frontFace = PVK_FRONT_FACE_CLOCKWISE },
+                            .cullMode = PVK_CULL_MODE_BACK_BIT, .frontFace = PVK_FRONT_FACE_COUNTER_CLOCKWISE },
         .depthStencil   = { .depthTestEnable = 1, .depthWriteEnable = 1, .depthCompareOp = PVK_COMPARE_OP_LESS },
     };
     CHECK(pvkCreateGraphicsPipeline(device, NULL, &pipelineInfo, &pipeline));

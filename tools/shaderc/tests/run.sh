@@ -28,7 +28,7 @@ bad()  { failed=$((failed + 1)); echo "FAIL $1: $2"; }
 
 # ---------------------------------------------------------------- must compile
 cd "$HERE/pass"
-for src in *.vert *.frag *.comp *.task *.mesh; do
+for src in *.vert *.tesc *.tese *.frag *.comp *.task *.mesh; do
     [ -e "$src" ] || continue
     name=$(echo "$src" | tr . _)
 
@@ -54,7 +54,7 @@ done
 
 # ---------------------------------------------------------------- must be rejected
 cd "$HERE/fail"
-for src in *.vert *.frag *.comp *.task *.mesh; do
+for src in *.vert *.tesc *.tese *.frag *.comp *.task *.mesh; do
     [ -e "$src" ] || continue
     if ! glslangValidator $(target "$src") -g -o "$OUT/$src.spv" "$src" >"$OUT/$src.glslang"; then
         bad "$src" "glslangValidator failed: $(cat "$OUT/$src.glslang")"

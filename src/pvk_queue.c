@@ -535,13 +535,15 @@ PvkResult pvk_semaphores_check(const char *who, uint32_t count, const PvkSemapho
     return PVK_SUCCESS;
 }
 
-/* An indirect draw is built: its chain goes on at the draw's tag. Interrupts disabled. */
-static void indirect_resume(PvkDevice dev)
+/* An indirect draw is built: its chain goes on at the draw's tag. The chain stops for the draw
+ * again unless it is `done`. Interrupts disabled. */
+static void indirect_resume(PvkDevice dev, int done)
 {
     struct PvkReadbackRun *run = &dev->readback;
     PvkQueue queue = run->queue;
 
-    queue->ring[queue->head].readbackNext++;
+    if (done)
+        queue->ring[queue->head].readbackNext++;
     run->stage = 0;
     *queue->qwc  = 0;
     *queue->tadr = DMA_SET_TADR((u32)run->rb->resume, 0);
@@ -656,19 +658,21 @@ PvkResult pvkQueueSubmit(PvkQueue queue, uint32_t submitCount, const PvkSubmitIn
 
     /* Each indirect draw stops its chain: read its commands, build the draws, let the chain go on. */
     res = PVK_SUCCESS;
-    for (; stops; stops--) {
+    while (stops) {
         const struct PvkReadback *rb;
         PvkResult built;
+        int done = 1;
 
         WaitSema(queue->indirect);
         rb    = queue->device->readback.rb;
-        built = pvk_cmd_build_indirect(rb->indirectCmd, rb->indirectIndex);
+        built = pvk_cmd_build_indirect(rb->indirectCmd, rb->indirectIndex, &done);
         if (built != PVK_SUCCESS)
             res = built;
         FlushCache(0);
         DI();
-        indirect_resume(queue->device);
+        indirect_resume(queue->device, done);
         EI();
+        stops -= done != 0;
     }
     return res;
 }

@@ -1,0 +1,1 @@
+tess_vertex_location.tesc: error: per-vertex variable 'far' reaches past location 6; a control point has a qword per location for 7 of them (maxTessellationControlPerVertexOutputComponents)

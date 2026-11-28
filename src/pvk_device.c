@@ -17,6 +17,15 @@ const PvkPhysicalDeviceLimits pvk_limits = {
     .maxPerStageDescriptorSampledImages  = 1,
     .maxStorageBufferRange               = PVK_MAX_STORAGE_BYTES,
     .maxPerStageDescriptorStorageBuffers = PVK_MAX_STORAGE_BLOCKS,
+    .maxTessellationGenerationLevel      = PVK_MAX_TESSELLATION_LEVEL,
+    .maxTessellationPatchSize            = PVK_MAX_TESSELLATION_PATCH_SIZE,
+    .maxTessellationControlPerVertexInputComponents  = 7,
+    .maxTessellationControlPerVertexOutputComponents = 4 * (PVK_VU1_TESS_VERTEX_QWORDS - 1),
+    .maxTessellationControlPerPatchOutputComponents  = 4 * PVK_VU1_TESS_PATCH_QWORDS,
+    .maxTessellationControlTotalOutputComponents     = 4 * (PVK_VU1_TESS_PATCH_QWORDS + PVK_MAX_TESSELLATION_PATCH_SIZE *
+                                                            (PVK_VU1_TESS_VERTEX_QWORDS - 1)),
+    .maxTessellationEvaluationInputComponents        = 4 * (PVK_VU1_TESS_VERTEX_QWORDS - 1),
+    .maxTessellationEvaluationOutputComponents       = 7,
     .maxComputeWorkGroupCount            = { 65535, 65535, 65535 },
     .maxComputeWorkGroupInvocations      = PVK_MAX_COMPUTE_WORK_GROUP_SIZE * PVK_MAX_COMPUTE_WORK_GROUP_SIZE *
                                            PVK_MAX_COMPUTE_WORK_GROUP_SIZE,
@@ -45,6 +54,7 @@ const PvkPhysicalDeviceLimits pvk_limits = {
 
 static const PvkPhysicalDeviceFeatures supported_features = {
     .robustBufferAccess        = 1,
+    .tessellationShader        = 1,
     .multiDrawIndirect         = 1,
     .drawIndirectFirstInstance = 1,
 };
@@ -304,6 +314,7 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
     if (enabled) {
         const PvkPhysicalDeviceFeatures *f = enabled;
         const char *missing = f->robustBufferAccess && !supported_features.robustBufferAccess ? "robustBufferAccess"
+                            : f->tessellationShader && !supported_features.tessellationShader ? "tessellationShader"
                             : f->multiDrawIndirect && !supported_features.multiDrawIndirect ? "multiDrawIndirect"
                             : f->drawIndirectFirstInstance && !supported_features.drawIndirectFirstInstance
                                 ? "drawIndirectFirstInstance" : NULL;

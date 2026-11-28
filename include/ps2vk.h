@@ -49,6 +49,7 @@ typedef enum PvkResult {
 typedef enum PvkStructureType {
     PVK_STRUCTURE_TYPE_DEVICE_CREATE_INFO                            = 3,          /**< PvkDeviceCreateInfo. */
     PVK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO                     = 16,         /**< PvkShaderModuleCreateInfo. */
+    PVK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO       = 21,         /**< PvkPipelineTessellationStateCreateInfo. */
     PVK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO      = 23,         /**< PvkPipelineRasterizationStateCreateInfo. */
     PVK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO                  = 29,         /**< PvkComputePipelineCreateInfo. */
     PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2                    = 1000059000, /**< PvkPhysicalDeviceFeatures2. */
@@ -275,6 +276,14 @@ typedef enum PvkPhysicalDeviceType {
  * | maxPerStageDescriptorUniformBuffers | PVK_MAX_UNIFORM_BLOCKS | shaderc's block table |
  * | maxStorageBufferRange | PVK_MAX_STORAGE_BYTES | VU1 data memory (16384 bytes) less the dispatch header, the push constants and the invocation qwords |
  * | maxPerStageDescriptorStorageBuffers | PVK_MAX_STORAGE_BLOCKS | one VU1 integer register holds each block's address |
+ * | maxTessellationGenerationLevel | PVK_MAX_TESSELLATION_LEVEL | the EE cuts a patch, so only the level's meaning bounds it |
+ * | maxTessellationPatchSize | PVK_MAX_TESSELLATION_PATCH_SIZE | 32 control point records of 4 qwords are kept for the control shader |
+ * | maxTessellationControlPerVertexInputComponents | 7 | a vertex shader writes one vec4, one vec2 and one float beside gl_Position |
+ * | maxTessellationControlPerVertexOutputComponents | 28 | a control point of a patch record is gl_Position and 7 more qwords |
+ * | maxTessellationControlPerPatchOutputComponents | 120 | a patch record has 30 qwords for the per-patch outputs |
+ * | maxTessellationControlTotalOutputComponents | 1016 | 32 control points of 28, and the 120 per patch |
+ * | maxTessellationEvaluationInputComponents | 28 | what a control point of a patch record holds |
+ * | maxTessellationEvaluationOutputComponents | 7 | the GS takes one color (4), one texture coordinate pair (2) and one fog amount (1) per vertex |
  * | maxComputeWorkGroupCount | 65535 per axis | a 16-bit VU1 integer register counts an axis's work groups |
  * | maxComputeWorkGroupSize | PVK_MAX_COMPUTE_WORK_GROUP_SIZE per axis | VU1 keeps the invocation IDs as floats, exact below 16777216 |
  * | maxComputeWorkGroupInvocations | PVK_MAX_COMPUTE_WORK_GROUP_SIZE cubed | VU1 keeps gl_LocalInvocationIndex as a float, exact below 16777216 |
@@ -306,6 +315,14 @@ typedef struct PvkPhysicalDeviceLimits {
     uint32_t maxPerStageDescriptorSampledImages;  /**< Sampled images one shader stage reads. */
     uint32_t maxStorageBufferRange;               /**< Largest storage buffer range, in bytes. */
     uint32_t maxPerStageDescriptorStorageBuffers; /**< Storage buffers one shader stage reads and writes. */
+    uint32_t maxTessellationGenerationLevel;      /**< Largest tessellation level: the segments an edge of a patch is cut into. */
+    uint32_t maxTessellationPatchSize;            /**< Most control points of a patch. */
+    uint32_t maxTessellationControlPerVertexInputComponents;  /**< Numbers a vertex shader passes a control shader per control point, gl_Position apart. */
+    uint32_t maxTessellationControlPerVertexOutputComponents; /**< Numbers a control shader writes per control point, gl_Position apart. */
+    uint32_t maxTessellationControlPerPatchOutputComponents;  /**< Numbers a control shader writes per patch. */
+    uint32_t maxTessellationControlTotalOutputComponents;     /**< Numbers a control shader writes for one patch altogether. */
+    uint32_t maxTessellationEvaluationInputComponents;        /**< Numbers an evaluation shader reads per control point, gl_Position apart. */
+    uint32_t maxTessellationEvaluationOutputComponents;       /**< Numbers an evaluation shader passes on per vertex, gl_Position apart. */
     uint32_t maxComputeWorkGroupCount[3];         /**< Largest groupCountX, groupCountY and groupCountZ of pvkCmdDispatch(). */
     uint32_t maxComputeWorkGroupInvocations;      /**< Most invocations in one work group: the product of a compute shader's local sizes. */
     uint32_t maxComputeWorkGroupSize[3];          /**< Largest local_size_x, local_size_y and local_size_z of a compute shader. */
@@ -358,9 +375,12 @@ typedef struct PvkPhysicalDeviceProperties {
  * With multiDrawIndirect an indirect draw takes a drawCount above 1; with
  * drawIndirectFirstInstance an indirect command's firstInstance may be
  * nonzero. The EE reads every command, so both cost nothing on the PS2.
+ * With tessellationShader a graphics pipeline may hold tessellation control
+ * and evaluation stages and draw PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST.
  */
 typedef struct PvkPhysicalDeviceFeatures {
     uint32_t robustBufferAccess;       /**< Nonzero: run-time indices into block arrays are clamped. */
+    uint32_t tessellationShader;       /**< Nonzero: pipelines with tessellation control and evaluation stages and PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST. */
     uint32_t multiDrawIndirect;        /**< Nonzero: pvkCmdDrawIndirect() and pvkCmdDrawIndexedIndirect() take a drawCount above 1. */
     uint32_t drawIndirectFirstInstance; /**< Nonzero: an indirect command's firstInstance may be nonzero. */
 } PvkPhysicalDeviceFeatures;
@@ -1410,7 +1430,9 @@ typedef struct PvkPipelineCache_T *PvkPipelineCache;
 /** @brief Shader stages. The values are bits, so they can be ORed into a stage mask. */
 typedef enum PvkShaderStage {
     PVK_SHADER_STAGE_VERTEX       = 1,    /**< Runs on VU1, once per vertex of a draw. */
-    PVK_SHADER_STAGE_FRAGMENT     = 2,    /**< Becomes GS settings. */
+    PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT    = 2, /**< Runs on VU1, once per output control point of a patch, and sets the patch's tessellation levels. */
+    PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT = 4, /**< Runs on VU1, once per vertex the tessellation of a patch makes. */
+    PVK_SHADER_STAGE_FRAGMENT     = 0x10, /**< Becomes GS settings. */
     PVK_SHADER_STAGE_COMPUTE_BIT  = 0x20, /**< Runs on VU1, once per invocation of a pvkCmdDispatch(). */
     PVK_SHADER_STAGE_TASK_BIT_EXT = 0x40, /**< Runs on VU1, once per invocation of a pvkCmdDrawMeshTasksEXT(), and starts the mesh shader's work groups. */
     PVK_SHADER_STAGE_MESH_BIT_EXT = 0x80  /**< Runs on VU1, once per invocation of a mesh work group, and writes the group's vertices and primitives. */
@@ -1433,7 +1455,8 @@ typedef enum PvkPrimitiveTopology {
     PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST  = 3, /**< Every 3 vertices form a triangle. */
     PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP = 4, /**< Each vertex after the second makes a triangle with the previous two. */
     PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN   = 5, /**< Each vertex after the second makes a triangle with the previous one and the first. */
-    PVK_PRIMITIVE_TOPOLOGY_SPRITE_LIST    = 6  /**< PS2 only: every 2 vertices are opposite corners of an axis-aligned rectangle (GS PRIM sprite). The rectangle takes the second vertex's color and depth; texture coordinates interpolate between the corners. */
+    PVK_PRIMITIVE_TOPOLOGY_SPRITE_LIST    = 6, /**< PS2 only: every 2 vertices are opposite corners of an axis-aligned rectangle (GS PRIM sprite). The rectangle takes the second vertex's color and depth; texture coordinates interpolate between the corners. */
+    PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST     = 10 /**< Every patchControlPoints vertices are the control points of a patch, which the tessellation stages cut into triangles, lines or points. */
 } PvkPrimitiveTopology;
 
 /** @brief Most vertex inputs a vertex shader can have. */
@@ -1480,6 +1503,12 @@ typedef enum PvkPrimitiveTopology {
 
 /** @brief Most VU1 data memory the shared variables of a task shader or of a mesh shader may take, in bytes: a qword per scalar, vector or matrix column. */
 #define PVK_MAX_SHARED_BYTES 4096
+
+/** @brief Most control points of a tessellation patch. */
+#define PVK_MAX_TESSELLATION_PATCH_SIZE 32
+
+/** @brief Largest tessellation level: the most segments an edge of a patch is cut into. */
+#define PVK_MAX_TESSELLATION_LEVEL 64
 
 /**
  * @brief A uniform block of a vertex shader and where VU1 keeps it.
@@ -1619,12 +1648,33 @@ typedef struct PvkShaderSpecConstant {
  * each a scalar or a vector; a larger or nested one is read a member or
  * an element at a time. A compute shader has neither.
  *
+ * A tessellation control shader runs on VU1 once per output control point
+ * of a patch, behind the vertex shader, which has run for each of the
+ * patch's control points. It reads gl_in[].gl_Position and, per control
+ * point, what the vertex shader wrote beside it: one vec4, one vec2 and one
+ * float, told apart by type. It writes gl_out[].gl_Position, per-vertex
+ * outputs at locations 0 to 6, per-patch outputs at locations 0 to 29, each
+ * location a qword, and gl_TessLevelOuter and gl_TessLevelInner. It reads
+ * gl_InvocationID, gl_PatchVerticesIn and gl_PrimitiveID, may read its own
+ * outputs, and may call barrier(), which works as in a mesh shader. Stores
+ * to gl_PointSize and the clip and cull distances change nothing.
+ *
+ * A tessellation evaluation shader runs on VU1 once per vertex of the
+ * triangles, lines or points a patch is cut into. Its input layout names
+ * triangles, quads or isolines, equal_spacing, fractional_even_spacing or
+ * fractional_odd_spacing, cw or ccw, and point_mode. It reads gl_TessCoord,
+ * the control shader's outputs through gl_in[] and input declarations at
+ * their locations, the two level arrays, gl_PatchVerticesIn and
+ * gl_PrimitiveID, and writes what a vertex shader writes: gl_Position, one
+ * vec4 color, one vec2 texture coordinate and one float fog amount. Uniform
+ * blocks and push constants serve both shaders; storage blocks neither.
+ *
  * Applications never fill this in by hand: shaderc writes a .pvs file (see
  * PvkPvsHeader), and pvkCreateShaderModule() builds one of these from the
  * file's bytes.
  */
 typedef struct PvkShaderCode {
-    PvkShaderStage stage;                  /**< Vertex, fragment, compute, task or mesh. */
+    PvkShaderStage stage;                  /**< Vertex, tessellation control, tessellation evaluation, fragment, compute, task or mesh. */
     const char    *name;                   /**< Source file name, for error messages. */
     const char    *entryPoint;             /**< Name of its entry point, as the GLSL declares it (main). */
 
@@ -1635,11 +1685,11 @@ typedef struct PvkShaderCode {
     const uint32_t *const *vu1Clamps;      /**< Every stage but fragment: the run-time index clamps in the microcode, 3 instruction pairs each, NOP'd in the pipeline's copy unless the device has robustBufferAccess. */
     uint32_t        vu1SpecConstantCount;  /**< Every stage but fragment: number of entries in vu1SpecConstants. */
     const PvkShaderSpecConstant *vu1SpecConstants; /**< Every stage but fragment: its specialization constants, each the LOI immediate in the microcode that holds its default; pvkCreateGraphicsPipeline() or pvkCreateComputePipelines() overwrites the immediate in its copy of the code with the value the stage's PvkSpecializationInfo gives it. */
-    uint32_t        inputCount;            /**< Vertex: number of inputs, each one vec4. */
+    uint32_t        inputCount;            /**< Vertex: number of inputs, each one vec4. Tessellation evaluation: 1, the tessellation coordinate. */
     uint32_t        inputLocations[PVK_MAX_VERTEX_INPUTS]; /**< Vertex: input locations, in the order VU1 reads them. */
-    int32_t         colorOutputLocation;   /**< Vertex and mesh: location of the color output, or -1 if none. */
-    int32_t         texcoordOutputLocation;/**< Vertex and mesh: location of the vec2 texture coordinate output, or -1 if none. When set, VU1 emits ST (or UV for a sampler with unnormalizedCoordinates), RGBAQ, XYZ2 per vertex instead of RGBAQ, XYZ2. */
-    int32_t         fogOutputLocation;     /**< Vertex and mesh: location of the float output, the fog amount, or -1 if none. When set, VU1 clamps the value to 0..1 (0 = all fog, 1 = no fog, in 256 steps) and emits it per vertex in the GS FOG register, between RGBAQ and XYZ2; the GS interpolates it across the primitive. */
+    int32_t         colorOutputLocation;   /**< Vertex, tessellation evaluation and mesh: location of the color output, or -1 if none. */
+    int32_t         texcoordOutputLocation;/**< Vertex, tessellation evaluation and mesh: location of the vec2 texture coordinate output, or -1 if none. When set, VU1 emits ST (or UV for a sampler with unnormalizedCoordinates), RGBAQ, XYZ2 per vertex instead of RGBAQ, XYZ2. */
+    int32_t         fogOutputLocation;     /**< Vertex, tessellation evaluation and mesh: location of the float output, the fog amount, or -1 if none. When set, VU1 clamps the value to 0..1 (0 = all fog, 1 = no fog, in 256 steps) and emits it per vertex in the GS FOG register, between RGBAQ and XYZ2; the GS interpolates it across the primitive. */
     uint32_t        pushConstantBytes;     /**< Every stage but fragment: size of its push constant block, 0 if it has none. */
     uint32_t        uniformBlockCount;     /**< Every stage but fragment: number of entries in uniformBlocks. */
     PvkShaderUniformBlock uniformBlocks[PVK_MAX_UNIFORM_BLOCKS]; /**< Every stage but fragment: its uniform blocks, in (set, binding) order. */
@@ -1669,12 +1719,23 @@ typedef struct PvkShaderCode {
     uint32_t        meshKickAddress;       /**< Mesh: VU1 data memory qword of the GIF packet the first kick of a draw fills. */
     uint32_t        payloadBytes;          /**< Task and mesh: size of the task payload in VU1 data memory, a qword per scalar, vector or matrix column; 0 if the shader declares none. */
     uint32_t        sharedBytes;           /**< Task and mesh: VU1 data memory the shader keeps for its own work groups: its shared variables, a qword per scalar, vector or matrix column, and for each invocation the registers a barrier() holds. */
+
+    uint32_t        vu1EpilogueWord;       /**< Vertex: word offset in the microcode of the first instruction pair behind the shader body; a tessellation pipeline writes a call of the control program there. */
+    uint32_t        vu1NextWord;           /**< Vertex: word offset of the pair that moves on to the next vertex. */
+    uint32_t        vu1KickWord;           /**< Vertex: word offset of the pair that XGKICKs the batch. */
+    uint32_t        tessOutputVertices;    /**< Tessellation control: layout(vertices = n), the control points of the patch it writes. */
+    uint32_t        tessBaseAddress;       /**< Tessellation control: lowest VU1 data memory qword the control program keeps data in; a batch's vertices stay below it. */
+    uint32_t        tessInputs;            /**< Tessellation control: the vertex shader outputs it reads: bit 0 the vec4, bit 1 the vec2, bit 2 the float. */
+    uint32_t        tessDomain;            /**< Tessellation evaluation: 0 triangles, 1 quads, 2 isolines. */
+    uint32_t        tessSpacing;           /**< Tessellation evaluation: 0 equal_spacing, 1 fractional_even_spacing, 2 fractional_odd_spacing. */
+    uint32_t        tessClockwise;         /**< Tessellation evaluation: 1 for cw, 0 for ccw. */
+    uint32_t        tessPointMode;         /**< Tessellation evaluation: 1 for point_mode. */
 } PvkShaderCode;
 
 /** @brief The first word of a .pvs file: "PVS1". */
 #define PVK_PVS_MAGIC   0x31535650u
 /** @brief The .pvs layout version PvkPvsHeader describes. */
-#define PVK_PVS_VERSION 3u
+#define PVK_PVS_VERSION 4u
 
 /** @brief One specialization constant of a vertex shader in a .pvs file. */
 typedef struct PvkPvsSpecConstant {
@@ -1741,6 +1802,16 @@ typedef struct PvkPvsHeader {
     uint32_t meshKickAddress;        /**< PvkShaderCode::meshKickAddress. */
     uint32_t payloadBytes;           /**< PvkShaderCode::payloadBytes. */
     uint32_t sharedBytes;            /**< PvkShaderCode::sharedBytes. */
+    uint32_t epilogueWord;           /**< PvkShaderCode::vu1EpilogueWord. */
+    uint32_t nextWord;               /**< PvkShaderCode::vu1NextWord. */
+    uint32_t kickWord;               /**< PvkShaderCode::vu1KickWord. */
+    uint32_t tessOutputVertices;     /**< PvkShaderCode::tessOutputVertices. */
+    uint32_t tessBaseAddress;        /**< PvkShaderCode::tessBaseAddress. */
+    uint32_t tessInputs;             /**< PvkShaderCode::tessInputs. */
+    uint32_t tessDomain;             /**< PvkShaderCode::tessDomain. */
+    uint32_t tessSpacing;            /**< PvkShaderCode::tessSpacing. */
+    uint32_t tessClockwise;          /**< PvkShaderCode::tessClockwise. */
+    uint32_t tessPointMode;          /**< PvkShaderCode::tessPointMode. */
 } PvkPvsHeader;
 
 /**
@@ -1991,10 +2062,10 @@ typedef enum PvkCullMode {
     PVK_CULL_MODE_FRONT_AND_BACK = 3  /**< Discard all triangles: the draw is skipped. */
 } PvkCullMode;
 
-/** @brief Which winding is front-facing, in framebuffer space (y down). */
+/** @brief Which winding is front-facing, as the triangle's vertices run on screen. */
 typedef enum PvkFrontFace {
-    PVK_FRONT_FACE_COUNTER_CLOCKWISE = 0, /**< Positive signed area is front-facing. */
-    PVK_FRONT_FACE_CLOCKWISE         = 1  /**< Negative signed area is front-facing. */
+    PVK_FRONT_FACE_COUNTER_CLOCKWISE = 0, /**< A triangle whose vertices run counter-clockwise on screen is front-facing. */
+    PVK_FRONT_FACE_CLOCKWISE         = 1  /**< A triangle whose vertices run clockwise on screen is front-facing. */
 } PvkFrontFace;
 
 /** @brief How a pipeline with a line topology draws its lines. */
@@ -2248,15 +2319,29 @@ typedef struct PvkPipelineCacheCreateInfo {
 } PvkPipelineCacheCreateInfo;
 
 /** @brief Parameters for pvkCreateGraphicsPipeline(). */
+/**
+ * @brief The patches of a tessellation pipeline.
+ *
+ * Read only by a pipeline with tessellation stages, whose topology is
+ * PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST.
+ */
+typedef struct PvkPipelineTessellationStateCreateInfo {
+    PvkStructureType sType;              /**< PVK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO. */
+    const void      *pNext;              /**< NULL. */
+    uint32_t         flags;              /**< 0. */
+    uint32_t         patchControlPoints; /**< Vertices of a draw that make one patch: 1 to PvkPhysicalDeviceLimits::maxTessellationPatchSize. */
+} PvkPipelineTessellationStateCreateInfo;
+
 typedef struct PvkGraphicsPipelineCreateInfo {
-    uint32_t                       stageCount;     /**< Number of entries in stages: 2, or 3 for a mesh pipeline with a task stage. */
-    const PvkPipelineShaderStageCreateInfo *stages; /**< One PVK_SHADER_STAGE_FRAGMENT stage and either one PVK_SHADER_STAGE_VERTEX stage or, for a mesh pipeline, one PVK_SHADER_STAGE_MESH_BIT_EXT stage with or without a PVK_SHADER_STAGE_TASK_BIT_EXT stage, in any order. */
+    uint32_t                       stageCount;     /**< Number of entries in stages: 2, 3 for a mesh pipeline with a task stage, 4 for a tessellation pipeline. */
+    const PvkPipelineShaderStageCreateInfo *stages; /**< One PVK_SHADER_STAGE_FRAGMENT stage and either one PVK_SHADER_STAGE_VERTEX stage or, for a mesh pipeline, one PVK_SHADER_STAGE_MESH_BIT_EXT stage with or without a PVK_SHADER_STAGE_TASK_BIT_EXT stage, in any order. A tessellation pipeline adds one PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT and one PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT stage to the vertex stage. */
     PvkPipelineLayout              layout;         /**< Layout whose push constant ranges cover the block of the vertex shader, or of the task and the mesh shader, for that shader's stage. */
     uint32_t                       bindingCount;   /**< Number of entries in bindings. A mesh pipeline reads neither bindings nor attributes. */
     const PvkVertexInputBinding   *bindings;       /**< The vertex buffer bindings the attributes come from. */
     uint32_t                       attributeCount; /**< Number of entries in attributes. */
     const PvkVertexInputAttribute *attributes;     /**< One per vertex shader input. */
     PvkPrimitiveTopology           topology;       /**< How the vertices of a draw are grouped into primitives. Not read by a mesh pipeline: the mesh shader's output layout (points, lines or triangles) names the primitive. */
+    PvkPipelineTessellationStateCreateInfo tessellation; /**< The patch size, read by a pipeline with tessellation stages. */
     PvkViewport                    viewport;       /**< Viewport, unless PVK_DYNAMIC_STATE_VIEWPORT is dynamic. */
     PvkRect2D                      scissor;        /**< Pixels the draws may write, clipped to the attachment, unless PVK_DYNAMIC_STATE_SCISSOR is dynamic; a zero width or height means the whole attachment level, which a secondary command buffer recorded with PVK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT does not know, so its draws need a real rectangle. GS SCISSOR. */
     PvkFormat                      depthAttachmentFormat; /**< Format of the depth attachment the pipeline draws with, or PVK_FORMAT_UNDEFINED for none. Sets the depth range the viewport maps to. */
@@ -2327,6 +2412,19 @@ void      pvkDestroyShaderModule(PvkDevice device, PvkShaderModule module);
  * shared variables and the mesh shader's outputs together take at most
  * PVK_MAX_MESH_OUTPUT_BYTES. Culling applies to a mesh shader's triangles as
  * to a triangle list.
+ *
+ * A tessellation pipeline holds a vertex, a tessellation control and a
+ * tessellation evaluation stage, needs the tessellationShader feature turned
+ * on at pvkCreateDevice(), and has the topology
+ * PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST with tessellation.patchControlPoints
+ * vertices to a patch. Its program is the three shaders' code one behind
+ * the other, together at most 2044 VU1 instructions. VU1 runs the vertex
+ * shader for a patch's control points and then the control shader; the EE
+ * reads the levels the control shader wrote and cuts the patch as the
+ * evaluation shader's layout says; VU1 runs the evaluation shader for
+ * every vertex of the pieces, and the GS draws them as triangles, lines
+ * or points. Culling, blending and the depth test apply to those pieces. A
+ * fractional spacing puts its two shorter segments at the ends of an edge.
  *
  * @param device The device.
  * @param cache Cache the pipeline's program is looked up in and added to, or NULL.
@@ -3221,6 +3319,13 @@ void pvkCmdDispatch(PvkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCo
  * VU1 work, a batch holds as many instances as its output has room for, so
  * a small mesh drawn many times is sent once per batch.
  *
+ * With a tessellation pipeline the vertices are control points, whole
+ * patches of them only. The chain stops when VU1 has run the control
+ * shader for a batch of patches, pvkQueueSubmit() cuts those patches and
+ * builds their draws, and the chain goes on; pvkCmdDrawIndexed() and the
+ * indirect draws do so too. gl_PrimitiveID counts the patches of an
+ * instance from 0.
+ *
  * @param cmd The command buffer.
  * @param vertexCount Number of vertices to draw.
  * @param instanceCount Number of instances; 0 draws nothing.
@@ -3396,6 +3501,8 @@ typedef enum PvkPipelineStageFlagBits {
     PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT           = 0x00000002, /**< Same point. */
     PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT            = 0x00000004, /**< Same point: the VIF unpacks vertices as the chain runs. */
     PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT           = 0x00000008, /**< Same point: VU1 runs as the chain runs. */
+    PVK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT    = 0x00000010, /**< Same point: VU1 runs the control shader as the chain runs. */
+    PVK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT = 0x00000020, /**< Same point: VU1 runs the evaluation shader as the chain runs. */
     PVK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT         = 0x00000080, /**< Same point: GS register state set by the chain. */
     PVK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT    = 0x00000100, /**< Same point: GS TEST. */
     PVK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT     = 0x00000200, /**< Same point: GS TEST. */
@@ -3535,9 +3642,11 @@ typedef struct PvkSubmitInfo {
  * keeps, so it waits for the previous fenceless submission to finish first.
  *
  * The chain of a command buffer stops in front of each indirect draw (see
- * pvkCmdDrawIndirect()). This call then reads the draw's commands from their
- * buffer, builds the draws and lets the chain go on, so the call returns
- * once the last indirect draw of its command buffers has been reached.
+ * pvkCmdDrawIndirect()) and for every batch of patches of a tessellation
+ * draw (see pvkCmdDraw()). This call then reads the draw's commands from
+ * their buffer, or cuts the patches, builds the draws and lets the chain go
+ * on, so the call returns once the last such draw of its command buffers
+ * has been reached.
  *
  * @param queue The queue.
  * @param submitCount Number of entries in submits.

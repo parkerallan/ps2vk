@@ -121,6 +121,30 @@
 #define PVK_VU1_MESH_ENTRY        1   /* pair a mesh program starts at alone; pair 0 is the task's entry */
 #define PVK_VU1_MESH_KICK_QWORDS  61  /* most qwords of one kicked GIF packet */
 
+/* Tessellation, pass 1: the vertex program hands each control point to the control program, which
+ * keeps its data in the top of the input area and its patch records in the output area. */
+#define PVK_VU1_TESS_CPIN         339 /* the patch's control points as the vertex shader wrote them */
+#define PVK_VU1_TESS_CPIN_QWORDS  4   /* per control point: gl_Position, the vec4, the vec2, the float (w) */
+#define PVK_VU1_TESS_STATE        467 /* ints. x: next control point record; y: control points left in the
+                                         patch; z: where the patch's record goes; w: micro address to return to */
+#define PVK_VU1_TESS_STATE2       468 /* ints. x: patchControlPoints; y: gl_PrimitiveID of the next patch */
+#define PVK_VU1_TESS_HEADER       469 /* the control program's 8 header qwords */
+#define PVK_VU1_TESS_SAVE         477 /* the vertex program's VF01-VF31, then VI01-VI15, 4 to a qword */
+#define PVK_VU1_TESS_RECORD       513 /* the record the control shader writes; the batch's records follow */
+
+/* A patch record, as the control shader writes it and the evaluation shader reads it. */
+#define PVK_VU1_TESS_REC_OUTER    0   /* gl_TessLevelOuter[0..3], x of a qword each */
+#define PVK_VU1_TESS_REC_INNER    4   /* gl_TessLevelInner[0..1] */
+#define PVK_VU1_TESS_REC_ID       6   /* ints. x: gl_PrimitiveID; y: gl_PatchVerticesIn */
+#define PVK_VU1_TESS_REC_PATCH    8   /* the per-patch outputs, a qword per location */
+#define PVK_VU1_TESS_PATCH_QWORDS 30
+#define PVK_VU1_TESS_REC_VERTEX   38  /* per output control point: gl_Position, then a qword per location */
+#define PVK_VU1_TESS_VERTEX_QWORDS 8
+#define PVK_VU1_TESS_REC_QWORDS(vertices) (PVK_VU1_TESS_REC_VERTEX + (vertices) * PVK_VU1_TESS_VERTEX_QWORDS)
+
+/* Tessellation, pass 2: the evaluation program reads one patch's record at the top of data memory. */
+#define PVK_VU1_TESS_PATCH        730
+
 /* VU1 micro memory, in instruction pairs; the last 4 hold the routine that XGKICKs the frame packet. */
 #define PVK_VU1_MICRO_PAIRS       2048
 #define PVK_VU1_FRAME_ROUTINE     2044

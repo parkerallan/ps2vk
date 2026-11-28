@@ -18,6 +18,23 @@ static void cmd_release_copies(PvkCommandBuffer cmd);
 static int array_grow(PvkCommandBuffer cmd, void **array, uint32_t count, uint32_t *cap, size_t size);
 static int cmd_graphics(PvkCommandBuffer cmd, const char *who);
 static void cmd_vu1_readback(PvkCommandBuffer cmd, struct PvkReadback *rb);
+static void cmd_close_direct(PvkCommandBuffer cmd, qword_t *end);
+static qword_t *cmd_open_direct(PvkCommandBuffer cmd);
+
+/* Ends the chain: the DIRECT block's FLUSH waits for VU1, and its SIGNAL has the INTC_GS handler
+ * take over until what the chain stopped for is done. */
+static void chain_stop(PvkCommandBuffer cmd)
+{
+    qword_t *q = cmd_open_direct(cmd);
+
+    q = gs_ad(q, GIF_SET_TAG(1, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_SIGNAL(PVK_READBACK_SIGNAL_BIT | cmd->pool->family << 8, 0xFFFFFFFF), GS_REG_SIGNAL);
+    cmd_close_direct(cmd, q);
+    packet2_chain_open_end(&cmd->packet, 0, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_chain_close_tag(&cmd->packet);
+}
 
 /* Make sure `qwords` more fit in the chain; mark the buffer failed if not. */
 static int cmd_reserve(PvkCommandBuffer cmd, uint32_t qwords)
@@ -988,8 +1005,11 @@ static void cmd_release_copies(PvkCommandBuffer cmd)
             free(cmd->readbacks[i].stage);
     for (i = 0; i < cmd->uploadCount; i++)
         free(cmd->uploads[i].stage);
-    for (i = 0; i < cmd->indirectCount; i++)
+    for (i = 0; i < cmd->indirectCount; i++) {
         free(cmd->indirects[i].chain);
+        free(cmd->indirects[i].records);
+        free(cmd->indirects[i].coords);
+    }
     cmd->readbackCount = 0;
     cmd->uploadCount   = 0;
     cmd->indirectCount = 0;
@@ -1332,7 +1352,9 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
         cmd_flush(cmd);
     } else if (srcStageMask & (PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT | PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                               PVK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT | PVK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT)) {
+                               PVK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT | PVK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT |
+                               PVK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+                               PVK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT)) {
         packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
         packet2_vif_flushe(&cmd->packet, 0);
         packet2_vif_nop(&cmd->packet, 0);
@@ -1344,7 +1366,8 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
 #define PVK_ALL_STAGES (PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | \
                         PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT | PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT | \
                         PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | PVK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT | \
-                        PVK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT | PVK_GS_STAGES)
+                        PVK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT | PVK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT | \
+                        PVK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT | PVK_GS_STAGES)
 
 /* Open a GS packet on the command buffer's path: DIRECT (PATH2) or the GIF channel (PATH3). */
 static qword_t *cmd_open_gs(PvkCommandBuffer cmd)
@@ -1653,7 +1676,9 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_
         || ((stageFlags & PVK_SHADER_STAGE_FRAGMENT) && (layout->pushWords[1] & mask) != mask)
         || ((stageFlags & PVK_SHADER_STAGE_COMPUTE_BIT) && (layout->pushWords[2] & mask) != mask)
         || ((stageFlags & PVK_SHADER_STAGE_TASK_BIT_EXT) && (layout->pushWords[3] & mask) != mask)
-        || ((stageFlags & PVK_SHADER_STAGE_MESH_BIT_EXT) && (layout->pushWords[4] & mask) != mask)) {
+        || ((stageFlags & PVK_SHADER_STAGE_MESH_BIT_EXT) && (layout->pushWords[4] & mask) != mask)
+        || ((stageFlags & PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT) && (layout->pushWords[5] & mask) != mask)
+        || ((stageFlags & PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) && (layout->pushWords[6] & mask) != mask)) {
         pvk_error("pvkCmdPushConstants: bytes %u to %u are not in the layout's push constant "
                   "ranges for stage flags 0x%x\n", (unsigned)offset, (unsigned)(offset + size),
                   (unsigned)stageFlags);
@@ -1762,16 +1787,17 @@ static PvkDescriptorSet bound_set(PvkCommandBuffer cmd, const char *name, uint32
 static const char *shader_what(const PvkShaderCode *code)
 {
     return code->stage == PVK_SHADER_STAGE_MESH_BIT_EXT ? "mesh shader"
-         : code->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? "task shader" : "vertex shader";
+         : code->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? "task shader"
+         : code->stage == PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ? "tessellation control shader"
+         : code->stage == PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT ? "tessellation evaluation shader"
+         : "vertex shader";
 }
 
 /* The vertex shader's uniform blocks, or the mesh and task shaders': each bound range must hold its
  * block; after a pipeline or set bind they are sent to VU1 again by DMA REF, behind a FLUSH. */
-static int send_uniforms(PvkCommandBuffer cmd, const char *name)
+static int uniforms_send(PvkCommandBuffer cmd, const char *name, const PvkShaderCode *const *shader,
+                         const uint32_t *const *slotOf, int always)
 {
-    const PvkPipeline p = cmd->pipeline;
-    const PvkShaderCode *shader[2] = { p->vs, p->ts };
-    const uint32_t *slotOf[2] = { p->uniformSlots, p->taskUniformSlots };
     const struct PvkDescriptorSlot *slots[2][PVK_MAX_UNIFORM_BLOCKS];
     uint32_t i, k, blocks = 0;
 
@@ -1797,7 +1823,7 @@ static int send_uniforms(PvkCommandBuffer cmd, const char *name)
         }
     }
 
-    if (!cmd->uniformsDirty || !blocks)
+    if ((!cmd->uniformsDirty && !always) || !blocks)
         return 1;
     if (!cmd_reserve(cmd, 1 + 2 * blocks))
         return 0;
@@ -1812,6 +1838,15 @@ static int send_uniforms(PvkCommandBuffer cmd, const char *name)
     }
     cmd->uniformsDirty = 0;
     return 1;
+}
+
+static int send_uniforms(PvkCommandBuffer cmd, const char *name)
+{
+    const PvkPipeline p = cmd->pipeline;
+    const PvkShaderCode *shader[2] = { p->vs, p->ts };
+    const uint32_t *slotOf[2] = { p->uniformSlots, p->taskUniformSlots };
+
+    return uniforms_send(cmd, name, shader, slotOf, 0);
 }
 
 /* What every draw needs: rendering, a pipeline whose depth format matches the
@@ -1902,7 +1937,8 @@ static int draw_ready_kind(PvkCommandBuffer cmd, const char *name, int mesh)
         return 0;
     }
 
-    if (!send_uniforms(cmd, name))
+    /* A tessellation draw sends each pass its shaders' blocks when the chain reaches it. */
+    if (!p->tess && !send_uniforms(cmd, name))
         return 0;
     if (p->fs->textured && !bound_set(cmd, name, p->samplerSet, p->samplerSlot, "fragment shader", p->fs->name,
                                       (uint32_t)p->fs->samplerBinding))
@@ -1949,7 +1985,7 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
 /* Most indices in one batch: whole primitives that fit the output area. */
 static uint32_t batch_max_indices(const PvkPipeline p)
 {
-    return ((PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / p->outputQwords) / p->primStep * p->primStep;
+    return ((p->outputEnd - PVK_VU1_OUTPUT_ADDR - 1) / p->outputQwords) / p->primStep * p->primStep;
 }
 
 /* Vertices a batch starting at draw position `done` repeats from the previous
@@ -2011,10 +2047,10 @@ static uint32_t stream_slots(PvkCommandBuffer cmd, int instance)
  * its vertices in the output area and its qwords in the input area. */
 static uint32_t batch_instances(const PvkPipeline p, uint32_t vertices, uint32_t used, uint32_t left)
 {
-    uint32_t k = (PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR) / (1 + vertices * p->outputQwords);
+    uint32_t k = (p->outputEnd - PVK_VU1_OUTPUT_ADDR) / (1 + vertices * p->outputQwords);
 
     if (p->instanceQwords) {
-        uint32_t room = (PVK_BATCH_INPUT_QWORDS - used) / p->instanceQwords;
+        uint32_t room = (p->inputQwords - used) / p->instanceQwords;
 
         room = room > 2 * (p->instanceAlign - 1) ? room - 2 * (p->instanceAlign - 1) : 1;
         if (room < k)
@@ -2214,7 +2250,7 @@ static void batch_end(PvkCommandBuffer cmd, uint32_t firstInstance, uint32_t ins
 {
     batch_range(cmd, 1, firstInstance, instances, PVK_VU1_INPUT_ADDR + at,
                 firstInstance % cmd->pipeline->instanceAlign);
-    packet2_utils_vu_add_start_program(&cmd->packet, 0);
+    packet2_utils_vu_add_start_program(&cmd->packet, cmd->pipeline->entry);
 }
 
 /* Index `i` of a batch's list: the carried ones come before the draw's. */
@@ -2297,11 +2333,21 @@ static void draw_batches(PvkCommandBuffer cmd, const char *name, uint32_t vertex
 }
 
 /* pvkCmdDraw, reporting errors under `name`. */
+static void cmd_indirect(PvkCommandBuffer cmd, int kind, const uint8_t *at, uint32_t drawCount, uint32_t stride,
+                         const PvkDrawIndexedIndirectCommand *direct);
+
 static void draw(PvkCommandBuffer cmd, const char *name, uint32_t vertexCount, uint32_t instanceCount,
                  uint32_t firstVertex, uint32_t firstInstance)
 {
-    if (draw_ready(cmd, name))
-        draw_batches(cmd, name, vertexCount, instanceCount, firstVertex, firstInstance);
+    if (!draw_ready(cmd, name))
+        return;
+    if (cmd->pipeline->tess) {
+        /* The patches are cut once VU1 has run their control shader, when the chain gets here. */
+        PvkDrawIndexedIndirectCommand c = { vertexCount, instanceCount, firstVertex, 0, firstInstance };
+        cmd_indirect(cmd, 0, NULL, 1, 0, &c);
+        return;
+    }
+    draw_batches(cmd, name, vertexCount, instanceCount, firstVertex, firstInstance);
 }
 
 /* An indexed batch at a draw position: the carried indices, how many of the
@@ -2440,8 +2486,19 @@ static void indexed_batches(PvkCommandBuffer cmd, const char *name, uint32_t ind
 static void draw_indexed(PvkCommandBuffer cmd, const char *name, uint32_t indexCount, uint32_t instanceCount,
                          uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
-    if (draw_ready(cmd, name))
-        indexed_batches(cmd, name, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+    if (!draw_ready(cmd, name))
+        return;
+    if (cmd->pipeline->tess) {
+        PvkDrawIndexedIndirectCommand c = { indexCount, instanceCount, firstIndex, vertexOffset, firstInstance };
+        if (!cmd->indexBuffer) {
+            pvk_error("%s needs an index buffer bound with pvkCmdBindIndexBuffer\n", name);
+            cmd->failed = 1;
+            return;
+        }
+        cmd_indirect(cmd, 1, NULL, 1, 0, &c);
+        return;
+    }
+    indexed_batches(cmd, name, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
 
 void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
@@ -2501,7 +2558,8 @@ static int indirect_first_instance(PvkCommandBuffer cmd, const char *name, uint3
 }
 
 /* Records an indirect call: what is bound, a stop of the chain, and a NEXT tag its draws' chain goes behind. */
-static void cmd_indirect(PvkCommandBuffer cmd, int kind, const uint8_t *at, uint32_t drawCount, uint32_t stride)
+static void cmd_indirect(PvkCommandBuffer cmd, int kind, const uint8_t *at, uint32_t drawCount, uint32_t stride,
+                         const PvkDrawIndexedIndirectCommand *direct)
 {
     struct PvkReadback stop = { 0 };
     struct PvkIndirect *in;
@@ -2522,6 +2580,11 @@ static void cmd_indirect(PvkCommandBuffer cmd, int kind, const uint8_t *at, uint
     memcpy(in->vertexOffsets, cmd->vertexOffsets, sizeof(in->vertexOffsets));
     in->indexBuffer = cmd->indexBuffer;
     in->indexOffset = cmd->indexOffset;
+    in->tess        = cmd->pipeline->tess;
+    if (direct) {
+        in->direct = 1;
+        in->params = *direct;
+    }
     /* The chain stops here until the draws are built, then goes on at the tag. */
     stop.indirectCmd   = cmd;
     stop.indirectIndex = cmd->indirectCount - 1;
@@ -2540,7 +2603,7 @@ void pvkCmdDrawIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, u
 
     if (!at || !draw_ready(cmd, "pvkCmdDrawIndirect") || !drawCount)
         return;
-    cmd_indirect(cmd, 0, at, drawCount, stride);
+    cmd_indirect(cmd, 0, at, drawCount, stride, NULL);
 }
 
 void pvkCmdDrawIndexedIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, uint32_t drawCount,
@@ -2556,22 +2619,14 @@ void pvkCmdDrawIndexedIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t of
         cmd->failed = 1;
         return;
     }
-    cmd_indirect(cmd, 1, at, drawCount, stride);
+    cmd_indirect(cmd, 1, at, drawCount, stride, NULL);
 }
 
 /* Ends the chain behind a VU1 program that writes storage blocks: the DIRECT block's FLUSH waits
  * for the program, the SIGNAL stops the chain until the INTC_GS handler has copied the blocks out. */
 static void cmd_vu1_readback(PvkCommandBuffer cmd, struct PvkReadback *rb)
 {
-    qword_t *q = cmd_open_direct(cmd);
-
-    q = gs_ad(q, GIF_SET_TAG(1, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-    q = gs_ad(q, GS_SET_SIGNAL(PVK_READBACK_SIGNAL_BIT | cmd->pool->family << 8, 0xFFFFFFFF), GS_REG_SIGNAL);
-    cmd_close_direct(cmd, q);
-    packet2_chain_open_end(&cmd->packet, 0, 0);
-    packet2_vif_nop(&cmd->packet, 0);
-    packet2_vif_nop(&cmd->packet, 0);
-    packet2_chain_close_tag(&cmd->packet);
+    chain_stop(cmd);
     rb->resume = (qword_t *)cmd->packet.next;
     cmd->readbacks[cmd->readbackCount++] = *rb;
 }
@@ -2947,8 +3002,244 @@ void pvkCmdDrawMeshTasksIndirectEXT(PvkCommandBuffer cmd, PvkBuffer buffer, size
     }
 }
 
+/* VU1 data memory as the EE sees it, readable while VU1 is idle. */
+#define VU1_DATA ((const uint8_t *)0x1100C000)
+
+/* A copy of the command buffer that draws with an indirect call's state into its `chain`. */
+static void replay_begin(struct PvkCommandBuffer_T *t, PvkCommandBuffer cmd, const struct PvkIndirect *in, uint32_t cap)
+{
+    memset(t, 0, sizeof(*t));
+    t->device      = cmd->device;
+    t->pool        = cmd->pool;
+    t->replay      = 1;
+    t->pipeline    = in->pipeline;
+    memcpy(t->sets, in->sets, sizeof(t->sets));
+    memcpy(t->vertexBuffers, in->vertexBuffers, sizeof(t->vertexBuffers));
+    memcpy(t->vertexOffsets, in->vertexOffsets, sizeof(t->vertexOffsets));
+    t->indexBuffer = in->indexBuffer;
+    t->indexOffset = in->indexOffset;
+    t->packet      = cmd->packet;
+    t->packet.base = t->packet.next = in->chain;
+    t->packet.max_qwords_count   = (u16)cap;
+    t->packet.tag_opened_at      = NULL;
+    t->packet.vif_code_opened_at = NULL;
+}
+
+/* The levels of patch record k: 4 outer and 2 inner, the x of a qword each. */
+static void tess_levels(const qword_t *record, float *outer, float *inner)
+{
+    const float *f = (const float *)record;
+    uint32_t i;
+
+    for (i = 0; i < 4; i++)
+        outer[i] = f[(PVK_VU1_TESS_REC_OUTER + i) * 4];
+    for (i = 0; i < 2; i++)
+        inner[i] = f[(PVK_VU1_TESS_REC_INNER + i) * 4];
+}
+
+/* One step of a tessellation draw: the patches VU1 has run the control shader for are cut and drawn,
+ * then the next ones go through the vertex and control programs. `done` is 1 when none is left. */
+static PvkResult tess_build(PvkCommandBuffer cmd, struct PvkIndirect *in, int *done)
+{
+    static struct PvkCommandBuffer_T t;
+    static struct PvkBuffer_T stream;
+    const char *name = in->direct ? (in->kind ? "pvkCmdDrawIndexed" : "pvkCmdDraw")
+                                  : (in->kind ? "pvkCmdDrawIndexedIndirect" : "pvkCmdDrawIndirect");
+    const PvkPipeline p = in->pipeline, e = p->eval;
+    const PvkShaderCode *tes = p->tes;
+    const PvkShaderCode *const first[2] = { p->vs, p->tcs }, *const last[2] = { tes, NULL };
+    const uint32_t *const firstSlots[2] = { p->uniformSlots, p->tcsUniformSlots };
+    const uint32_t *const lastSlots[2] = { p->tesUniformSlots, NULL };
+    uint32_t ran = in->ranPatches, rec = p->tessRecord, k, total = 0, n, drawn, draw, instance, at;
+    float outer[4], inner[2], was[6];
+
+    ((dma_tag_t *)in->jump)->ADDR = (u32)(in->jump + 1);
+    *done = 1;
+    /* The records VU1 wrote, and room for the coordinates of the patches not drawn yet. */
+    if (ran && !in->ranDrawn) {
+        if (!in->records && !(in->records = memalign(64, (size_t)p->tessPatches * rec * 16))) {
+            pvk_error("%s: out of EE RAM for the patch records\n", name);
+            return PVK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        memcpy(in->records, VU1_DATA + p->tessFirst * 16, (size_t)ran * rec * 16);
+    }
+    for (k = in->ranDrawn; k < ran; k++) {
+        tess_levels(in->records + k * rec, outer, inner);
+        /* Patches with the levels of the one before share its coordinates. */
+        if (k == in->ranDrawn || memcmp(was, outer, sizeof(outer)) || memcmp(was + 4, inner, sizeof(inner)))
+            total += pvk_tessellate(tes->tessDomain, tes->tessSpacing, (int)tes->tessClockwise, (int)tes->tessPointMode,
+                                    outer, inner, NULL);
+        memcpy(was, outer, sizeof(outer));
+        memcpy(was + 4, inner, sizeof(inner));
+    }
+    if (total > in->coordsCap) {
+        free(in->coords);
+        in->coords    = memalign(64, (size_t)total * 16);
+        in->coordsCap = in->coords ? total : 0;
+        if (!in->coords) {
+            pvk_error("%s: out of EE RAM for %u tessellation coordinates\n", name, (unsigned)total);
+            return PVK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+    if (!in->chainCap)
+        in->chainCap = 1024;
+
+    for (;;) {
+        float *coords = in->coords, *mine = NULL;
+        uint32_t count = 0;
+
+        if (!in->chain && !(in->chain = memalign(64, (size_t)in->chainCap * 16))) {
+            pvk_error("%s: out of EE RAM for the draws' %u-qword chain\n", name, (unsigned)in->chainCap);
+            return PVK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        replay_begin(&t, cmd, in, in->chainCap);
+        drawn    = in->ranDrawn;
+        draw     = in->stepDraw;
+        instance = in->stepInstance;
+        at       = in->stepDone;
+        n        = 0;
+
+        if (drawn < ran) {
+            t.pipeline         = e;
+            t.vertexBuffers[0] = &stream;
+            t.vertexOffsets[0] = 0;
+            uniforms_send(&t, name, last, lastSlots, 1);
+        }
+        for (k = drawn; k < ran && !t.failed; k++) {
+            const qword_t *r = in->records + k * rec;
+            qword_t *mark = t.packet.next;
+            uint32_t sent;
+
+            tess_levels(r, outer, inner);
+            if (k == in->ranDrawn || memcmp(was, outer, sizeof(outer)) || memcmp(was + 4, inner, sizeof(inner))) {
+                mine    = coords;
+                count   = pvk_tessellate(tes->tessDomain, tes->tessSpacing, (int)tes->tessClockwise,
+                                         (int)tes->tessPointMode, outer, inner, mine);
+                coords += count * 4;
+            }
+            memcpy(was, outer, sizeof(outer));
+            memcpy(was + 4, inner, sizeof(inner));
+            if (count && cmd_reserve(&t, 2 + 2 * (rec / PVK_MAX_UNPACK_QWORDS + 1))) {
+                /* The patch's record to where the evaluation program reads it, once VU1 is idle. */
+                cmd_flush(&t);
+                for (sent = 0; sent < rec; sent += PVK_MAX_UNPACK_QWORDS)
+                    packet2_utils_vu_add_unpack_data(&t.packet, PVK_VU1_TESS_PATCH + sent, (void *)(r + sent),
+                                                     rec - sent < PVK_MAX_UNPACK_QWORDS ? rec - sent
+                                                                                        : PVK_MAX_UNPACK_QWORDS, 0);
+                stream.data = mine;
+                stream.size = (size_t)count * 16;
+                draw_batches(&t, name, count, 1, 0, 0);
+            }
+            if (t.failed == 2 && in->chainCap == 0xffff && k > drawn) {
+                /* The chain is full: the patches so far are drawn, and the next step goes on here. */
+                t.packet.next = mark;
+                t.packet.tag_opened_at = NULL;
+                t.packet.vif_code_opened_at = NULL;
+                t.failed = 0;
+                break;
+            }
+        }
+        drawn = t.failed ? drawn : k;
+
+        /* The next patches, when every one VU1 has run is drawn and a command has some left. */
+        while (!t.failed && drawn == ran && draw < in->drawCount) {
+            PvkDrawIndexedIndirectCommand c = in->params;
+            uint32_t vertices;
+
+            if (!in->direct && in->kind) {
+                memcpy(&c, in->at + (size_t)draw * in->stride, sizeof c);
+            } else if (!in->direct) {
+                PvkDrawIndirectCommand d;
+                memcpy(&d, in->at + (size_t)draw * in->stride, sizeof d);
+                c.indexCount    = d.vertexCount;
+                c.instanceCount = d.instanceCount;
+                c.firstIndex    = d.firstVertex;
+                c.vertexOffset  = 0;
+                c.firstInstance = d.firstInstance;
+            }
+            if (!in->direct && !indirect_first_instance(&t, name, c.firstInstance))
+                break;
+            vertices = c.indexCount - c.indexCount % p->primStep; /* whole patches only */
+            if (!vertices || !c.instanceCount) {
+                draw++;
+                continue;
+            }
+            n = vertices - at < p->maxBatch ? vertices - at : p->maxBatch;
+            t.pipeline = p;
+            memcpy(t.vertexBuffers, in->vertexBuffers, sizeof(t.vertexBuffers));
+            memcpy(t.vertexOffsets, in->vertexOffsets, sizeof(t.vertexOffsets));
+            uniforms_send(&t, name, first, firstSlots, 1);
+            if (!cmd_reserve(&t, 6))
+                break;
+            /* The control program's state: no control point yet, and where the records go. */
+            cmd_flush(&t);
+            packet2_utils_vu_open_unpack(&t.packet, PVK_VU1_TESS_STATE, 0);
+            packet2_add_u32(&t.packet, PVK_VU1_TESS_CPIN);
+            packet2_add_u32(&t.packet, p->primStep);
+            packet2_add_u32(&t.packet, p->tessFirst);
+            packet2_add_u32(&t.packet, 0);
+            packet2_add_u32(&t.packet, p->primStep);
+            packet2_add_u32(&t.packet, at / p->primStep);
+            packet2_add_u32(&t.packet, 0);
+            packet2_add_u32(&t.packet, 0);
+            packet2_utils_vu_close_unpack(&t.packet);
+            if (in->kind)
+                indexed_batches(&t, name, n, 1, c.firstIndex + at, c.vertexOffset, c.firstInstance + instance);
+            else
+                draw_batches(&t, name, n, 1, c.firstIndex + at, c.firstInstance + instance);
+            at += n;
+            if (at == vertices) {
+                at = 0;
+                if (++instance == c.instanceCount) {
+                    instance = 0;
+                    draw++;
+                }
+            }
+            break;
+        }
+        if (!t.failed && cmd_reserve(&t, 8)) {
+            if (n || drawn < ran) {
+                chain_stop(&t);
+            } else {
+                /* Back to the recording, at the tag behind the one that led here. */
+                packet2_chain_next(&t.packet, (const dma_tag_t *)(in->jump + 1), 0, 0, 0);
+                packet2_vif_nop(&t.packet, 0);
+                packet2_vif_nop(&t.packet, 0);
+                packet2_chain_close_tag(&t.packet);
+            }
+        }
+        if (t.failed != 2)
+            break;
+        if (in->chainCap == 0xffff) {
+            pvk_error("%s: one patch's draws take more than 65535 chain qwords\n", name);
+            t.failed = 1;
+            break;
+        }
+        free(in->chain);
+        in->chain    = NULL;
+        in->chainCap = in->chainCap * 2 > 0xffff ? 0xffff : in->chainCap * 2;
+    }
+    if (t.failed) {
+        in->ranPatches = in->ranDrawn = in->stepDraw = in->stepInstance = in->stepDone = 0;
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    *done = !n && drawn == ran;
+    if (drawn < ran) {
+        in->ranDrawn = drawn;
+    } else {
+        in->ranPatches   = n / p->primStep;
+        in->ranDrawn     = 0;
+        /* The next submit of the command buffer starts the draw over. */
+        in->stepDraw     = *done ? 0 : draw;
+        in->stepInstance = *done ? 0 : instance;
+        in->stepDone     = *done ? 0 : at;
+    }
+    ((dma_tag_t *)in->jump)->ADDR = (u32)in->chain;
+    return PVK_SUCCESS;
+}
+
 /* Builds one indirect call's draws from its commands as the buffer holds them now; a failed call draws nothing. */
-static PvkResult indirect_build(PvkCommandBuffer cmd, struct PvkIndirect *in)
+static PvkResult indirect_build(PvkCommandBuffer cmd, struct PvkIndirect *in, int *done)
 {
     static const char *const names[] = { "pvkCmdDrawIndirect", "pvkCmdDrawIndexedIndirect",
                                          "pvkCmdDrawMeshTasksIndirectEXT" };
@@ -2957,6 +3248,9 @@ static PvkResult indirect_build(PvkCommandBuffer cmd, struct PvkIndirect *in)
     const uint8_t *at;
     uint32_t cap = 256, i;
 
+    if (in->tess)
+        return tess_build(cmd, in, done);
+    *done = 1;
     if (in->kind == 2) {
         PvkDrawMeshTasksIndirectCommandEXT c;
         float f[4];
@@ -3034,7 +3328,7 @@ static PvkResult indirect_build(PvkCommandBuffer cmd, struct PvkIndirect *in)
     return PVK_SUCCESS;
 }
 
-PvkResult pvk_cmd_build_indirect(PvkCommandBuffer cmd, uint32_t index)
+PvkResult pvk_cmd_build_indirect(PvkCommandBuffer cmd, uint32_t index, int *done)
 {
-    return indirect_build(cmd, &cmd->indirects[index]);
+    return indirect_build(cmd, &cmd->indirects[index], done);
 }

@@ -133,6 +133,16 @@ struct PvkIndirect {
     uint32_t      *mscal;     /* kind 2: the VIF code that starts VU1, a NOP while a count is 0 */
     uint32_t       mscalCode;
     int            task;      /* kind 2: the counts are a task shader's */
+    int            tess;      /* kinds 0 and 1 with a tessellation pipeline: built a batch of patches at a time */
+    int            direct;    /* tess: pvkCmdDraw or pvkCmdDrawIndexed, whose values are `params` */
+    PvkDrawIndexedIndirectCommand params;
+    uint32_t       stepDraw, stepInstance, stepDone; /* tess: command, instance and vertex the next batch starts at */
+    uint32_t       ranPatches; /* tess: patches VU1 has just run the control shader for */
+    uint32_t       ranDrawn;  /* tess: how many of them are drawn already */
+    uint32_t       chainCap;  /* tess: qwords `chain` holds */
+    qword_t       *records;   /* tess: those patches' records, copied out of VU1 */
+    float         *coords;    /* tess: their tessellation coordinates, a qword each */
+    uint32_t       coordsCap; /* in qwords */
 };
 
 /* The region the handlers are reading back; stage 0 = none. */
@@ -203,8 +213,13 @@ struct PvkDevice_T {
 
 /* Packs the command buffer's staged upload regions, and its secondaries', from their buffers. */
 void pvk_cmd_pack_uploads(PvkCommandBuffer cmd);
-/* Reads the commands of entry `index` of the command buffer's indirects[] and builds the draws. Not from a handler. */
-PvkResult pvk_cmd_build_indirect(PvkCommandBuffer cmd, uint32_t index);
+/* Reads the commands of entry `index` of the command buffer's indirects[] and builds the draws; `done` is 0
+ * when the chain stops for the entry again. Not from a handler. */
+PvkResult pvk_cmd_build_indirect(PvkCommandBuffer cmd, uint32_t index, int *done);
+/* The tessellation coordinates of a patch, a qword (u, v, w, 0) per vertex of its triangles, lines or
+ * points; `out` NULL only counts them. */
+uint32_t pvk_tessellate(uint32_t domain, uint32_t spacing, int clockwise, int pointMode, const float *outer,
+                        const float *inner, float *out);
 
 /* Takes `words` words of VRAM (a multiple of a page) at the first fit; 0 when none. */
 int  pvk_vram_alloc(PvkDevice device, uint32_t words, uint32_t *address);
@@ -396,12 +411,13 @@ struct PvkDescriptorPool_T {
  * read, one bit per word, plus the set layouts. Two layouts with equal masks
  * are push-constant compatible in Vulkan's sense. */
 struct PvkPipelineLayout_T {
-    uint32_t pushWords[5];    /* [0] vertex, [1] fragment, [2] compute, [3] task, [4] mesh stage */
+    uint32_t pushWords[7];    /* [0] vertex, [1] fragment, [2] compute, [3] task, [4] mesh, [5] and [6] tessellation control and evaluation stage */
     uint32_t setLayoutCount;
     struct PvkDescriptorSetLayout_T setLayouts[PVK_MAX_DESCRIPTOR_SETS];
 };
 
 #define PVK_ALL_SHADER_STAGES (PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT | PVK_SHADER_STAGE_COMPUTE_BIT | \
+                               PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | \
                                PVK_SHADER_STAGE_TASK_BIT_EXT | PVK_SHADER_STAGE_MESH_BIT_EXT)
 
 /* Bits of a layout's word mask for the bytes [offset, offset + size). */
@@ -449,6 +465,18 @@ struct PvkPipeline_T {
     uint32_t taskUniformSlots[PVK_MAX_UNIFORM_BLOCKS]; /* bindings[] slot of each ts->uniformBlocks[] entry */
     uint32_t taskStorageSlots[PVK_MAX_STORAGE_BLOCKS]; /* and of each ts->storageBlocks[] entry */
     uint32_t meshEntry;       /* instruction pair a mesh draw starts VU1 at: the task program, else the mesh program */
+    int      tess;            /* a tessellation pipeline: vs's program calls tcs's behind it, and draws end in `eval` */
+    const PvkShaderCode *tcs, *tes; /* or NULL */
+    uint32_t tcsUniformSlots[PVK_MAX_UNIFORM_BLOCKS]; /* bindings[] slot of each tcs->uniformBlocks[] entry */
+    uint32_t tesUniformSlots[PVK_MAX_UNIFORM_BLOCKS]; /* and of each tes->uniformBlocks[] entry */
+    uint32_t patchControlPoints;
+    uint32_t tessRecord;      /* qwords of a patch record */
+    uint32_t tessPatches;     /* patches one VU1 run of the control program has records for */
+    uint32_t tessFirst;       /* VU1 qword of the first of those records */
+    struct PvkPipeline_T *eval; /* tes's program as a pipeline of its own: one vec4 stream, the tessellation coordinates */
+    uint32_t entry;           /* instruction pair a batch starts VU1 at */
+    uint32_t outputEnd;       /* VU1 qword behind a batch's output area */
+    uint32_t inputQwords;     /* VU1 qwords a batch's input may take, after the header */
     const PvkShaderCode *vs;
     const PvkShaderCode *fs;
     PvkPipelineLayout    layout;

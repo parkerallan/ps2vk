@@ -1,0 +1,1 @@
+tess_two_vec4.tesc: error: tessellation control shader has two inputs of the type of 'vNormal'; the stage before it writes one vec4, one vec2 and one float

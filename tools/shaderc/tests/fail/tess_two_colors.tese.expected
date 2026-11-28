@@ -1,0 +1,1 @@
+tess_two_colors.tese: error: shader has 2 color outputs; the GS can interpolate only one color

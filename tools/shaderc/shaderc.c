@@ -48,6 +48,13 @@
  *             SetMeshOutputsEXT, gl_MeshVerticesEXT[].gl_Position, a color,
  *             a texture coordinate and a fog output per vertex, the primitive
  *             index arrays, gl_CullPrimitiveEXT and a perprimitiveEXT color
+ *   tessellation control: what a compute shader computes with but storage
+ *             blocks, gl_in[].gl_Position and the vertex shader's vec4,
+ *             vec2 and float per control point, gl_out[].gl_Position,
+ *             per-vertex and per-patch outputs, the tessellation levels,
+ *             gl_InvocationID, gl_PatchVerticesIn, gl_PrimitiveID, barrier()
+ *   tessellation evaluation: what a vertex shader computes with, on
+ *             gl_TessCoord, gl_in[], the control shader's outputs and levels
  *   fragment: outColor = vColor;                      (Gouraud)
  *             outColor = texture(tex, vUV);           (GS TFX decal)
  *             outColor = texture(tex, vUV) * vColor;  (GS TFX modulate)
@@ -140,13 +147,23 @@ enum { BuiltInPosition = 0, BuiltInNumWorkgroups = 24, BuiltInWorkgroupSize = 25
        BuiltInInstanceIndex = 43 };
 enum { ScUniformConstant = 0, ScInput = 1, ScUniform = 2, ScOutput = 3, ScWorkgroup = 4, ScFunction = 7,
        ScPushConstant = 9, ScStorageBuffer = 12, ScTaskPayload = 5402 };
-enum { ExecVertex = 0, ExecFragment = 4, ExecGLCompute = 5, ExecTask = 5364, ExecMesh = 5365 };
+enum { ExecVertex = 0, ExecTessControl = 1, ExecTessEval = 2, ExecFragment = 4, ExecGLCompute = 5, ExecTask = 5364,
+       ExecMesh = 5365 };
+enum { ExecModeSpacingEqual = 1, ExecModeSpacingFractionalEven = 2, ExecModeSpacingFractionalOdd = 3,
+       ExecModeVertexOrderCw = 4, ExecModeVertexOrderCcw = 5, ExecModePointMode = 10, ExecModeTriangles = 22,
+       ExecModeQuads = 24, ExecModeIsolines = 25 };
+enum { BuiltInInvocationId = 8, BuiltInTessLevelOuter = 11, BuiltInTessLevelInner = 12, BuiltInTessCoord = 13,
+       BuiltInPatchVertices = 14 };
+#define DecPatch 15
 enum { ExecModeLocalSize = 17, ExecModeOutputVertices = 26, ExecModeOutputPoints = 27, ExecModeLocalSizeId = 38,
        ExecModeOutputLines = 5269, ExecModeOutputPrimitives = 5270, ExecModeOutputTriangles = 5298 };
 /* The stages VU1 runs as work groups of invocations. */
-#define IS_GROUPED(sh) ((sh)->execModel == ExecGLCompute || (sh)->execModel == ExecTask || (sh)->execModel == ExecMesh)
+#define IS_GROUPED(sh) ((sh)->execModel == ExecGLCompute || (sh)->execModel == ExecTask || (sh)->execModel == ExecMesh || \
+                        (sh)->execModel == ExecTessControl)
 /* The stages whose code runs on VU1. */
-#define IS_CODE(sh) ((sh)->execModel == ExecVertex || IS_GROUPED(sh))
+#define IS_VERTEXLIKE(sh) ((sh)->execModel == ExecVertex || (sh)->execModel == ExecTessEval)
+#define IS_TESS(sh) ((sh)->execModel == ExecTessControl || (sh)->execModel == ExecTessEval)
+#define IS_CODE(sh) (IS_VERTEXLIKE(sh) || IS_GROUPED(sh))
 
 /* GLSL.std.450 instruction numbers. */
 enum {
@@ -249,6 +266,12 @@ typedef struct {
     int      ignored;        /* pointer: stores to it change nothing the GS draws (gl_PointSize, gl_PrimitiveID) */
     int      cullFlag;       /* pointer: gl_CullPrimitiveEXT of one primitive */
     int      sharedQword;    /* variable: 1 + its first qword among the shared variables, 0 if not shared */
+    /* tessellation: a variable that lives in the control points or in the patch record */
+    int      patch;          /* variable: decorated Patch */
+    int      tessBlk;        /* variable: 1 + SYN_ block it lives in, 0 if none */
+    int      tessQ;          /* its first qword there */
+    int      tessStride;     /* qwords from one control point to the next; 0 = not per control point */
+    int      tessComp;       /* field of the qword a scalar is in */
     /* ints: VU1 computes with floats, so an int that is counted or compared is one */
     int      intIsFloat;     /* int value held as a float (a counter, a sum, a phi) */
     uint32_t asFloat;        /* int value: id of its float form once made, 0 if not yet */
@@ -297,7 +320,9 @@ static const char *g_src = "shader";
 static const char *g_stage = NULL;   /* compute, task or mesh: messages name that stage's shader */
 static int g_intVectors = 0;         /* mesh and task: an int vector is a vector of the floats VU1 counts with */
 static int g_header = -1;            /* first of a mesh or task program's 8 header qwords; -1 = a compute program's */
-static int g_synBase[5];             /* VU1 address of the vertex and primitive records, output counts, payload, shared variables */
+static int g_synBase[9];             /* VU1 address of each SYN_ block */
+static int g_pairs = 0;              /* instruction pairs written so far */
+static int g_epilogue, g_next, g_kick; /* vertex: pairs a tessellation pipeline patches */
 static int g_ctxQwords = 0;          /* qwords an invocation keeps at a barrier(): where it goes on, and its registers */
 static const char *g_sym = "";       /* symbol prefix of the microcode being written */
 static int g_clamps = 0;             /* run-time index clamps labelled so far */
@@ -679,7 +704,10 @@ typedef struct {
 
 /* Blocks at fixed VU1 addresses, numbered after the storage blocks: a mesh shader's vertex and
  * primitive records, its SetMeshOutputsEXT counts, the task payload, and the shared variables. */
-enum { SYN_VERT = PVK_MAX_STORAGE_BLOCKS, SYN_PRIM, SYN_COUNTS, SYN_PAYLOAD, SYN_SHARED };
+enum { SYN_VERT = PVK_MAX_STORAGE_BLOCKS, SYN_PRIM, SYN_COUNTS, SYN_PAYLOAD, SYN_SHARED,
+       /* tessellation: the vertex shader's control points, the control shader's patch record,
+        * the record the evaluation shader reads, the control program's state */
+       SYN_CPIN, SYN_TREC, SYN_TPATCH, SYN_TSTATE };
 
 /* VU1 address of header qword k (PVK_VU1_HEADER_*) of the program being compiled. */
 static int hdr_addr(int k)
@@ -752,6 +780,8 @@ typedef struct {
     uint32_t payloadVar;            /* task and mesh: the task payload variable, 0 if none */
     int      payloadQwords;
     int      sharedQwords;          /* task and mesh: qwords of the shared variables */
+    int      tessDomain, tessSpacing, tessCw, tessPoint; /* evaluation: its input layout */
+    int      tessInputs;            /* control: vertex shader outputs read, bit 0 vec4, 1 vec2, 2 float */
     int      barriers;              /* task and mesh: barrier() calls */
     uint32_t constBase;             /* synthetic id of constant qword 0 (then qword 1, ...) */
     uint32_t nextId;                /* next free synthetic id, after the constant qwords */
@@ -1052,7 +1082,7 @@ static void place_uniforms(Shader *sh)
         fail("the uniform blocks take %u bytes together; ps2vk reserves %d bytes of VU1 memory "
              "for uniform buffers", (unsigned)qword * 16, PVK_VU1_UNIFORM_QWORDS * 16);
     /* A task shader's blocks end the area, which leaves its start to the mesh shader's. */
-    for (int i = 0; sh->execModel == ExecTask && i < sh->uniformCount; i++)
+    for (int i = 0; (sh->execModel == ExecTask || sh->execModel == ExecTessControl) && i < sh->uniformCount; i++)
         sh->uniforms[i].qword += PVK_VU1_UNIFORM_QWORDS - qword;
 }
 
@@ -1800,7 +1830,7 @@ static int is_plain_base(const IdInfo *ids, const Shader *sh, uint32_t base)
         return ids[base].ignored || ids[base].storBlock > SYN_VERT;
     if (!base || sh->execModel == ExecVertex || sh->execModel == ExecFragment)
         return 0;
-    return base == sh->payloadVar || ids[base].sharedQword || (sh->execModel == ExecMesh &&
+    return base == sh->payloadVar || ids[base].sharedQword || ids[base].tessBlk || (sh->execModel == ExecMesh &&
            (base == sh->meshVertVar || base == sh->meshPrimVar || base == sh->meshIndexVar ||
             base == sh->colorVar || base == sh->texcoordVar || base == sh->fogVar));
 }
@@ -1833,6 +1863,49 @@ static void plain_chain(IdInfo *ids, Shader *sh, const uint32_t *w, uint32_t n)
         blk = SYN_SHARED;
         type = ids[ids[base].varType].elemType;
         q = ids[base].sharedQword - 1;
+    } else if (ids[base].tessBlk) {
+        blk = ids[base].tessBlk - 1;
+        type = ids[ids[base].varType].elemType;
+        q = ids[base].tessQ;
+        comp = ids[base].tessComp;
+        what = "a tessellation input or output";
+        if (ids[base].tessStride) {
+            /* The first index picks the control point. */
+            uint32_t idx;
+
+            if (n < 5)
+                fail("compute shader reads or writes a whole array of control points; use one at a time");
+            idx = w[4];
+            i = 5;
+            if (ids[idx].kind == ID_CONST && !is_spec(&ids[idx])) {
+                if (ids[idx].value >= PVK_MAX_TESSELLATION_PATCH_SIZE)
+                    fail("compute shader reaches control point %u; a patch has at most %d "
+                         "(maxTessellationPatchSize)", (unsigned)ids[idx].value, PVK_MAX_TESSELLATION_PATCH_SIZE);
+                q += (int)ids[idx].value * ids[base].tessStride;
+            } else {
+                if (ids[idx].kind != ID_VALUE || !(ids[idx].floatIndex || is_int(ids, ids[idx].valType)))
+                    fail("compute shader picks a control point with something other than an int; VU1 "
+                         "addresses qwords through VI08");
+                dynIndex = idx;
+                dynStride = ids[base].tessStride;
+                dynCount = ids[type].elemCount && ids[type].elemCount < PVK_MAX_TESSELLATION_PATCH_SIZE
+                         ? (int)ids[type].elemCount : PVK_MAX_TESSELLATION_PATCH_SIZE;
+            }
+            type = ids[type].elemType;
+            if (ids[type].type == T_STRUCT && ids[type].structPosMember >= 0) {
+                /* gl_in[i] or gl_out[i]: gl_Position is the record's first qword. */
+                if (n < 6 || ids[w[5]].kind != ID_CONST || ids[w[5]].value >= (uint32_t)ids[type].memberCount)
+                    fail("compute shader reads or writes a whole gl_in or gl_out element; use gl_Position");
+                if ((int)ids[w[5]].value != ids[type].structPosMember) {
+                    /* gl_PointSize and the clip and cull distances: the GS takes none of them. */
+                    ids[id].kind = ID_PTR;
+                    ids[id].ignored = 1;
+                    return;
+                }
+                type = ids[type].members[ids[w[5]].value];
+                i = 6;
+            }
+        }
     } else {
         /* An output array: the first index picks the vertex or the primitive. */
         uint32_t arr = ids[ids[base].varType].elemType, idx;
@@ -1950,6 +2023,101 @@ static void plain_chain(IdInfo *ids, Shader *sh, const uint32_t *w, uint32_t n)
 }
 
 /* gl_CullPrimitiveEXT = <bool>: nonzero in the w field of the primitive's record. */
+/* A pointer to a whole tessellation variable that is no array of control points. */
+static uint32_t tess_ptr(IdInfo *ids, Shader *sh, uint32_t var)
+{
+    uint32_t p = new_id(sh);
+
+    ids[p].kind = ID_PTR;
+    ids[p].storBlock = ids[var].tessBlk;
+    ids[p].storOff = (uint32_t)ids[var].tessQ * 16 + (uint32_t)ids[var].tessComp * 4;
+    ids[p].ptrType = ids[ids[var].varType].elemType;
+    ids[p].comp = ids[var].tessComp;
+    return p;
+}
+
+/* Places a tessellation shader's input or output in its SYN_ block; 0 leaves it to the vertex rules. */
+static int tess_variable(IdInfo *ids, Shader *sh, uint32_t id, uint32_t storage, uint32_t pointee, const char *name)
+{
+    int tcs = sh->execModel == ExecTessControl, b = ids[id].builtin, in = storage == ScInput;
+    int rec = tcs && !in ? SYN_TREC : SYN_TPATCH;
+    uint32_t elem = ids[pointee].type == T_ARRAY ? ids[pointee].elemType : 0;
+
+    if (!tcs && !in)
+        return 0;   /* an evaluation shader's outputs are a vertex shader's */
+    if (tcs && in && b == BuiltInInvocationId) {
+        ids[id].builtinQword = 1 + LOCAL_QWORD;
+        return 1;
+    }
+    if (!tcs && b == BuiltInTessCoord) {
+        /* The one stream the evaluation program reads: a qword per vertex, u, v, w. */
+        sh->inputs[0].location = 0;
+        sh->inputs[0].size = 3;
+        sh->inputs[0].var = id;
+        sh->inputCount = 1;
+        return 1;
+    }
+    if (in && (b == BuiltInPatchVertices || b == BuiltInPrimitiveId)) {
+        ids[id].tessBlk = 1 + (tcs ? SYN_TSTATE : SYN_TPATCH);
+        ids[id].tessQ = tcs ? 0 : PVK_VU1_TESS_REC_ID;
+        ids[id].tessComp = (b == BuiltInPrimitiveId) == tcs ? 1 : 0;
+        return 1;
+    }
+    if (b == BuiltInTessLevelOuter || b == BuiltInTessLevelInner) {
+        ids[id].tessBlk = 1 + rec;
+        ids[id].tessQ = b == BuiltInTessLevelOuter ? PVK_VU1_TESS_REC_OUTER : PVK_VU1_TESS_REC_INNER;
+        return 1;
+    }
+    if (elem && ids[elem].type == T_STRUCT && ids[elem].structPosMember >= 0) {
+        /* gl_in or gl_out */
+        ids[id].tessBlk = 1 + (tcs && in ? SYN_CPIN : rec);
+        ids[id].tessQ = tcs && in ? 0 : PVK_VU1_TESS_REC_VERTEX;
+        ids[id].tessStride = tcs && in ? PVK_VU1_TESS_CPIN_QWORDS : PVK_VU1_TESS_VERTEX_QWORDS;
+        return 1;
+    }
+    if (b >= 0)
+        fail("built-in %s '%s' is not supported", in ? "input" : "output", name);
+    if (ids[id].location < 0)
+        fail("%s '%s' has no location", in ? "input" : "output", name);
+    if (ids[id].patch) {
+        if (ids[id].location + plain_qwords(ids, pointee, "a per-patch variable") > PVK_VU1_TESS_PATCH_QWORDS)
+            fail("per-patch variable '%s' reaches past location %d; a patch record has a qword per "
+                 "location for %d of them (maxTessellationControlPerPatchOutputComponents)", name,
+                 PVK_VU1_TESS_PATCH_QWORDS - 1, PVK_VU1_TESS_PATCH_QWORDS);
+        ids[id].tessBlk = 1 + rec;
+        ids[id].tessQ = PVK_VU1_TESS_REC_PATCH + ids[id].location;
+        return 1;
+    }
+    if (!elem)
+        fail("%s '%s' is neither per patch nor an array with an element per control point", in ? "input" : "output",
+             name);
+    if (tcs && in) {
+        /* What the vertex shader writes, told apart by type as the GS's inputs are. */
+        int size = type_size(ids, elem);
+
+        if (size != 4 && size != 2 && !is_float(ids, elem))
+            fail("tessellation control input '%s' must be a vec4, a vec2 or a float per control point: the "
+                 "stage before it writes nothing else", name);
+        if (sh->tessInputs & (size == 4 ? 1 : size == 2 ? 2 : 4))
+            fail("tessellation control shader has two inputs of the type of '%s'; the stage before it writes "
+                 "one vec4, one vec2 and one float", name);
+        sh->tessInputs |= size == 4 ? 1 : size == 2 ? 2 : 4;
+        ids[id].tessBlk = 1 + SYN_CPIN;
+        ids[id].tessQ = size == 4 ? 1 : size == 2 ? 2 : 3;
+        ids[id].tessComp = size == 4 || size == 2 ? 0 : 3;
+        ids[id].tessStride = PVK_VU1_TESS_CPIN_QWORDS;
+        return 1;
+    }
+    if (1 + ids[id].location + plain_qwords(ids, elem, "a per-vertex variable") > PVK_VU1_TESS_VERTEX_QWORDS)
+        fail("per-vertex variable '%s' reaches past location %d; a control point has a qword per location for "
+             "%d of them (maxTessellationControlPerVertexOutputComponents)", name, PVK_VU1_TESS_VERTEX_QWORDS - 2,
+             PVK_VU1_TESS_VERTEX_QWORDS - 1);
+    ids[id].tessBlk = 1 + rec;
+    ids[id].tessQ = PVK_VU1_TESS_REC_VERTEX + 1 + ids[id].location;
+    ids[id].tessStride = PVK_VU1_TESS_VERTEX_QWORDS;
+    return 1;
+}
+
 /* A pointer to a whole shared variable, for a load or a store that names the variable itself. */
 static uint32_t shared_ptr(IdInfo *ids, Shader *sh, uint32_t var)
 {
@@ -2032,7 +2200,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 
         switch (op) {
         case OpCapability:
-            if (w[1] != 1 && w[1] != 5379 && w[1] != 5283) /* Shader, DemoteToHelperInvocation, MeshShadingEXT */
+            /* Shader, Tessellation, DemoteToHelperInvocation, MeshShadingEXT */
+            if (w[1] != 1 && w[1] != 3 && w[1] != 5379 && w[1] != 5283)
                 fail("shader needs SPIR-V capability %u, which the PS2 does not support", (unsigned)w[1]);
             break;
         case OpEntryPoint:
@@ -2041,7 +2210,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             sh->execModel = w[1];
             sh->entryPoint = (const char *)&w[3];
             g_intVectors = w[1] == ExecTask || w[1] == ExecMesh;
-            g_stage = w[1] == ExecGLCompute ? "compute" : w[1] == ExecTask ? "task" : w[1] == ExecMesh ? "mesh" : NULL;
+            g_stage = w[1] == ExecGLCompute ? "compute" : w[1] == ExecTask ? "task" : w[1] == ExecMesh ? "mesh"
+                    : w[1] == ExecTessControl ? "tessellation control"
+                    : w[1] == ExecTessEval ? "tessellation evaluation" : NULL;
             break;
         case OpString:
             ids[w[1]].name = (const char *)&w[2];
@@ -2058,6 +2229,14 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 sh->meshMaxVertices = w[3];
             } else if (w[2] == ExecModeOutputPrimitives && n >= 4) {
                 sh->meshMaxPrimitives = w[3];
+            } else if (w[2] == ExecModeTriangles || w[2] == ExecModeQuads || w[2] == ExecModeIsolines) {
+                sh->tessDomain = w[2] == ExecModeTriangles ? 0 : w[2] == ExecModeQuads ? 1 : 2;
+            } else if (w[2] >= ExecModeSpacingEqual && w[2] <= ExecModeSpacingFractionalOdd) {
+                sh->tessSpacing = (int)w[2] - ExecModeSpacingEqual;
+            } else if (w[2] == ExecModeVertexOrderCw || w[2] == ExecModeVertexOrderCcw) {
+                sh->tessCw = w[2] == ExecModeVertexOrderCw;
+            } else if (w[2] == ExecModePointMode) {
+                sh->tessPoint = 1;
             } else if (w[2] == ExecModeOutputPoints || w[2] == ExecModeOutputLines || w[2] == ExecModeOutputTriangles) {
                 sh->meshPrimVertices = w[2] == ExecModeOutputPoints ? 1 : w[2] == ExecModeOutputLines ? 2 : 3;
             }
@@ -2088,6 +2267,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[w[1]].bufferBlock = 1;
             else if (w[2] == DecPerPrimitive)
                 ids[w[1]].perPrimitive = 1;
+            else if (w[2] == DecPatch)
+                ids[w[1]].patch = 1;
             break;
         case OpMemberDecorate:
             if (w[3] == DecBuiltIn) {
@@ -2227,7 +2408,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             } else if (!inFunction && storage != ScInput && storage != ScOutput && storage != ScPushConstant
                        && storage != ScUniform && !(storage == ScStorageBuffer && IS_GROUPED(sh))
                        && !(storage == ScTaskPayload && IS_GROUPED(sh))
-                       && !(storage == ScWorkgroup && IS_GROUPED(sh))) {
+                       && !(storage == ScWorkgroup && IS_GROUPED(sh) && sh->execModel != ExecTessControl)) {
                 fail("'%s' is a storage buffer or something else this version of ps2vk-shaderc "
                      "does not support; it supports shader inputs, outputs, push constants, "
                      "uniform blocks and a sampler2D", ids[id].name ? ids[id].name : "variable");
@@ -2254,7 +2435,16 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 
     if (!IS_CODE(sh) && sh->execModel != ExecFragment)
         fail("only vertex, fragment, compute, task and mesh shaders are supported");
-    g_header = sh->execModel == ExecMesh ? PVK_VU1_MESH_ADDR : sh->execModel == ExecTask ? PVK_VU1_TASK_ADDR : -1;
+    g_header = sh->execModel == ExecMesh ? PVK_VU1_MESH_ADDR : sh->execModel == ExecTask ? PVK_VU1_TASK_ADDR
+             : sh->execModel == ExecTessControl ? PVK_VU1_TESS_HEADER : -1;
+    if (sh->execModel == ExecTessControl) {
+        /* One invocation per output control point: a work group of that many along x. */
+        if (sh->meshMaxVertices < 1 || sh->meshMaxVertices > PVK_MAX_TESSELLATION_PATCH_SIZE)
+            fail("tessellation control shader's layout(vertices = %u) must be 1 to %d "
+                 "(maxTessellationPatchSize)", (unsigned)sh->meshMaxVertices, PVK_MAX_TESSELLATION_PATCH_SIZE);
+        sh->localSize[0] = sh->meshMaxVertices;
+        sh->localSize[1] = sh->localSize[2] = 1;
+    }
     for (int i = 0; IS_GROUPED(sh) && i < 3; i++)
         if (sh->localSize[i] < 1 || sh->localSize[i] > PVK_MAX_COMPUTE_WORK_GROUP_SIZE)
             fail("compute shader's local size along %c is %u; it must be 1 to %d (%s)",
@@ -2290,7 +2480,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             uint32_t pointee = ids[w[1]].elemType;
             const char *name = ids[id].name ? ids[id].name : "variable";
 
-            if (IS_GROUPED(sh) && storage == ScInput) {
+            if (IS_TESS(sh) && (storage == ScInput || storage == ScOutput) &&
+                tess_variable(ids, sh, id, storage, pointee, name)) {
+                /* placed among the control points or in the patch record */
+            } else if (IS_GROUPED(sh) && storage == ScInput) {
                 int b = ids[id].builtin;
                 if (b < BuiltInNumWorkgroups || b > BuiltInLocalInvocationIndex || b == BuiltInWorkgroupSize)
                     fail("compute shader input '%s' is none of gl_GlobalInvocationID, gl_LocalInvocationID, "
@@ -2365,7 +2558,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             } else if (storage == ScStorageBuffer || (storage == ScUniform && ids[pointee].bufferBlock)) {
                 StorBlock *b;
 
-                if (!IS_GROUPED(sh))
+                if (!IS_GROUPED(sh) || sh->execModel == ExecTessControl)
                     fail("'%s' is a storage buffer; storage buffers are only available in compute, task and mesh "
                          "shaders", name);
                 if (sh->storageCount == PVK_MAX_STORAGE_BLOCKS)
@@ -2466,19 +2659,19 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                             fail("shader has 2 color outputs; the GS can interpolate only one color");
                         sh->colorVar = id;
                         sh->colorLocation = ids[id].location;
-                    } else if (size == 2 && sh->execModel == ExecVertex) {
+                    } else if (size == 2 && IS_VERTEXLIKE(sh)) {
                         if (sh->texcoordVar)
                             fail("vertex shader has 2 texture coordinate outputs; the GS "
                                  "interpolates only one pair (S, T)");
                         sh->texcoordVar = id;
                         sh->texcoordLocation = ids[id].location;
-                    } else if (size == 1 && is_float(ids, pointee) && sh->execModel == ExecVertex) {
+                    } else if (size == 1 && is_float(ids, pointee) && IS_VERTEXLIKE(sh)) {
                         if (sh->fogVar)
                             fail("vertex shader has 2 float outputs; the GS interpolates only one "
                                  "fog amount");
                         sh->fogVar = id;
                         sh->fogLocation = ids[id].location;
-                    } else if (sh->execModel == ExecVertex) {
+                    } else if (IS_VERTEXLIKE(sh)) {
                         fail("vertex output '%s' must be a vec4 (the color), a vec2 (the texture "
                              "coordinate) or a float (the fog amount); the GS interpolates nothing else", name);
                     } else {
@@ -2519,6 +2712,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         place_storage(sh);
     g_synBase[SYN_PAYLOAD - SYN_VERT] = PVK_VU1_PAYLOAD_ADDR;
     g_synBase[SYN_SHARED - SYN_VERT] = PVK_VU1_PAYLOAD_ADDR + sh->payloadQwords;
+    g_synBase[SYN_CPIN - SYN_VERT] = PVK_VU1_TESS_CPIN;
+    g_synBase[SYN_TREC - SYN_VERT] = PVK_VU1_TESS_RECORD;
+    g_synBase[SYN_TPATCH - SYN_VERT] = PVK_VU1_TESS_PATCH;
+    g_synBase[SYN_TSTATE - SYN_VERT] = PVK_VU1_TESS_STATE2;
     if (sh->execModel == ExecMesh) {
         /* The records and the two GIF packets end VU1 data memory; a vertex is [ST,] RGBAQ, [FOG,] XYZ2. */
         int out = 2 + (sh->texcoordVar ? 1 : 0) + (sh->fogVar ? 1 : 0), bytes;
@@ -2634,14 +2831,14 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 sh->returns++;
                 break;
             case OpControlBarrier:
-                if (sh->execModel != ExecMesh && sh->execModel != ExecTask)
+                if (sh->execModel != ExecMesh && sh->execModel != ExecTask && sh->execModel != ExecTessControl)
                     unsupported(op, stage);
                 new_op(sh->body, &sh->bodyCount, OpBarrier, 0);
                 sh->barriers++;
                 break;
             case OpMemoryBarrier:
                 /* VU1 runs one invocation at a time: the next read sees every store before it. */
-                if (sh->execModel != ExecMesh && sh->execModel != ExecTask)
+                if (sh->execModel != ExecMesh && sh->execModel != ExecTask && sh->execModel != ExecTessControl)
                     unsupported(op, stage);
                 break;
             case OpEmitMeshTasksEXT: {
@@ -2853,7 +3050,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     ids[id].intIsFloat = 1;
                     if (ids[ptr].kind == ID_PTR)
                         ids[id].comp = ids[ptr].comp;
-                    else if (ids[ptr].builtin == BuiltInLocalInvocationIndex)
+                    else if (ids[ptr].builtin == BuiltInLocalInvocationIndex || ids[ptr].builtin == BuiltInInvocationId)
                         ids[id].comp = 3;
                     else
                         ids[id].builtinQword = ids[ptr].builtinQword;
@@ -2861,6 +3058,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 }
                 if (ids[ptr].kind == ID_VAR && ids[ptr].sharedQword)
                     ptr = shared_ptr(ids, sh, ptr);
+                if (ids[ptr].kind == ID_VAR && ids[ptr].tessBlk && !ids[ptr].tessStride)
+                    ptr = tess_ptr(ids, sh, ptr);
                 if (ids[ptr].kind == ID_PTR && ids[ptr].storBlock) {
                     uint32_t type = ids[ptr].ptrType;
                     if (ids[ptr].storBlock == SYN_SHARED + 1 && (ids[type].type == T_STRUCT || ids[type].type == T_ARRAY)) {
@@ -3651,6 +3850,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 }
                 if (ids[ptr].kind == ID_VAR && ids[ptr].sharedQword)
                     ptr = shared_ptr(ids, sh, ptr);
+                if (ids[ptr].kind == ID_VAR && ids[ptr].tessBlk && !ids[ptr].tessStride)
+                    ptr = tess_ptr(ids, sh, ptr);
                 if (is_plain_base(ids, sh, ptr) && ids[ptr].kind != ID_PTR)
                     fail("compute shader stores a whole mesh output array or task payload; write its members "
                          "and elements one at a time");
@@ -3772,7 +3973,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     if (sh->execModel == ExecMesh && (!sh->meshVertVar || !sh->meshIndexVar))
         fail("mesh shader never writes %s", sh->meshVertVar ? "its primitives' indices (gl_PrimitiveTriangleIndicesEXT, "
              "gl_PrimitiveLineIndicesEXT or gl_PrimitivePointIndicesEXT)" : "gl_MeshVerticesEXT[].gl_Position");
-    if (sh->execModel == ExecVertex) {
+    if (IS_VERTEXLIKE(sh)) {
         if (!sh->positionValue)
             fail("vertex shader never writes gl_Position");
         if (sh->colorVar && !sh->colorValue)
@@ -3949,6 +4150,7 @@ static uint32_t vu_label(const char *path, const VuObject *o, const char *sym, c
 /* Upper (FMAC) and lower (load/store/integer/branch) instruction of one VU1 cycle. */
 static void vu(FILE *f, const char *upper, const char *lower, const char *comment)
 {
+    g_pairs++;
     if (comment)
         fprintf(f, "         %-40s %-40s ; %s\n", upper, lower, comment);
     else
@@ -4018,6 +4220,8 @@ static const int g_vertexPool[] = { 5, 6, 7, 8, 9, 18, 19, 27, 28, 29, 30, 31 };
 /* A compute shader has no inputs or epilogue: VF01-VF04 hold the loop state, the rest is free. */
 static const int g_computePool[] = { 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
                                      25, 26, 27, 28, 29, 30, 31 };
+/* An evaluation shader has one input, the tessellation coordinate in VF10: VF11-VF17 are free too. */
+static const int g_evalPool[] = { 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 27, 28, 29, 30, 31 };
 static const int *g_pool = g_vertexPool;
 static int g_poolCount = (int)(sizeof(g_vertexPool) / sizeof(g_vertexPool[0]));
 /* Mesh: a constant is loaded where a block first reads it and its register given back after the
@@ -4386,10 +4590,12 @@ static const char *body_name(const BodyOp *b)
     case OpBranchConditional: return "if";
     case OpPhiMove: return "value of this path";
     case OpConvertSToF: return "int to float";
-    case OpStorLoad: return b->storBlock == SYN_SHARED ? "shared variable read"
+    case OpStorLoad: return b->storBlock >= SYN_CPIN ? "tessellation input read"
+                            : b->storBlock == SYN_SHARED ? "shared variable read"
                             : b->storBlock == SYN_PAYLOAD ? "task payload read" : b->storBlock >= SYN_VERT
                             ? "mesh output read" : "storage block read";
-    case OpStorStore: return b->storBlock == SYN_SHARED ? "shared variable write"
+    case OpStorStore: return b->storBlock >= SYN_CPIN ? "tessellation output write"
+                             : b->storBlock == SYN_SHARED ? "shared variable write"
                              : b->storBlock == SYN_PAYLOAD ? "task payload write" : b->storBlock == SYN_COUNTS
                              ? "SetMeshOutputsEXT" : b->storBlock >= SYN_VERT ? "mesh output write" : "storage block write";
     case OpEmitTasks: return "EmitMeshTasksEXT";
@@ -4814,13 +5020,15 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const Shader *sh, const Bod
  * variables, a task shader's going up from behind them. VI14 points at the running invocation's. */
 static int ctx_start(const Shader *sh)
 {
+    if (sh->execModel == ExecTessControl)
+        return PVK_VU1_TESS_CPIN;
     return g_synBase[SYN_SHARED - SYN_VERT] + (sh->execModel == ExecMesh ? 0 : sh->sharedQwords);
 }
 
 /* Offset from VI14 of the invocation's qword k: 0 where it goes on, then its registers. */
 static int ctx_off(const Shader *sh, int k)
 {
-    return sh->execModel == ExecMesh ? -1 - k : k;
+    return sh->execModel == ExecMesh || sh->execModel == ExecTessControl ? -1 - k : k;
 }
 
 /* barrier(): the registers in use go to the invocation's qwords and the next invocation runs;
@@ -4851,6 +5059,109 @@ static void emit_barrier(FILE *f, const Regs *r, const IdInfo *ids, const Shader
         emit_l(f, &c, "lq", "VF%02d,%d(VI14)", regs[k], ctx_off(sh, 1 + k));
 }
 
+/* The registers of the vertex program a control program keeps while it runs a patch. */
+static const int g_savedVI[] = { 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15 };
+#define SAVED_VI ((int)(sizeof(g_savedVI) / sizeof(g_savedVI[0])))
+
+static void emit_saved(FILE *f, int restore)
+{
+    char buf[64];
+
+    for (int r = 1; r <= 31; r++) {
+        snprintf(buf, sizeof(buf), "%s            VF%02d,%d(VI00)", restore ? "lq" : "sq", r, PVK_VU1_TESS_SAVE + r - 1);
+        vu(f, "NOP", buf, NULL);
+    }
+    for (int i = 0; i < SAVED_VI; i++) {
+        snprintf(buf, sizeof(buf), "%s.%c         VI%02d,%d(VI00)", restore ? "ilw" : "isw", "xyzw"[i % 4], g_savedVI[i],
+                 PVK_VU1_TESS_SAVE + 31 + i / 4);
+        vu(f, "NOP", buf, NULL);
+    }
+}
+
+/* A control program's start: the vertex program calls it with every control point in VF20, VF21,
+ * the texture coordinate register and VF22, and the shader runs when the patch has them all. */
+static void emit_control_entry(FILE *f, const char *sym)
+{
+    char buf[64];
+
+    fprintf(f, "; called by the vertex program (bal VI08) with one control point\n");
+    snprintf(buf, sizeof(buf), "isw.w         VI08,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, "where to return to");
+    snprintf(buf, sizeof(buf), "ilw.x         VI13,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, "the control point's record");
+    vu(f, "NOP", "sq            VF20,0(VI13)", "gl_Position");
+    vu(f, "NOP", "sq            VF21,1(VI13)", "the vec4 output");
+    snprintf(buf, sizeof(buf), "sq            VF%02d,2(VI13)", PVK_VU1_TEXCOORD_REG);
+    vu(f, "NOP", buf, "the vec2 output");
+    vu(f, "NOP", "sq            VF22,3(VI13)", "the float output, in w");
+    snprintf(buf, sizeof(buf), "iaddiu        VI13,VI13,%d", PVK_VU1_TESS_CPIN_QWORDS);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "isw.x         VI13,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "ilw.y         VI08,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, "control points the patch still lacks");
+    vu(f, "NOP", "isubiu        VI08,VI08,1", NULL);
+    snprintf(buf, sizeof(buf), "isw.y         VI08,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "ibne          VI08,VI00,%s_ret", sym);
+    vu(f, "NOP", buf, "more to come");
+    vu(f, "NOP", "NOP", "branch delay slot");
+    fprintf(f, "; the patch is complete: keep the vertex program's registers\n");
+    emit_saved(f, 0);
+}
+
+/* A control program's end: the record gets its IDs and goes to its place among the batch's, the
+ * state moves on to the next patch, and the vertex program gets its registers back. */
+static void emit_control_exit(FILE *f, const Shader *sh, const char *sym)
+{
+    char buf[64];
+
+    fprintf(f, "; the record's IDs, and the state of the next patch\n");
+    snprintf(buf, sizeof(buf), "ilw.y         VI01,%d(VI00)", PVK_VU1_TESS_STATE2);
+    vu(f, "NOP", buf, "gl_PrimitiveID");
+    snprintf(buf, sizeof(buf), "ilw.x         VI02,%d(VI00)", PVK_VU1_TESS_STATE2);
+    vu(f, "NOP", buf, "patchControlPoints");
+    snprintf(buf, sizeof(buf), "isw.x         VI01,%d(VI00)", PVK_VU1_TESS_RECORD + PVK_VU1_TESS_REC_ID);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "isw.y         VI02,%d(VI00)", PVK_VU1_TESS_RECORD + PVK_VU1_TESS_REC_ID);
+    vu(f, "NOP", buf, NULL);
+    vu(f, "NOP", "iaddiu        VI01,VI01,1", NULL);
+    snprintf(buf, sizeof(buf), "isw.y         VI01,%d(VI00)", PVK_VU1_TESS_STATE2);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "isw.y         VI02,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, "control points the next patch lacks");
+    snprintf(buf, sizeof(buf), "iaddiu        VI03,VI00,%d", PVK_VU1_TESS_CPIN);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "isw.x         VI03,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, "its first control point's record");
+    fprintf(f, "; the record to its place among the batch's\n");
+    snprintf(buf, sizeof(buf), "ilw.z         VI02,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "iaddiu        VI01,VI00,%d", PVK_VU1_TESS_RECORD);
+    vu(f, "NOP", buf, NULL);
+    snprintf(buf, sizeof(buf), "iaddiu        VI03,VI00,%d", PVK_VU1_TESS_REC_QWORDS((int)sh->meshMaxVertices));
+    vu(f, "NOP", buf, "qwords of a record");
+    fprintf(f, "%s_copy:\n", sym);
+    vu(f, "NOP", "lq            VF05,0(VI01)", NULL);
+    vu(f, "NOP", "iaddiu        VI01,VI01,1", NULL);
+    vu(f, "NOP", "sq            VF05,0(VI02)", NULL);
+    vu(f, "NOP", "isubiu        VI03,VI03,1", NULL);
+    vu(f, "NOP", "iaddiu        VI02,VI02,1", NULL);
+    snprintf(buf, sizeof(buf), "ibne          VI03,VI00,%s_copy", sym);
+    vu(f, "NOP", buf, NULL);
+    vu(f, "NOP", "NOP", "branch delay slot");
+    snprintf(buf, sizeof(buf), "isw.z         VI02,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, "where the next patch's record goes");
+    fprintf(f, "; the vertex program's registers again\n");
+    emit_saved(f, 1);
+    fprintf(f, "%s_ret:\n", sym);
+    snprintf(buf, sizeof(buf), "ilw.w         VI08,%d(VI00)", PVK_VU1_TESS_STATE);
+    vu(f, "NOP", buf, NULL);
+    vu(f, "NOP", "NOP", "the jump reads VI after one instruction");
+    vu(f, "NOP", "jr            VI08", "back into the vertex program");
+    vu(f, "NOP", "NOP", "branch delay slot");
+}
+
 /* A compute, task or mesh program's start: the storage blocks' addresses and the local size. */
 static void emit_compute_head(FILE *f, const Shader *sh, const char *sym)
 {
@@ -4877,6 +5188,8 @@ static void emit_compute_head(FILE *f, const Shader *sh, const char *sym)
         snprintf(buf, sizeof(buf), "isw.x         VI15,%d(VI00)", PVK_VU1_MESH_STATE);
         vu(f, "NOP", buf, "where to return to");
     }
+    if (sh->execModel == ExecTessControl)
+        emit_control_entry(f, sym);
     if (task) {
         fprintf(f, "; the first work group, and the groups left along each axis\n");
         snprintf(buf, sizeof(buf), "lq            VF04,%d(VI00)", hdr_addr(PVK_VU1_HEADER_COUNTS));
@@ -4915,7 +5228,9 @@ static void emit_compute_loops(FILE *f, const Shader *sh, const char *sym)
 {
     char buf[64];
 
-    if (sh->execModel == ExecTask) {
+    if (sh->execModel == ExecTessControl) {
+        fprintf(f, "; one invocation per output control point\n");
+    } else if (sh->execModel == ExecTask) {
         fprintf(f, "; this work group, then invocations along z, y, x\n");
         snprintf(buf, sizeof(buf), "lq            VF01,%d(VI00)", PVK_VU1_TASK_NEXT);
         vu(f, "NOP", buf, "gl_WorkGroupID");
@@ -5217,7 +5532,8 @@ static void emit_compute_tail(FILE *f, const Shader *sh, const char *sym)
         vu(f, "NOP", buf, "barrier(): where the invocation goes on");
         vu(f, "NOP", "iaddiu        VI15,VI00,1", "an invocation waits");
         fprintf(f, "%s_done:\n", sym);
-        snprintf(buf, sizeof(buf), "%s        VI14,VI14,%d", sh->execModel == ExecMesh ? "isubiu" : "iaddiu",
+        snprintf(buf, sizeof(buf), "%s        VI14,VI14,%d",
+                 sh->execModel == ExecMesh || sh->execModel == ExecTessControl ? "isubiu" : "iaddiu",
                  g_ctxQwords);
         vu(f, "NOP", buf, "the next invocation's registers");
     }
@@ -5277,6 +5593,9 @@ static void emit_compute_tail(FILE *f, const Shader *sh, const char *sym)
         snprintf(buf, sizeof(buf), "ibne          VI03,VI00,%s_group", sym);
         vu(f, "NOP", buf, NULL);
         vu(f, "NOP", "NOP", "branch delay slot");
+    } else if (sh->execModel == ExecTessControl) {
+        emit_control_exit(f, sh, sym);
+        return;
     } else if (sh->execModel == ExecMesh) {
         emit_mesh_geometry(f, sh, sym);
         emit_group_ends(f, sh, sym);
@@ -5308,9 +5627,11 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
 
     g_sym = sym;
     g_lazyConst = mesh;
-    g_pool = compute ? g_computePool : g_vertexPool;
+    g_pool = compute ? g_computePool : sh->execModel == ExecTessEval ? g_evalPool : g_vertexPool;
     g_poolCount = compute ? (int)(sizeof(g_computePool) / sizeof(g_computePool[0]))
-                          : (int)(sizeof(g_vertexPool) / sizeof(g_vertexPool[0]));
+                : sh->execModel == ExecTessEval ? (int)(sizeof(g_evalPool) / sizeof(g_evalPool[0]))
+                : (int)(sizeof(g_vertexPool) / sizeof(g_vertexPool[0]));
+    g_pairs = 0;
 
     /* Registers: inputs are fixed, constants live for the whole program,
      * temporaries and push constant/uniform qwords are freed after their last read. */
@@ -5679,6 +6000,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             vu(f, buf, "NOP", buf2);
         }
 
+        g_epilogue = g_pairs;
         fprintf(f, "; epilogue: perspective divide, viewport, GS formats, store\n");
         if (sh->texcoordValue) {
             snprintf(buf, sizeof(buf), "ilw.w         VI13,%d(VI01)", PVK_VU1_INPUT_COUNT);
@@ -5736,6 +6058,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             snprintf(buf, sizeof(buf), "iaddiu        VI05,VI05,%d", PVK_VU1_OUTPUT_PER_VERTEX + st + fog);
         }
         vu(f, "NOP", buf, NULL);
+        g_next = g_pairs;
         vu(f, "NOP", "iadd          VI03,VI03,VI07", "next vertex");
         vu(f, "NOP", "isubiu        VI02,VI02,1", NULL);
         snprintf(buf, sizeof(buf), "ilw.y         VI08,%d(VI01)", PVK_VU1_INPUT_STRIDE);
@@ -5753,6 +6076,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         vu(f, "NOP", "NOP", "branch delay slot");
 
         fprintf(f, "; send the batch to the GS and stop\n");
+        g_kick = g_pairs;
         vu(f, "NOP", "xgkick        VI04", NULL);
         vu(f, "NOP[E]", "NOP", NULL);
     } else {
@@ -5790,6 +6114,8 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
 
         memset(&h, 0, sizeof(h));
         h.stage       = mesh ? PVK_SHADER_STAGE_MESH_BIT_EXT : sh->execModel == ExecTask ? PVK_SHADER_STAGE_TASK_BIT_EXT
+                      : sh->execModel == ExecTessControl ? PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT
+                      : sh->execModel == ExecTessEval ? PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT
                       : compute ? PVK_SHADER_STAGE_COMPUTE_BIT : PVK_SHADER_STAGE_VERTEX;
         h.codeWords   = (end - start) / 4;
         h.convertWord = compute ? 0 : (vu_label(obj, &o, sym, "_Convert") - start) / 4;
@@ -5840,7 +6166,31 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             h.meshKickAddress       = (uint32_t)sh->kickA;
         }
         h.payloadBytes = (uint32_t)sh->payloadQwords * 16;
-        if (compute) {
+        if (!compute) {
+            h.epilogueWord = (uint32_t)g_epilogue * 2;
+            h.nextWord     = (uint32_t)g_next * 2;
+            h.kickWord     = (uint32_t)g_kick * 2;
+        }
+        if (sh->execModel == ExecTessEval) {
+            h.tessDomain    = (uint32_t)sh->tessDomain;
+            h.tessSpacing   = (uint32_t)sh->tessSpacing;
+            h.tessClockwise = (uint32_t)sh->tessCw;
+            h.tessPointMode = (uint32_t)sh->tessPoint;
+        }
+        if (sh->execModel == ExecTessControl) {
+            /* The registers a barrier() keeps go below the control points, into the input area. */
+            int base = PVK_VU1_TESS_CPIN - g_ctxQwords * (int)sh->meshMaxVertices;
+
+            if (base < PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_HEADER + 64)
+                fail("compute shader's barrier() keeps %d qwords for each of its %u invocations, %d bytes of "
+                     "VU1 memory; below the control points it has %d", g_ctxQwords, (unsigned)sh->meshMaxVertices,
+                     g_ctxQwords * (int)sh->meshMaxVertices * 16,
+                     (PVK_VU1_TESS_CPIN - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER - 64) * 16);
+            h.tessOutputVertices = sh->meshMaxVertices;
+            h.tessBaseAddress    = (uint32_t)base;
+            h.tessInputs         = (uint32_t)sh->tessInputs;
+        }
+        if (compute && sh->execModel != ExecTessControl) {
             /* Behind the body, where the registers a barrier() keeps are known. */
             int kept = g_ctxQwords * (int)(sh->localSize[0] * sh->localSize[1] * sh->localSize[2]);
             int top = mesh ? sh->vertBase : PVK_VU1_MEMORY_QWORDS;
@@ -5942,9 +6292,11 @@ static void write_listing(const char *base)
     fprintf(f, "name = %s\n", (const char *)file + h->nameOffset);
     fprintf(f, "entryPoint = %s\n", (const char *)file + h->entryPointOffset);
     if (h->stage != PVK_SHADER_STAGE_FRAGMENT) {
-        int grouped = h->stage != PVK_SHADER_STAGE_VERTEX;
+        int grouped = h->stage != PVK_SHADER_STAGE_VERTEX && h->stage != PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
 
         fprintf(f, "stage = %s\n", h->stage == PVK_SHADER_STAGE_VERTEX ? "vertex"
+                : h->stage == PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ? "tessellation control"
+                : h->stage == PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT ? "tessellation evaluation"
                 : h->stage == PVK_SHADER_STAGE_COMPUTE_BIT ? "compute"
                 : h->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? "task" : "mesh");
         fprintf(f, "codeWords = %u\n", (unsigned)h->codeWords);
@@ -5976,6 +6328,17 @@ static void write_listing(const char *base)
             fprintf(f, "payloadBytes = %u\n", (unsigned)h->payloadBytes);
         if (h->stage == PVK_SHADER_STAGE_MESH_BIT_EXT || h->stage == PVK_SHADER_STAGE_TASK_BIT_EXT)
             fprintf(f, "sharedBytes = %u\n", (unsigned)h->sharedBytes);
+        if (h->stage == PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT) {
+            fprintf(f, "tessOutputVertices = %u\n", (unsigned)h->tessOutputVertices);
+            fprintf(f, "tessBaseAddress = %u\n", (unsigned)h->tessBaseAddress);
+            fprintf(f, "tessInputs = %u\n", (unsigned)h->tessInputs);
+        }
+        if (h->stage == PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) {
+            fprintf(f, "tessDomain = %u\n", (unsigned)h->tessDomain);
+            fprintf(f, "tessSpacing = %u\n", (unsigned)h->tessSpacing);
+            fprintf(f, "tessClockwise = %u\n", (unsigned)h->tessClockwise);
+            fprintf(f, "tessPointMode = %u\n", (unsigned)h->tessPointMode);
+        }
         fprintf(f, "inputLocations =");
         for (uint32_t i = 0; i < h->inputCount && i < PVK_MAX_VERTEX_INPUTS; i++)
             fprintf(f, " %u", (unsigned)h->inputLocations[i]);

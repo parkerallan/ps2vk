@@ -200,7 +200,8 @@ static int blend_factor(PvkBlendFactor f, int *k0, int *k1, int *src)
     }
 }
 
-/* VU1 drops a triangle when its screen-space signed area * cullSign < 0. */
+/* VU1 drops a triangle when (P1 - P0) x (P2 - P0) on screen, times cullSign, is negative. With y
+ * down that product is positive for a clockwise triangle: minus twice Vulkan's area. */
 static PvkResult setup_cull(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *info)
 {
     const PvkPipelineRasterizationStateCreateInfo *rs = &info->rasterization;
@@ -219,7 +220,7 @@ static PvkResult setup_cull(PvkPipeline p, const PvkGraphicsPipelineCreateInfo *
         p->cullAll = 1;
     else if (triangles && rs->cullMode != PVK_CULL_MODE_NONE)
         p->cullSign = (rs->cullMode == PVK_CULL_MODE_BACK_BIT) == (rs->frontFace == PVK_FRONT_FACE_COUNTER_CLOCKWISE)
-                    ? 1.0f : -1.0f;
+                    ? -1.0f : 1.0f;
 
     memcpy(&ctx[0], &flip, sizeof(flip));
     ctx[1] = p->fan ? 1 : 0;
@@ -414,7 +415,8 @@ void pvk_viewport_context(const PvkViewport *vp, PvkFormat depthFormat, float *c
 
 static PvkResult validate_shaders(const PvkShaderCode *vs, const PvkShaderCode *fs)
 {
-    if (!vs || (vs->stage != PVK_SHADER_STAGE_VERTEX && vs->stage != PVK_SHADER_STAGE_MESH_BIT_EXT)) {
+    if (!vs || (vs->stage != PVK_SHADER_STAGE_VERTEX && vs->stage != PVK_SHADER_STAGE_MESH_BIT_EXT &&
+                vs->stage != PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) {
         pvk_error("pipeline: vertexShader is not a vertex shader\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
@@ -512,6 +514,10 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
             l->pushWords[3] |= mask;
         if (r->stageFlags & PVK_SHADER_STAGE_MESH_BIT_EXT)
             l->pushWords[4] |= mask;
+        if (r->stageFlags & PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)
+            l->pushWords[5] |= mask;
+        if (r->stageFlags & PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)
+            l->pushWords[6] |= mask;
     }
 
     *layout = l;
@@ -582,6 +588,16 @@ static PvkResult validate_layout(PvkPipeline p, const PvkGraphicsPipelineCreateI
         if (res == PVK_SUCCESS && p->ts)
             res = validate_blocks(p->ts, info->layout, PVK_SHADER_STAGE_TASK_BIT_EXT, 3, "pipeline", "task",
                                   p->taskUniformSlots, p->taskStorageSlots);
+        if (res != PVK_SUCCESS)
+            return res;
+    }
+    if (p->tess) {
+        uint32_t none[PVK_MAX_STORAGE_BLOCKS];
+        PvkResult res = validate_blocks(p->tcs, info->layout, PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, 5, "pipeline",
+                                        "tessellation control", p->tcsUniformSlots, none);
+        if (res == PVK_SUCCESS)
+            res = validate_blocks(p->tes, info->layout, PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, 6, "pipeline",
+                                  "tessellation evaluation", p->tesUniformSlots, none);
         if (res != PVK_SUCCESS)
             return res;
     }
@@ -799,7 +815,10 @@ static PvkResult setup_vertex_input(PvkPipeline p, const PvkGraphicsPipelineCrea
     }
     p->vertexQwords   = next[0];
     p->instanceQwords = next[1];
-    p->inputBudget    = PVK_BATCH_INPUT_QWORDS - p->instanceQwords * (1 + 2 * (p->instanceAlign - 1));
+    /* A control program keeps its data in the top of the input area. */
+    p->inputQwords    = p->tess ? p->tcs->tessBaseAddress - PVK_VU1_INPUT_ADDR - PVK_VU1_INPUT_HEADER
+                                : PVK_BATCH_INPUT_QWORDS;
+    p->inputBudget    = p->inputQwords - p->instanceQwords * (1 + 2 * (p->instanceAlign - 1));
     return PVK_SUCCESS;
 }
 
@@ -807,6 +826,8 @@ static PvkResult setup_vertex_input(PvkPipeline p, const PvkGraphicsPipelineCrea
 #define VU_UPPER_NOP    0x000002FFu
 #define VU_LOWER_NOP    0x8000033Cu
 #define VU_LOWER_B      0x40000000u /* b imm11: target = this pair + 1 + imm11 */
+#define VU_LOWER_BAL    0x42000000u /* bal it,imm11: it (bits 20-16) = the pair behind the delay slot */
+#define VU_UPPER_MAX_BC 0x10u       /* maxbc's opcode bit that addbc's lacks */
 #define VU_DEST_SHIFT   21          /* xyzw write mask, x in bit 24 */
 #define VU_LQ_BASE_SHIFT 11         /* lq ft,imm11(is): is in bits 15-11, imm11 in bits 10-0 */
 #define VU_VERTEX_REG   3           /* VI03: the vertex being processed */
@@ -818,45 +839,23 @@ static void vu_nop(uint32_t *pair)
     pair[1] = VU_UPPER_NOP;
 }
 
-/* The pipeline's copy of the vertex shader, with the input loads before the
- * conversion block (see PvkShaderCode::vu1Convert) pointed at each input's
- * qword of the vertex or the instance, and the block patched: per input the
- * pairs `itof0` + `loi` scale, `muli` + `loi` -1, `maxi` and `mul.mask
- * VFn,VF00,VF00` (0 and 1 for the components the format lacks), each NOP'd
- * when the format does not need it (a `loi` feeds the next pair), and the
- * branch skips the leading inputs that need nothing. The run-time index
- * clamps (vu1Clamps) are NOP'd unless the device has robustBufferAccess. */
-static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const uint32_t *qword, const int *instance,
-                           int robust)
+/* Patches a copy of a vertex or evaluation shader's code for its input formats: the input loads
+ * before the conversion block (see PvkShaderCode::vu1Convert) pointed at each input's qword of
+ * the vertex or the instance, and the block patched: per input the pairs `itof0` + `loi` scale,
+ * `muli` + `loi` -1, `maxi` and `mul.mask VFn,VF00,VF00` (0 and 1 for the components the format
+ * lacks), each NOP'd when the format does not need it (a `loi` feeds the next pair), and the
+ * branch skips the leading inputs that need nothing. */
+static PvkResult patch_inputs(uint32_t *code, const PvkShaderCode *vs, const VertexFormat *const *fmt,
+                              const uint32_t *qword, const int *instance)
 {
-    const PvkShaderCode *vs = p->vs;
-    size_t words = (size_t)(vs->vu1CodeEnd - vs->vu1CodeStart);
     uint32_t *blk, i, first = vs->inputCount, target;
 
     if (!vs->vu1Convert || vs->vu1Convert < vs->vu1CodeStart + 2 * vs->inputCount ||
         vs->vu1Convert + 2 * (2 + 4 * vs->inputCount) > vs->vu1CodeEnd) {
-        pvk_error("pipeline: vertex shader '%s' has no input conversion block; rebuild it with this shaderc\n",
-                  vs->name);
+        pvk_error("pipeline: shader '%s' has no input conversion block; rebuild it with this shaderc\n", vs->name);
         return PVK_ERROR_INVALID_SHADER;
     }
-    if (words / 2 > PVK_VU1_FRAME_ROUTINE) {
-        pvk_error("pipeline: vertex shader '%s' is %u VU1 instructions; micro memory holds %u\n", vs->name,
-                  (unsigned)(words / 2), (unsigned)PVK_VU1_FRAME_ROUTINE);
-        return PVK_ERROR_INVALID_SHADER;
-    }
-    p->program = calloc(1, sizeof(*p->program));
-    if (!p->program)
-        return PVK_ERROR_OUT_OF_HOST_MEMORY;
-    p->program->vs   = vs;
-    pvk_shader_retain(vs);
-    p->program->refs = 1;
-    p->program->code = memalign(16, words * 4);
-    if (!p->program->code)
-        return PVK_ERROR_OUT_OF_HOST_MEMORY;
-    memcpy(p->program->code, vs->vu1CodeStart, words * 4);
-    p->program->codeEnd = p->program->code + words;
-    blk = p->program->code + (vs->vu1Convert - vs->vu1CodeStart);
-
+    blk = code + (vs->vu1Convert - vs->vu1CodeStart);
     for (i = 0; i < vs->inputCount; i++) {
         uint32_t *load = blk - 2 * (vs->inputCount - i);
         uint32_t *s = blk + 2 * (2 + 4 * i);
@@ -885,18 +884,128 @@ static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const 
     }
     target = 2 + 4 * first;
     blk[0] = VU_LOWER_B | ((target - 1) & 0x7FF);
+    return PVK_SUCCESS;
+}
 
-    for (i = 0; i < vs->vu1ClampCount && !robust; i++) {
-        const uint32_t *c = vs->vu1Clamps[i];
-        if (c < vs->vu1CodeStart || c + 6 > vs->vu1CodeEnd) {
-            pvk_error("pipeline: vertex shader '%s' has a run-time index clamp outside its code\n", vs->name);
+/* NOPs a shader's run-time index clamps (vu1Clamps) in its copy at `code`. */
+static PvkResult nop_clamps(uint32_t *code, const PvkShaderCode *c)
+{
+    uint32_t i;
+
+    for (i = 0; i < c->vu1ClampCount; i++) {
+        const uint32_t *clamp = c->vu1Clamps[i];
+        if (clamp < c->vu1CodeStart || clamp + 6 > c->vu1CodeEnd) {
+            pvk_error("pipeline: shader '%s' has a run-time index clamp outside its code\n", c->name);
             return PVK_ERROR_INVALID_SHADER;
         }
-        vu_nop(p->program->code + (c - vs->vu1CodeStart));
-        vu_nop(p->program->code + (c - vs->vu1CodeStart) + 2);
-        vu_nop(p->program->code + (c - vs->vu1CodeStart) + 4);
+        vu_nop(code + (clamp - c->vu1CodeStart));
+        vu_nop(code + (clamp - c->vu1CodeStart) + 2);
+        vu_nop(code + (clamp - c->vu1CodeStart) + 4);
     }
     return PVK_SUCCESS;
+}
+
+/* The pipeline's copy of the vertex shader, patched for its inputs, with room for `extra` words
+ * of programs behind it. The index clamps stay only with robustBufferAccess. */
+static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const uint32_t *qword, const int *instance,
+                           int robust, size_t extra)
+{
+    const PvkShaderCode *vs = p->vs;
+    size_t words = (size_t)(vs->vu1CodeEnd - vs->vu1CodeStart);
+    PvkResult res;
+
+    if ((words + extra) / 2 > PVK_VU1_FRAME_ROUTINE) {
+        pvk_error("pipeline: vertex shader '%s'%s is %u VU1 instructions; micro memory holds %u\n", vs->name,
+                  extra ? " with its tessellation shaders" : "", (unsigned)((words + extra) / 2),
+                  (unsigned)PVK_VU1_FRAME_ROUTINE);
+        return PVK_ERROR_INVALID_SHADER;
+    }
+    p->program = calloc(1, sizeof(*p->program));
+    if (!p->program)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    p->program->vs   = vs;
+    pvk_shader_retain(vs);
+    p->program->refs = 1;
+    p->program->code = memalign(16, (words + extra) * 4);
+    if (!p->program->code)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    memcpy(p->program->code, vs->vu1CodeStart, words * 4);
+    p->program->codeEnd = p->program->code + words;
+    if ((res = patch_inputs(p->program->code, vs, fmt, qword, instance)) != PVK_SUCCESS)
+        return res;
+    return robust ? PVK_SUCCESS : nop_clamps(p->program->code, vs);
+}
+
+static PvkResult specialize(PvkPipeline p, const PvkShaderCode *vs, const PvkSpecializationInfo *info, size_t at);
+
+/* What a tessellation pipeline's three shaders must agree on. */
+static PvkResult tess_check(const PvkShaderCode *vs, const PvkShaderCode *tcs, const PvkShaderCode *tes)
+{
+    static const char *const kind[3] = { "vec4", "vec2", "float" };
+    const int32_t has[3] = { vs->colorOutputLocation, vs->texcoordOutputLocation, vs->fogOutputLocation };
+    uint32_t vsEnd = 0, tcsStart = PVK_VU1_UNIFORM_QWORDS, i;
+
+    (void)tes;
+    for (i = 0; i < 3; i++)
+        if ((tcs->tessInputs >> i & 1) && has[i] < 0) {
+            pvk_error("pipeline: tessellation control shader '%s' reads a %s per control point, but vertex shader "
+                      "'%s' writes none\n", tcs->name, kind[i], vs->name);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+    /* The vertex shader's uniform blocks start the uniform area and the control shader's end it. */
+    for (i = 0; i < vs->uniformBlockCount; i++)
+        if (vs->uniformBlocks[i].qword + (vs->uniformBlocks[i].bytes + 15) / 16 > vsEnd)
+            vsEnd = vs->uniformBlocks[i].qword + (vs->uniformBlocks[i].bytes + 15) / 16;
+    for (i = 0; i < tcs->uniformBlockCount; i++)
+        if (tcs->uniformBlocks[i].qword < tcsStart)
+            tcsStart = tcs->uniformBlocks[i].qword;
+    if (vsEnd > tcsStart) {
+        pvk_error("pipeline: the uniform blocks of vertex shader '%s' and tessellation control shader '%s' take more "
+                  "than %u bytes together (maxUniformBufferRange)\n", vs->name, tcs->name,
+                  (unsigned)PVK_MAX_UNIFORM_BYTES);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    return PVK_SUCCESS;
+}
+
+/* A tessellation pipeline's program: the vertex shader's code, patched to hand every control
+ * point to the control shader's behind it and to kick nothing, then the evaluation shader's. */
+static PvkResult tess_code(PvkPipeline p, int robust, const PvkSpecializationInfo *tcsSpec,
+                           const PvkSpecializationInfo *tesSpec)
+{
+    static const int vertexRate = 0;
+    static const uint32_t firstQword = 0;
+    const VertexFormat *coord = vertex_format(PVK_FORMAT_R32G32B32A32_SFLOAT);
+    const PvkShaderCode *vs = p->vs, *tcs = p->tcs, *tes = p->tes;
+    size_t vw = (size_t)(vs->vu1CodeEnd - vs->vu1CodeStart), cw = (size_t)(tcs->vu1CodeEnd - tcs->vu1CodeStart);
+    size_t ew = (size_t)(tes->vu1CodeEnd - tes->vu1CodeStart);
+    uint32_t *code = p->program->code, *e = code + vs->vu1EpilogueWord, pair = vs->vu1EpilogueWord / 2;
+    PvkResult res;
+
+    memcpy(code + vw, tcs->vu1CodeStart, cw * 4);
+    memcpy(code + vw + cw, tes->vu1CodeStart, ew * 4);
+    p->program->codeEnd = code + vw + cw + ew;
+    if ((res = patch_inputs(code + vw + cw, tes, &coord, &firstQword, &vertexRate)) != PVK_SUCCESS)
+        return res;
+    if (!robust && ((res = nop_clamps(code + vw, tcs)) != PVK_SUCCESS ||
+                    (res = nop_clamps(code + vw + cw, tes)) != PVK_SUCCESS))
+        return res;
+
+    /* Behind the vertex shader's body: call the control program, then on to the next vertex. */
+    e[0] = VU_LOWER_BAL | 8u << 16 | (((uint32_t)(vw / 2) - (pair + 1)) & 0x7FF);
+    e[1] = VU_UPPER_NOP;
+    vu_nop(e + 2);
+    e[4] = VU_LOWER_B | ((vs->vu1NextWord / 2 - (pair + 3)) & 0x7FF);
+    e[5] = VU_UPPER_NOP;
+    vu_nop(e + 6);
+    vu_nop(code + vs->vu1KickWord);
+    /* The float output is the fog amount, kept above 0 by a max: a control shader gets it as it is. */
+    if (vs->fogOutputLocation >= 0)
+        e[-1] &= ~VU_UPPER_MAX_BC;
+
+    if ((res = specialize(p, tcs, tcsSpec, vw)) != PVK_SUCCESS)
+        return res;
+    return specialize(p, tes, tesSpec, vw + cw);
 }
 
 /* What a mesh pipeline's two shaders share: the uniform area, the payload and VU1 data memory. */
@@ -937,7 +1046,7 @@ static PvkResult mesh_code(PvkPipeline p, int robust)
 {
     const PvkShaderCode *part[2] = { p->ts, p->vs };
     size_t words = 0, at = 0;
-    uint32_t i, k;
+    uint32_t k;
 
     for (k = 0; k < 2; k++)
         if (part[k])
@@ -964,15 +1073,10 @@ static PvkResult mesh_code(PvkPipeline p, int robust)
         if (!c)
             continue;
         memcpy(p->program->code + at, c->vu1CodeStart, n * 4);
-        for (i = 0; i < c->vu1ClampCount && !robust; i++) {
-            const uint32_t *clamp = c->vu1Clamps[i];
-            if (clamp < c->vu1CodeStart || clamp + 6 > c->vu1CodeEnd) {
-                pvk_error("pipeline: shader '%s' has a run-time index clamp outside its code\n", c->name);
-                return PVK_ERROR_INVALID_SHADER;
-            }
-            vu_nop(p->program->code + at + (clamp - c->vu1CodeStart));
-            vu_nop(p->program->code + at + (clamp - c->vu1CodeStart) + 2);
-            vu_nop(p->program->code + at + (clamp - c->vu1CodeStart) + 4);
+        if (!robust) {
+            PvkResult res = nop_clamps(p->program->code + at, c);
+            if (res != PVK_SUCCESS)
+                return res;
         }
         at += n;
     }
@@ -1012,7 +1116,9 @@ static PvkResult check_specialization(const PvkSpecializationInfo *info, uint32_
 static PvkResult specialize(PvkPipeline p, const PvkShaderCode *vs, const PvkSpecializationInfo *info, size_t at)
 {
     const char *stage = vs->stage == PVK_SHADER_STAGE_COMPUTE_BIT ? "compute" : vs->stage == PVK_SHADER_STAGE_MESH_BIT_EXT
-                      ? "mesh" : vs->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? "task" : "vertex";
+                      ? "mesh" : vs->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? "task"
+                      : vs->stage == PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ? "tessellation control"
+                      : vs->stage == PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT ? "tessellation evaluation" : "vertex";
     uint32_t i, j;
 
     for (i = 0; i < vs->vu1SpecConstantCount; i++) {
@@ -1102,7 +1208,7 @@ static uint32_t max_batch_vertices(const PvkPipeline p, uint32_t step)
 {
     /* Up to align - 1 unused vertices come before and after a batch's. */
     uint32_t byInput  = p->vertexQwords ? p->inputBudget / p->vertexQwords - 2 * (p->align - 1) : UINT32_MAX;
-    uint32_t byOutput = (PVK_VU1_MEMORY_QWORDS - PVK_VU1_OUTPUT_ADDR - 1) / p->outputQwords;
+    uint32_t byOutput = (p->outputEnd - PVK_VU1_OUTPUT_ADDR - 1) / p->outputQwords;
     uint32_t n        = byInput < byOutput ? byInput : byOutput;
 
     return n - n % step; /* whole primitives per batch */
@@ -1119,13 +1225,68 @@ static const struct {
     [PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP] = { PRIM_TRIANGLE_STRIP, 1, 2, 0 },
     [PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN]   = { PRIM_TRIANGLE_FAN, 1, 2, 1 },
     [PVK_PRIMITIVE_TOPOLOGY_SPRITE_LIST]    = { PRIM_SPRITE, 2, 0, 0 },
+    [PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST]     = { 0, 0, 0, 0 }, /* the evaluation shader's layout says what is drawn */
 };
+
+/* The evaluation program as a pipeline of its own, and the pipeline itself set up to run whole
+ * patches through the vertex and control programs. */
+static PvkResult tess_finish(PvkPipeline p)
+{
+    size_t before = (size_t)(p->vs->vu1CodeEnd - p->vs->vu1CodeStart) + (size_t)(p->tcs->vu1CodeEnd - p->tcs->vu1CodeStart);
+    PvkPipeline e = memalign(16, sizeof(*e));
+    uint32_t slots;
+
+    if (!e)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    *e = *p;
+    p->eval = e;
+    e->eval = NULL;
+    e->tess = 0;
+    e->vs   = p->tes;
+    /* Its vertices are tessellation coordinates: one stream of a qword each. */
+    memset(e->vertexBindings, 0, sizeof(e->vertexBindings));
+    e->vertexBindings[0].used   = 1;
+    e->vertexBindings[0].stride = 16;
+    e->vertexBindings[0].count  = 1;
+    e->vertexBindings[0].mode   = vertex_format(PVK_FORMAT_R32G32B32A32_SFLOAT)->mode;
+    e->vertexBindings[0].align  = 1;
+    e->vertexBindings[0].chunk  = 255;
+    e->vertexQwords   = 1;
+    e->instanceQwords = 0;
+    e->align = e->instanceAlign = 1;
+    e->inputQwords    = PVK_BATCH_INPUT_QWORDS;
+    e->inputBudget    = PVK_BATCH_INPUT_QWORDS;
+    e->outputEnd      = PVK_VU1_TESS_PATCH; /* the patch's record ends data memory */
+    e->entry          = (uint32_t)(before / 2);
+    e->maxBatch       = max_batch_vertices(e, e->primStep);
+
+    p->tessRecord  = PVK_VU1_TESS_REC_QWORDS(p->tcs->tessOutputVertices);
+    slots          = (PVK_VU1_MEMORY_QWORDS - PVK_VU1_TESS_RECORD) / p->tessRecord;
+    /* The control shader writes the first slot; with room for more, each record is copied behind it. */
+    p->tessPatches = slots > 1 ? slots - 1 : 1;
+    p->tessFirst   = PVK_VU1_TESS_RECORD + (slots > 1 ? p->tessRecord : 0);
+    p->primStep    = p->patchControlPoints;
+    p->primOverlap = 0;
+    p->fan         = 0;
+    p->strip       = 0;
+    p->maxBatch    = max_batch_vertices(p, p->primStep);
+    if (p->maxBatch > p->tessPatches * p->primStep)
+        p->maxBatch = p->tessPatches * p->primStep;
+    if (!p->maxBatch) {
+        pvk_error("pipeline: a patch of %u control points of %u qwords each does not fit the %u qwords VU1 has for "
+                  "a batch's vertices beside the control program's data\n", (unsigned)p->patchControlPoints,
+                  (unsigned)p->vertexQwords, (unsigned)p->inputBudget);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    return PVK_SUCCESS;
+}
 
 PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, const PvkGraphicsPipelineCreateInfo *info,
                                     PvkPipeline *pipeline)
 {
-    const PvkShaderCode *vs = NULL, *fs = NULL, *ts = NULL, *ms = NULL;
-    const PvkSpecializationInfo *vsSpec = NULL, *tsSpec = NULL, *msSpec = NULL;
+    const PvkShaderCode *vs = NULL, *fs = NULL, *ts = NULL, *ms = NULL, *tcs = NULL, *tes = NULL;
+    const PvkSpecializationInfo *vsSpec = NULL, *tsSpec = NULL, *msSpec = NULL, *tcsSpec = NULL, *tesSpec = NULL;
+    uint32_t patchControlPoints = 0;
     const VertexFormat *fmt[PVK_MAX_VERTEX_INPUTS];
     uint32_t qword[PVK_MAX_VERTEX_INPUTS], i;
     int instance[PVK_MAX_VERTEX_INPUTS];
@@ -1139,12 +1300,13 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
         const PvkShaderCode **slot = s->stage == PVK_SHADER_STAGE_VERTEX ? &vs
                                    : s->stage == PVK_SHADER_STAGE_FRAGMENT ? &fs
                                    : s->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? &ts
-                                   : s->stage == PVK_SHADER_STAGE_MESH_BIT_EXT ? &ms : NULL;
+                                   : s->stage == PVK_SHADER_STAGE_MESH_BIT_EXT ? &ms
+                                   : s->stage == PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ? &tcs
+                                   : s->stage == PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT ? &tes : NULL;
 
         if (!slot || *slot || !s->module) {
-            pvk_error("pipeline: stage %u must be a PVK_SHADER_STAGE_VERTEX, PVK_SHADER_STAGE_FRAGMENT, "
-                      "PVK_SHADER_STAGE_TASK_BIT_EXT or PVK_SHADER_STAGE_MESH_BIT_EXT stage, each at most once, with a "
-                      "module\n", (unsigned)i);
+            pvk_error("pipeline: stage %u must be a vertex, tessellation control, tessellation evaluation, fragment, "
+                      "task or mesh stage, each at most once, with a module\n", (unsigned)i);
             return PVK_ERROR_VALIDATION_FAILED;
         }
         if (s->module->code->stage != s->stage) {
@@ -1167,6 +1329,10 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
             tsSpec = s->specializationInfo;
         else if (s->stage == PVK_SHADER_STAGE_MESH_BIT_EXT)
             msSpec = s->specializationInfo;
+        else if (s->stage == PVK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)
+            tcsSpec = s->specializationInfo;
+        else if (s->stage == PVK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)
+            tesSpec = s->specializationInfo;
     }
     if (ms || ts) {
         /* The mesh shader's output layout stands in for the vertex input and the topology. */
@@ -1191,13 +1357,48 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
         meshInfo.topology = lists[ms->meshPrimitiveVertices - 1];
         info     = &meshInfo;
     }
+    if (tcs || tes) {
+        /* What the evaluation shader's layout makes stands in for the topology. */
+        static const PvkPrimitiveTopology made[] = { PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                                     PVK_PRIMITIVE_TOPOLOGY_LINE_LIST };
+        const PvkPipelineTessellationStateCreateInfo *t = &info->tessellation;
+
+        if (!tcs || !tes || !vs || ms) {
+            pvk_error("pipeline: tessellation needs a vertex, a tessellation control and a tessellation evaluation "
+                      "stage, and no mesh stage\n");
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (!device->features.tessellationShader) {
+            pvk_error("pipeline: tessellation stages need the tessellationShader feature turned on at pvkCreateDevice\n");
+            return PVK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        if (info->topology != PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+            pvk_error("pipeline: tessellation stages need the topology PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST\n");
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (t->sType != PVK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO || t->pNext || t->flags ||
+            !t->patchControlPoints || t->patchControlPoints > PVK_MAX_TESSELLATION_PATCH_SIZE) {
+            pvk_error("pipeline: tessellation needs its sType, no pNext, flags 0 and patchControlPoints 1 to %d "
+                      "(maxTessellationPatchSize)\n", PVK_MAX_TESSELLATION_PATCH_SIZE);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if ((res = tess_check(vs, tcs, tes)) != PVK_SUCCESS)
+            return res;
+        patchControlPoints = t->patchControlPoints;
+        meshInfo = *info;
+        meshInfo.topology = tes->tessPointMode ? PVK_PRIMITIVE_TOPOLOGY_POINT_LIST : made[tes->tessDomain];
+        info     = &meshInfo;
+    } else if (info->topology == PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+        pvk_error("pipeline: PVK_PRIMITIVE_TOPOLOGY_PATCH_LIST needs tessellation control and evaluation stages\n");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
     if (!vs || !fs) {
         pvk_error("pipeline: stages must hold a fragment stage and a vertex or a mesh stage\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
-    if ((res = validate_shaders(vs, fs)) != PVK_SUCCESS)
+    if ((res = validate_shaders(tes ? tes : vs, fs)) != PVK_SUCCESS)
         return res;
-    if ((unsigned)info->topology >= sizeof(topologies) / sizeof(topologies[0])) {
+    if ((unsigned)info->topology >= sizeof(topologies) / sizeof(topologies[0]) || !topologies[info->topology].step) {
         pvk_error("pipeline: unknown topology %d\n", (int)info->topology);
         return PVK_ERROR_VALIDATION_FAILED;
     }
@@ -1219,6 +1420,15 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
     p->ts           = ts;
     if (ts)
         pvk_shader_retain(ts);
+    p->tess         = tcs != NULL;
+    p->tcs          = tcs;
+    p->tes          = tes;
+    if (tcs) {
+        pvk_shader_retain(tcs);
+        pvk_shader_retain(tes);
+    }
+    p->patchControlPoints = patchControlPoints;
+    p->outputEnd    = PVK_VU1_MEMORY_QWORDS;
     res = validate_layout(p, info);
     if (res == PVK_SUCCESS && p->mesh) {
         size_t taskWords = ts ? (size_t)(ts->vu1CodeEnd - ts->vu1CodeStart) : 0;
@@ -1229,9 +1439,14 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
         if (res == PVK_SUCCESS)
             res = specialize(p, vs, vsSpec, taskWords);
     } else if (res == PVK_SUCCESS) {
+        size_t extra = p->tess ? (size_t)(tcs->vu1CodeEnd - tcs->vu1CodeStart) + (size_t)(tes->vu1CodeEnd - tes->vu1CodeStart)
+                               : 0;
+
         if ((res = setup_vertex_input(p, info, fmt, qword, instance)) == PVK_SUCCESS &&
-            (res = copy_code(p, fmt, qword, instance, device->features.robustBufferAccess != 0)) == PVK_SUCCESS)
+            (res = copy_code(p, fmt, qword, instance, device->features.robustBufferAccess != 0, extra)) == PVK_SUCCESS)
             res = specialize(p, vs, vsSpec, 0);
+        if (res == PVK_SUCCESS && p->tess)
+            res = tess_code(p, device->features.robustBufferAccess != 0, tcsSpec, tesSpec);
     }
     if (res != PVK_SUCCESS) {
         pvkDestroyPipeline(device, p, NULL);
@@ -1240,8 +1455,8 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
     if (cache)
         program_intern(p, cache);
     /* A vertex shader with a texture coordinate output stores ST before RGBAQ, XYZ2. */
-    p->texcoordOut  = vs->texcoordOutputLocation >= 0;
-    p->fogOut       = vs->fogOutputLocation >= 0;
+    p->texcoordOut  = (tes ? tes : vs)->texcoordOutputLocation >= 0;
+    p->fogOut       = (tes ? tes : vs)->fogOutputLocation >= 0;
     p->fogcol       = fs->fogColor;
     p->outputQwords = PVK_VU1_OUTPUT_PER_VERTEX + p->texcoordOut + p->fogOut;
     p->primStep     = topologies[info->topology].step;
@@ -1271,6 +1486,10 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
     ctx[PVK_VU1_CTX_COLOR_SCALE * 4 + 2] = 255.0f;
     ctx[PVK_VU1_CTX_COLOR_SCALE * 4 + 3] = 128.0f;
 
+    if (p->tess && (res = tess_finish(p)) != PVK_SUCCESS) {
+        pvkDestroyPipeline(device, p, NULL);
+        return res;
+    }
     *pipeline = p;
     return PVK_SUCCESS;
 }
@@ -1412,6 +1631,9 @@ void pvkDestroyPipeline(PvkDevice device, PvkPipeline pipeline, const PvkAllocat
     pvk_shader_release(pipeline->vs);
     pvk_shader_release(pipeline->fs);
     pvk_shader_release(pipeline->ts);
+    pvk_shader_release(pipeline->tcs);
+    pvk_shader_release(pipeline->tes);
+    free(pipeline->eval);
     host_free(pAllocator, pipeline);
 }
 
