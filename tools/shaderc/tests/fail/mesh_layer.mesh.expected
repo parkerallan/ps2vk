@@ -1,0 +1,1 @@
+mesh_layer.mesh:12: error: mesh shader uses gl_Layer or gl_ViewportIndex; the GS draws into one image through one viewport (maxMeshOutputLayers, multiViewport)

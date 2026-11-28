@@ -17,6 +17,7 @@ static void cmd_close_gs(PvkCommandBuffer cmd, qword_t *end);
 static void cmd_release_copies(PvkCommandBuffer cmd);
 static int array_grow(PvkCommandBuffer cmd, void **array, uint32_t count, uint32_t *cap, size_t size);
 static int cmd_graphics(PvkCommandBuffer cmd, const char *who);
+static void cmd_vu1_readback(PvkCommandBuffer cmd, struct PvkReadback *rb);
 
 /* Make sure `qwords` more fit in the chain; mark the buffer failed if not. */
 static int cmd_reserve(PvkCommandBuffer cmd, uint32_t qwords)
@@ -24,6 +25,10 @@ static int cmd_reserve(PvkCommandBuffer cmd, uint32_t qwords)
     if (cmd->failed)
         return 0;
     if (packet2_get_qw_count(&cmd->packet) + qwords + 2 > cmd->packet.max_qwords_count) {
+        if (cmd->replay) {
+            cmd->failed = 2; /* the caller builds the draws again in more memory */
+            return 0;
+        }
         pvk_error("command pool full (%u qwords); create it with a larger maxQwords\n",
                   (unsigned)cmd->pool->qwords);
         cmd->failed = 1;
@@ -218,6 +223,7 @@ void pvkDestroyCommandPool(PvkDevice device, PvkCommandPool pool)
         cmd_release_copies(cmd);
         free(cmd->readbacks);
         free(cmd->uploads);
+        free(cmd->indirects);
         free(cmd->executed);
         free(cmd);
     }
@@ -295,6 +301,7 @@ void pvkFreeCommandBuffers(PvkDevice device, PvkCommandPool pool, uint32_t count
         cmd_release_copies(cmd);
         free(cmd->readbacks);
         free(cmd->uploads);
+        free(cmd->indirects);
         free(cmd->executed);
         free(cmd);
     }
@@ -981,8 +988,11 @@ static void cmd_release_copies(PvkCommandBuffer cmd)
             free(cmd->readbacks[i].stage);
     for (i = 0; i < cmd->uploadCount; i++)
         free(cmd->uploads[i].stage);
+    for (i = 0; i < cmd->indirectCount; i++)
+        free(cmd->indirects[i].chain);
     cmd->readbackCount = 0;
     cmd->uploadCount   = 0;
+    cmd->indirectCount = 0;
 }
 
 static void pack_uploads(PvkCommandBuffer cmd)
@@ -1321,7 +1331,8 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
     } else if (srcStageMask & PVK_GS_STAGES) {
         cmd_flush(cmd);
     } else if (srcStageMask & (PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT | PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                               PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)) {
+                               PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                               PVK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT | PVK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT)) {
         packet2_chain_open_cnt(&cmd->packet, 0, 0, 0);
         packet2_vif_flushe(&cmd->packet, 0);
         packet2_vif_nop(&cmd->packet, 0);
@@ -1332,7 +1343,8 @@ void pvkCmdPipelineBarrier(PvkCommandBuffer cmd, PvkPipelineStageFlags srcStageM
 
 #define PVK_ALL_STAGES (PVK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | PVK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | \
                         PVK_PIPELINE_STAGE_VERTEX_INPUT_BIT | PVK_PIPELINE_STAGE_VERTEX_SHADER_BIT | \
-                        PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | PVK_GS_STAGES)
+                        PVK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | PVK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT | \
+                        PVK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT | PVK_GS_STAGES)
 
 /* Open a GS packet on the command buffer's path: DIRECT (PATH2) or the GIF channel (PATH3). */
 static qword_t *cmd_open_gs(PvkCommandBuffer cmd)
@@ -1636,10 +1648,12 @@ void pvkCmdPushConstants(PvkCommandBuffer cmd, PvkPipelineLayout layout, uint32_
         return;
     }
     mask = pvk_push_word_mask(offset, size);
-    if (!stageFlags || stageFlags & ~(PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT | PVK_SHADER_STAGE_COMPUTE_BIT)
+    if (!stageFlags || stageFlags & ~PVK_ALL_SHADER_STAGES
         || ((stageFlags & PVK_SHADER_STAGE_VERTEX) && (layout->pushWords[0] & mask) != mask)
         || ((stageFlags & PVK_SHADER_STAGE_FRAGMENT) && (layout->pushWords[1] & mask) != mask)
-        || ((stageFlags & PVK_SHADER_STAGE_COMPUTE_BIT) && (layout->pushWords[2] & mask) != mask)) {
+        || ((stageFlags & PVK_SHADER_STAGE_COMPUTE_BIT) && (layout->pushWords[2] & mask) != mask)
+        || ((stageFlags & PVK_SHADER_STAGE_TASK_BIT_EXT) && (layout->pushWords[3] & mask) != mask)
+        || ((stageFlags & PVK_SHADER_STAGE_MESH_BIT_EXT) && (layout->pushWords[4] & mask) != mask)) {
         pvk_error("pvkCmdPushConstants: bytes %u to %u are not in the layout's push constant "
                   "ranges for stage flags 0x%x\n", (unsigned)offset, (unsigned)(offset + size),
                   (unsigned)stageFlags);
@@ -1744,45 +1758,57 @@ static PvkDescriptorSet bound_set(PvkCommandBuffer cmd, const char *name, uint32
     return s;
 }
 
-/* The vertex shader's uniform blocks: each bound buffer range must hold the
- * block. When a pipeline or set was bound since the last draw, the blocks are
- * sent to VU1 memory again, streamed from the buffers by DMA REF tags after a
- * FLUSH, since a running batch loads them in its first instructions. */
+/* "vertex shader", "mesh shader" or "task shader", for messages. */
+static const char *shader_what(const PvkShaderCode *code)
+{
+    return code->stage == PVK_SHADER_STAGE_MESH_BIT_EXT ? "mesh shader"
+         : code->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? "task shader" : "vertex shader";
+}
+
+/* The vertex shader's uniform blocks, or the mesh and task shaders': each bound range must hold its
+ * block; after a pipeline or set bind they are sent to VU1 again by DMA REF, behind a FLUSH. */
 static int send_uniforms(PvkCommandBuffer cmd, const char *name)
 {
     const PvkPipeline p = cmd->pipeline;
-    const PvkShaderCode *vs = p->vs;
-    const struct PvkDescriptorSlot *slots[PVK_MAX_UNIFORM_BLOCKS];
-    uint32_t i;
+    const PvkShaderCode *shader[2] = { p->vs, p->ts };
+    const uint32_t *slotOf[2] = { p->uniformSlots, p->taskUniformSlots };
+    const struct PvkDescriptorSlot *slots[2][PVK_MAX_UNIFORM_BLOCKS];
+    uint32_t i, k, blocks = 0;
 
-    for (i = 0; i < vs->uniformBlockCount; i++) {
-        const PvkShaderUniformBlock *u = &vs->uniformBlocks[i];
-        uint32_t qwords = (u->bytes + 15) / 16;
-        PvkDescriptorSet s = bound_set(cmd, name, u->set, p->uniformSlots[i], "vertex shader", vs->name, u->binding);
+    for (k = 0; k < 2; k++) {
+        const PvkShaderCode *vs = shader[k];
 
-        if (!s)
-            return 0;
-        slots[i] = &s->slots[p->uniformSlots[i]];
-        if (slots[i]->range < u->bytes || slots[i]->offset + (size_t)qwords * 16 > slots[i]->buffer->size) {
-            pvk_error("%s: the uniform block at set %u, binding %u of vertex shader '%s' is %u bytes "
-                      "(%u whole qwords), but the bound buffer range holds %u\n", name, (unsigned)u->set,
-                      (unsigned)u->binding, vs->name, (unsigned)u->bytes, (unsigned)qwords,
-                      (unsigned)slots[i]->range);
-            cmd->failed = 1;
-            return 0;
+        for (i = 0; vs && i < vs->uniformBlockCount; i++, blocks++) {
+            const PvkShaderUniformBlock *u = &vs->uniformBlocks[i];
+            uint32_t qwords = (u->bytes + 15) / 16;
+            PvkDescriptorSet s = bound_set(cmd, name, u->set, slotOf[k][i], shader_what(vs), vs->name, u->binding);
+
+            if (!s)
+                return 0;
+            slots[k][i] = &s->slots[slotOf[k][i]];
+            if (slots[k][i]->range < u->bytes || slots[k][i]->offset + (size_t)qwords * 16 > slots[k][i]->buffer->size) {
+                pvk_error("%s: the uniform block at set %u, binding %u of %s '%s' is %u bytes "
+                          "(%u whole qwords), but the bound buffer range holds %u\n", name, (unsigned)u->set,
+                          (unsigned)u->binding, shader_what(vs), vs->name, (unsigned)u->bytes, (unsigned)qwords,
+                          (unsigned)slots[k][i]->range);
+                cmd->failed = 1;
+                return 0;
+            }
         }
     }
 
-    if (!cmd->uniformsDirty || !vs->uniformBlockCount)
+    if (!cmd->uniformsDirty || !blocks)
         return 1;
-    if (!cmd_reserve(cmd, 1 + 2 * vs->uniformBlockCount))
+    if (!cmd_reserve(cmd, 1 + 2 * blocks))
         return 0;
     cmd_flush(cmd);
-    for (i = 0; i < vs->uniformBlockCount; i++) {
-        const PvkShaderUniformBlock *u = &vs->uniformBlocks[i];
-        packet2_utils_vu_add_unpack_data(&cmd->packet, PVK_VU1_UNIFORM_ADDR + u->qword,
-                                         (uint8_t *)slots[i]->buffer->data + slots[i]->offset,
-                                         (u->bytes + 15) / 16, 0);
+    for (k = 0; k < 2; k++) {
+        for (i = 0; shader[k] && i < shader[k]->uniformBlockCount; i++) {
+            const PvkShaderUniformBlock *u = &shader[k]->uniformBlocks[i];
+            packet2_utils_vu_add_unpack_data(&cmd->packet, PVK_VU1_UNIFORM_ADDR + u->qword,
+                                             (uint8_t *)slots[k][i]->buffer->data + slots[k][i]->offset,
+                                             (u->bytes + 15) / 16, 0);
+        }
     }
     cmd->uniformsDirty = 0;
     return 1;
@@ -1793,9 +1819,10 @@ static int send_uniforms(PvkCommandBuffer cmd, const char *name)
  * descriptor sets its uniform blocks and sampler read. Sends the uniform
  * blocks and the GS state if they changed. Fails the buffer and returns 0
  * otherwise. */
-static int draw_ready(PvkCommandBuffer cmd, const char *name)
+static int draw_ready_kind(PvkCommandBuffer cmd, const char *name, int mesh)
 {
     PvkPipeline p = cmd->pipeline;
+    const PvkShaderCode *shader[2];
     uint32_t b, missing;
     framebuffer_t fb;
     PvkRect2D scissor;
@@ -1808,6 +1835,12 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
 
     if (!cmd->rendering || !p) {
         pvk_error("%s needs pvkCmdBeginRendering and a pipeline\n", name);
+        cmd->failed = 1;
+        return 0;
+    }
+    if (p->mesh != mesh) {
+        pvk_error("%s: the bound pipeline has %s stage; this draw needs a pipeline with one\n", name,
+                  mesh ? "no mesh" : "a mesh stage and no vertex");
         cmd->failed = 1;
         return 0;
     }
@@ -1827,13 +1860,19 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
             return 0;
         }
     }
-    if (p->vs->pushConstantBytes > cmd->pushSet
-        || (p->vs->pushConstantBytes && !pvk_layout_push_compatible(&cmd->pushLayout, p->layout))) {
-        pvk_error("%s: vertex shader '%s' reads %u bytes of push constants but only %u "
-                  "were set with pvkCmdPushConstants through the pipeline's layout\n", name, p->vs->name,
-                  (unsigned)p->vs->pushConstantBytes, (unsigned)cmd->pushSet);
-        cmd->failed = 1;
-        return 0;
+    shader[0] = p->vs;
+    shader[1] = p->ts;
+    for (b = 0; b < 2; b++) {
+        const PvkShaderCode *vs = shader[b];
+
+        if (vs && (vs->pushConstantBytes > cmd->pushSet
+                   || (vs->pushConstantBytes && !pvk_layout_push_compatible(&cmd->pushLayout, p->layout)))) {
+            pvk_error("%s: %s '%s' reads %u bytes of push constants but only %u "
+                      "were set with pvkCmdPushConstants through the pipeline's layout\n", name, shader_what(vs),
+                      vs->name, (unsigned)vs->pushConstantBytes, (unsigned)cmd->pushSet);
+            cmd->failed = 1;
+            return 0;
+        }
     }
     if (p->depthFormat != depthFormat) {
         pvk_error("%s: the pipeline's depthAttachmentFormat (%d) does not match the depth "
@@ -1900,6 +1939,11 @@ static int draw_ready(PvkCommandBuffer cmd, const char *name)
     }
     /* FRONT_AND_BACK discards every triangle, a stencil test of NEVER every pixel: nothing to send. */
     return !p->cullAll && !p->stencilNever;
+}
+
+static int draw_ready(PvkCommandBuffer cmd, const char *name)
+{
+    return draw_ready_kind(cmd, name, 0);
 }
 
 /* Most indices in one batch: whole primitives that fit the output area. */
@@ -2202,14 +2246,14 @@ static void batch_indices(PvkCommandBuffer cmd, uint32_t dest, const uint16_t *p
     packet2_chain_close_tag(&cmd->packet);
 }
 
-/* pvkCmdDraw, reporting errors under `name`. */
-static void draw(PvkCommandBuffer cmd, const char *name, uint32_t vertexCount, uint32_t instanceCount,
-                 uint32_t firstVertex, uint32_t firstInstance)
+/* The batches of one draw, once draw_ready() has checked and sent what the draw needs. */
+static void draw_batches(PvkCommandBuffer cmd, const char *name, uint32_t vertexCount, uint32_t instanceCount,
+                         uint32_t firstVertex, uint32_t firstInstance)
 {
     PvkPipeline p = cmd->pipeline;
     uint32_t done, idone, k = 1, b;
 
-    if (!draw_ready(cmd, name) || !draw_instances(cmd, name, firstInstance, instanceCount))
+    if (!draw_instances(cmd, name, firstInstance, instanceCount))
         return;
     if ((uint64_t)firstVertex + vertexCount > stream_slots(cmd, 0)) {
         pvk_error("%s reads past the end of a vertex buffer\n", name);
@@ -2252,6 +2296,14 @@ static void draw(PvkCommandBuffer cmd, const char *name, uint32_t vertexCount, u
     }
 }
 
+/* pvkCmdDraw, reporting errors under `name`. */
+static void draw(PvkCommandBuffer cmd, const char *name, uint32_t vertexCount, uint32_t instanceCount,
+                 uint32_t firstVertex, uint32_t firstInstance)
+{
+    if (draw_ready(cmd, name))
+        draw_batches(cmd, name, vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
 /* An indexed batch at a draw position: the carried indices, how many of the
  * draw's follow and the vertex range they span; n = 0 is one primitive whose
  * vertices lie too far apart for a block, sent vertex by vertex. */
@@ -2292,9 +2344,9 @@ static void indexed_plan(const PvkPipeline p, const uint16_t *idx, uint32_t inde
     }
 }
 
-/* pvkCmdDrawIndexed, reporting errors under `name`. */
-static void draw_indexed(PvkCommandBuffer cmd, const char *name, uint32_t indexCount, uint32_t instanceCount,
-                         uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
+/* The batches of one indexed draw, once draw_ready() has checked and sent what the draw needs. */
+static void indexed_batches(PvkCommandBuffer cmd, const char *name, uint32_t indexCount, uint32_t instanceCount,
+                            uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
     PvkPipeline p = cmd->pipeline;
     const uint16_t *idx;
@@ -2302,7 +2354,7 @@ static void draw_indexed(PvkCommandBuffer cmd, const char *name, uint32_t indexC
     uint32_t vertexSlots, done, idone, k = 1, i, j;
     int single;
 
-    if (!draw_ready(cmd, name) || !draw_instances(cmd, name, firstInstance, instanceCount))
+    if (!draw_instances(cmd, name, firstInstance, instanceCount))
         return;
     if (!cmd->indexBuffer) {
         pvk_error("%s needs an index buffer bound with pvkCmdBindIndexBuffer\n", name);
@@ -2384,6 +2436,14 @@ static void draw_indexed(PvkCommandBuffer cmd, const char *name, uint32_t indexC
     }
 }
 
+/* pvkCmdDrawIndexed, reporting errors under `name`. */
+static void draw_indexed(PvkCommandBuffer cmd, const char *name, uint32_t indexCount, uint32_t instanceCount,
+                         uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
+{
+    if (draw_ready(cmd, name))
+        indexed_batches(cmd, name, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+}
+
 void pvkCmdDraw(PvkCommandBuffer cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
                 uint32_t firstInstance)
 {
@@ -2440,21 +2500,47 @@ static int indirect_first_instance(PvkCommandBuffer cmd, const char *name, uint3
     return 1;
 }
 
+/* Records an indirect call: what is bound, a stop of the chain, and a NEXT tag its draws' chain goes behind. */
+static void cmd_indirect(PvkCommandBuffer cmd, int kind, const uint8_t *at, uint32_t drawCount, uint32_t stride)
+{
+    struct PvkReadback stop = { 0 };
+    struct PvkIndirect *in;
+
+    if (!array_grow(cmd, (void **)&cmd->indirects, cmd->indirectCount, &cmd->indirectCap, sizeof(*cmd->indirects)) ||
+        !array_grow(cmd, (void **)&cmd->readbacks, cmd->readbackCount, &cmd->readbackCap, sizeof(*cmd->readbacks)) ||
+        !cmd_reserve(cmd, 8))
+        return;
+    in = &cmd->indirects[cmd->indirectCount++];
+    memset(in, 0, sizeof(*in));
+    in->kind      = kind;
+    in->at        = at;
+    in->drawCount = drawCount;
+    in->stride    = stride;
+    in->pipeline  = cmd->pipeline;
+    memcpy(in->sets, cmd->sets, sizeof(in->sets));
+    memcpy(in->vertexBuffers, cmd->vertexBuffers, sizeof(in->vertexBuffers));
+    memcpy(in->vertexOffsets, cmd->vertexOffsets, sizeof(in->vertexOffsets));
+    in->indexBuffer = cmd->indexBuffer;
+    in->indexOffset = cmd->indexOffset;
+    /* The chain stops here until the draws are built, then goes on at the tag. */
+    stop.indirectCmd   = cmd;
+    stop.indirectIndex = cmd->indirectCount - 1;
+    cmd_vu1_readback(cmd, &stop);
+    in->jump = (qword_t *)cmd->packet.next;
+    packet2_chain_next(&cmd->packet, (const dma_tag_t *)(in->jump + 1), 0, 0, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_chain_close_tag(&cmd->packet);
+}
+
 void pvkCmdDrawIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, uint32_t drawCount, uint32_t stride)
 {
     const uint8_t *at = indirect_commands(cmd, "pvkCmdDrawIndirect", buffer, offset, drawCount, stride,
                                           sizeof(PvkDrawIndirectCommand));
-    uint32_t i;
 
-    if (!at || !draw_ready(cmd, "pvkCmdDrawIndirect"))
+    if (!at || !draw_ready(cmd, "pvkCmdDrawIndirect") || !drawCount)
         return;
-    for (i = 0; i < drawCount && !cmd->failed; i++, at += stride) {
-        PvkDrawIndirectCommand c;
-        memcpy(&c, at, sizeof c);
-        if (!indirect_first_instance(cmd, "pvkCmdDrawIndirect", c.firstInstance))
-            return;
-        draw(cmd, "pvkCmdDrawIndirect", c.vertexCount, c.instanceCount, c.firstVertex, c.firstInstance);
-    }
+    cmd_indirect(cmd, 0, at, drawCount, stride);
 }
 
 void pvkCmdDrawIndexedIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, uint32_t drawCount,
@@ -2462,18 +2548,32 @@ void pvkCmdDrawIndexedIndirect(PvkCommandBuffer cmd, PvkBuffer buffer, size_t of
 {
     const uint8_t *at = indirect_commands(cmd, "pvkCmdDrawIndexedIndirect", buffer, offset, drawCount, stride,
                                           sizeof(PvkDrawIndexedIndirectCommand));
-    uint32_t i;
 
-    if (!at || !draw_ready(cmd, "pvkCmdDrawIndexedIndirect"))
+    if (!at || !draw_ready(cmd, "pvkCmdDrawIndexedIndirect") || !drawCount)
         return;
-    for (i = 0; i < drawCount && !cmd->failed; i++, at += stride) {
-        PvkDrawIndexedIndirectCommand c;
-        memcpy(&c, at, sizeof c);
-        if (!indirect_first_instance(cmd, "pvkCmdDrawIndexedIndirect", c.firstInstance))
-            return;
-        draw_indexed(cmd, "pvkCmdDrawIndexedIndirect", c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset,
-                     c.firstInstance);
+    if (!cmd->indexBuffer) {
+        pvk_error("pvkCmdDrawIndexedIndirect needs an index buffer bound with pvkCmdBindIndexBuffer\n");
+        cmd->failed = 1;
+        return;
     }
+    cmd_indirect(cmd, 1, at, drawCount, stride);
+}
+
+/* Ends the chain behind a VU1 program that writes storage blocks: the DIRECT block's FLUSH waits
+ * for the program, the SIGNAL stops the chain until the INTC_GS handler has copied the blocks out. */
+static void cmd_vu1_readback(PvkCommandBuffer cmd, struct PvkReadback *rb)
+{
+    qword_t *q = cmd_open_direct(cmd);
+
+    q = gs_ad(q, GIF_SET_TAG(1, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
+    q = gs_ad(q, GS_SET_SIGNAL(PVK_READBACK_SIGNAL_BIT | cmd->pool->family << 8, 0xFFFFFFFF), GS_REG_SIGNAL);
+    cmd_close_direct(cmd, q);
+    packet2_chain_open_end(&cmd->packet, 0, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_vif_nop(&cmd->packet, 0);
+    packet2_chain_close_tag(&cmd->packet);
+    rb->resume = (qword_t *)cmd->packet.next;
+    cmd->readbacks[cmd->readbackCount++] = *rb;
 }
 
 /* The buffer range the compute shader's block at (set, binding) reads, from the descriptor set
@@ -2624,21 +2724,317 @@ void pvkCmdDispatch(PvkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCo
         }
     }
     packet2_utils_vu_add_start_program(&cmd->packet, 0);
-    if (!rb.vu1Count)
+    if (rb.vu1Count)
+        cmd_vu1_readback(cmd, &rb);
+}
+
+/* The buffer range a mesh pipeline's storage block reads, from the set bound at the graphics
+ * bind point; NULL fails the buffer. */
+static const struct PvkDescriptorSlot *mesh_storage_slot(PvkCommandBuffer cmd, const char *who, const PvkShaderCode *code,
+                                                         const PvkShaderStorageBlock *s, uint32_t slot)
+{
+    PvkDescriptorSet set = bound_set(cmd, who, s->set, slot, shader_what(code), code->name, s->binding);
+    const struct PvkDescriptorSlot *d;
+
+    if (!set)
+        return NULL;
+    d = &set->slots[slot];
+    if (!d->buffer || d->range < s->bytes || d->offset + (d->range + 15) / 16 * 16 > d->buffer->size) {
+        pvk_error("%s: the storage block at set %u, binding %u of %s '%s' is %u bytes, but the bound buffer range "
+                  "holds %u\n", who, (unsigned)s->set, (unsigned)s->binding, shader_what(code), code->name,
+                  (unsigned)s->bytes, d->buffer ? (unsigned)d->range : 0u);
+        cmd->failed = 1;
+        return NULL;
+    }
+    return d;
+}
+
+/* The 8 header qwords of a mesh or task program: the work group counts as floats and as ints,
+ * each storage block's first qword and last element, the invocation qwords, the array lengths. */
+static void mesh_header(PvkCommandBuffer cmd, uint32_t gx, uint32_t gy, uint32_t gz, const uint32_t *base,
+                        const float *last, const float *lengths)
+{
+    uint32_t i;
+
+    packet2_add_float(&cmd->packet, (float)gx);
+    packet2_add_float(&cmd->packet, (float)gy);
+    packet2_add_float(&cmd->packet, (float)gz);
+    packet2_add_float(&cmd->packet, 0.0f);
+    packet2_add_u32(&cmd->packet, gx);
+    packet2_add_u32(&cmd->packet, gy);
+    packet2_add_u32(&cmd->packet, gz);
+    packet2_add_u32(&cmd->packet, 0);
+    for (i = 0; i < 4; i++)
+        packet2_add_u32(&cmd->packet, base[i]);
+    for (i = 0; i < 4; i++)
+        packet2_add_float(&cmd->packet, last[i]);
+    for (i = 0; i < 12; i++)
+        packet2_add_u32(&cmd->packet, 0);
+    for (i = 0; i < 4; i++)
+        packet2_add_float(&cmd->packet, lengths[i]);
+}
+
+/* The work group counts a mesh draw may have; `task` names the limit for the message. */
+static int mesh_counts(const char *who, uint32_t gx, uint32_t gy, uint32_t gz, int task)
+{
+    if (gx > 65535 || gy > 65535 || gz > 65535) {
+        pvk_error("%s: %u x %u x %u work groups; at most 65535 along each axis (%s)\n", who, (unsigned)gx, (unsigned)gy,
+                  (unsigned)gz, task ? "maxTaskWorkGroupCount" : "maxMeshWorkGroupCount");
+        return 0;
+    }
+    if ((uint64_t)gx * gy * gz > 0xffffffffu) {
+        pvk_error("%s: %u x %u x %u work groups; at most 4294967295 together (%s)\n", who, (unsigned)gx, (unsigned)gy,
+                  (unsigned)gz, task ? "maxTaskWorkGroupTotalCount" : "maxMeshWorkGroupTotalCount");
+        return 0;
+    }
+    return 1;
+}
+
+/* A mesh draw. With `in`, an indirect one: the chain stops in front of it for its counts and VU1 start. */
+static void draw_mesh_tasks(PvkCommandBuffer cmd, const char *who, uint32_t gx, uint32_t gy, uint32_t gz,
+                            struct PvkIndirect *in)
+{
+    const struct PvkDescriptorSlot *sslot[2][PVK_MAX_STORAGE_BLOCKS];
+    const PvkShaderCode *shader[2];
+    const uint32_t *slotOf[2];
+    struct PvkReadback rb = { 0 };
+    uint32_t base[2][4] = { { 0 } }, qwords[2][4] = { { 0 } }, chunks = 0, next, i, k, done, fst, n = 0, limit;
+    uint32_t *counts, *mscal;
+    float last[2][4] = { { 0 } }, lengths[2][4] = { { 0 } };
+    u64 regs = 0;
+    PvkPipeline p;
+
+    if (!draw_ready_kind(cmd, who, 1))
+        return;
+    p = cmd->pipeline;
+    shader[0] = p->vs;
+    shader[1] = p->ts;
+    slotOf[0] = p->storageSlots;
+    slotOf[1] = p->taskStorageSlots;
+    if (!mesh_counts(who, gx, gy, gz, p->ts != NULL)) {
+        cmd->failed = 1;
+        return;
+    }
+
+    /* The task payload and the task shader's shared variables, then the mesh shader's storage blocks,
+     * then the task shader's; the mesh shader's shared variables end the room below its outputs. */
+    next  = PVK_VU1_PAYLOAD_ADDR + (p->ts ? (p->ts->payloadBytes + 15) / 16 + p->ts->sharedBytes / 16 : 0);
+    limit = p->vs->meshOutputAddress - p->vs->sharedBytes / 16;
+    for (k = 0; k < 2; k++) {
+        for (i = 0; shader[k] && i < shader[k]->storageBlockCount; i++) {
+            const PvkShaderStorageBlock *s = &shader[k]->storageBlocks[i];
+
+            if (!(sslot[k][i] = mesh_storage_slot(cmd, who, shader[k], s, slotOf[k][i])))
+                return;
+            qwords[k][i] = (uint32_t)((sslot[k][i]->range + 15) / 16);
+            base[k][i]   = next;
+            next        += qwords[k][i];
+            chunks      += (qwords[k][i] + PVK_MAX_UNPACK_QWORDS - 1) / PVK_MAX_UNPACK_QWORDS;
+            if (s->arrayStride && sslot[k][i]->range > s->arrayOffset)
+                lengths[k][i] = (float)((sslot[k][i]->range - s->arrayOffset) / s->arrayStride);
+            last[k][i] = lengths[k][i] > 0.0f ? lengths[k][i] - 1.0f : 0.0f;
+            if (s->written) {
+                rb.vu1[rb.vu1Count].dst   = (uint8_t *)sslot[k][i]->buffer->data + sslot[k][i]->offset;
+                rb.vu1[rb.vu1Count].qword = base[k][i];
+                rb.vu1[rb.vu1Count].bytes = (uint32_t)sslot[k][i]->range;
+                rb.vu1Count++;
+            }
+        }
+    }
+    if (next > limit) {
+        pvk_error("%s: the task payload, the task shader's shared variables and the storage blocks bound to mesh "
+                  "shader '%s' and its task shader take %u bytes together; this pipeline's mesh draws have %u "
+                  "(PVK_MAX_MESH_MEMORY_BYTES less the mesh shader's shared variables and outputs)\n", who,
+                  p->vs->name, (unsigned)(next - PVK_VU1_PAYLOAD_ADDR) * 16,
+                  (unsigned)(limit - PVK_VU1_PAYLOAD_ADDR) * 16);
+        cmd->failed = 1;
+        return;
+    }
+    if (!in && (!gx || !gy || !gz))
+        return;
+    if (!cmd_reserve(cmd, 56 + 2 * chunks) ||
+        ((rb.vu1Count || in) && !array_grow(cmd, (void **)&cmd->readbacks, cmd->readbackCount, &cmd->readbackCap,
+                                            sizeof(*cmd->readbacks))) ||
+        (in && !array_grow(cmd, (void **)&cmd->indirects, cmd->indirectCount, &cmd->indirectCap,
+                           sizeof(*cmd->indirects))))
         return;
 
-    /* The DIRECT block's FLUSH waits for the program to end; the SIGNAL stops the chain here
-     * until the INTC_GS handler has copied the written blocks out of VU1 data memory. */
-    {
-        qword_t *q = cmd_open_direct(cmd);
-        q = gs_ad(q, GIF_SET_TAG(1, 1, 0, 0, GIF_FLG_PACKED, 1), GIF_REG_AD);
-        q = gs_ad(q, GS_SET_SIGNAL(PVK_READBACK_SIGNAL_BIT | cmd->pool->family << 8, 0xFFFFFFFF), GS_REG_SIGNAL);
-        cmd_close_direct(cmd, q);
+    /* [ST or UV,] RGBAQ, [FOG,] XYZ2: the order VU1 stores a vertex in. */
+    fst = cmd_fst(cmd);
+    if (p->texcoordOut)
+        regs |= (u64)(fst ? GIF_REG_UV : GIF_REG_ST) << (4 * n++);
+    regs |= (u64)GIF_REG_RGBAQ << (4 * n++);
+    if (p->fogOut)
+        regs |= (u64)GIF_REG_FOG << (4 * n++);
+    regs |= (u64)GIF_REG_XYZ2 << (4 * n++);
+
+    if (in) {
+        struct PvkReadback stop = { 0 };
+
+        stop.indirectCmd   = cmd;
+        stop.indirectIndex = cmd->indirectCount;
+        cmd_vu1_readback(cmd, &stop);
     }
-    packet2_chain_open_end(&cmd->packet, 0, 0);
-    packet2_vif_nop(&cmd->packet, 0);
-    packet2_vif_nop(&cmd->packet, 0);
-    packet2_chain_close_tag(&cmd->packet);
-    rb.resume = (qword_t *)cmd->packet.next;
-    cmd->readbacks[cmd->readbackCount++] = rb;
+
+    /* VU1 must be idle before its headers change. A task shader sets the mesh header's counts. */
+    cmd_flush(cmd);
+    packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_MESH_ADDR, 0);
+    counts = (uint32_t *)cmd->packet.next;
+    mesh_header(cmd, p->ts ? 0 : gx, p->ts ? 0 : gy, p->ts ? 0 : gz, base[0], last[0], lengths[0]);
+    packet2_add_2x_s64(&cmd->packet, GIF_SET_TAG(0, 1, 1, p->prim | (fst ? PVK_PRIM_FST : 0), GIF_FLG_PACKED, p->outputQwords),
+                       regs);
+    packet2_add_u32(&cmd->packet, 0);
+    packet2_add_u32(&cmd->packet, fst);
+    packet2_add_u32(&cmd->packet, p->cullSign != 0.0f);
+    packet2_add_u32(&cmd->packet, 0);
+    packet2_add_float(&cmd->packet, 0.0f);
+    packet2_add_float(&cmd->packet, 0.0f);
+    packet2_add_float(&cmd->packet, p->cullSign);
+    packet2_add_float(&cmd->packet, 0.0f);
+    packet2_add_u32(&cmd->packet, 0);
+    packet2_add_u32(&cmd->packet, 0);
+    packet2_add_u32(&cmd->packet, 0);
+    packet2_add_u32(&cmd->packet, p->vs->meshKickAddress);
+    packet2_utils_vu_close_unpack(&cmd->packet);
+    if (p->ts) {
+        packet2_utils_vu_open_unpack(&cmd->packet, PVK_VU1_TASK_ADDR, 0);
+        counts = (uint32_t *)cmd->packet.next;
+        mesh_header(cmd, gx, gy, gz, base[1], last[1], lengths[1]);
+        packet2_utils_vu_close_unpack(&cmd->packet);
+    }
+    for (k = 0; k < 2; k++) {
+        for (i = 0; shader[k] && i < shader[k]->storageBlockCount; i++) {
+            for (done = 0; done < qwords[k][i]; done += PVK_MAX_UNPACK_QWORDS) {
+                uint32_t count = qwords[k][i] - done < PVK_MAX_UNPACK_QWORDS ? qwords[k][i] - done : PVK_MAX_UNPACK_QWORDS;
+                packet2_utils_vu_add_unpack_data(&cmd->packet, base[k][i] + done,
+                                                 (uint8_t *)sslot[k][i]->buffer->data + sslot[k][i]->offset + (size_t)done * 16,
+                                                 count, 0);
+            }
+        }
+    }
+    /* The tag's four words: the DMA tag, a VIF FLUSH, the MSCAL. */
+    mscal = (uint32_t *)cmd->packet.next + 3;
+    packet2_utils_vu_add_start_program(&cmd->packet, p->meshEntry);
+    if (in) {
+        in->counts    = counts;
+        in->mscal     = mscal;
+        in->mscalCode = *mscal;
+        in->task      = p->ts != NULL;
+        cmd->indirects[cmd->indirectCount++] = *in;
+    }
+    if (rb.vu1Count && array_grow(cmd, (void **)&cmd->readbacks, cmd->readbackCount, &cmd->readbackCap,
+                                  sizeof(*cmd->readbacks)))
+        cmd_vu1_readback(cmd, &rb);
+}
+
+void pvkCmdDrawMeshTasksEXT(PvkCommandBuffer cmd, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
+{
+    draw_mesh_tasks(cmd, "pvkCmdDrawMeshTasksEXT", groupCountX, groupCountY, groupCountZ, NULL);
+}
+
+void pvkCmdDrawMeshTasksIndirectEXT(PvkCommandBuffer cmd, PvkBuffer buffer, size_t offset, uint32_t drawCount,
+                                    uint32_t stride)
+{
+    const uint8_t *at = indirect_commands(cmd, "pvkCmdDrawMeshTasksIndirectEXT", buffer, offset, drawCount, stride,
+                                          sizeof(PvkDrawMeshTasksIndirectCommandEXT));
+    uint32_t i;
+
+    if (!at)
+        return;
+    for (i = 0; i < drawCount && !cmd->failed; i++, at += stride) {
+        struct PvkIndirect in = { .kind = 2, .at = at, .drawCount = 1 };
+        draw_mesh_tasks(cmd, "pvkCmdDrawMeshTasksIndirectEXT", 1, 1, 1, &in);
+    }
+}
+
+/* Builds one indirect call's draws from its commands as the buffer holds them now; a failed call draws nothing. */
+static PvkResult indirect_build(PvkCommandBuffer cmd, struct PvkIndirect *in)
+{
+    static const char *const names[] = { "pvkCmdDrawIndirect", "pvkCmdDrawIndexedIndirect",
+                                         "pvkCmdDrawMeshTasksIndirectEXT" };
+    static struct PvkCommandBuffer_T t;
+    const char *name = names[in->kind];
+    const uint8_t *at;
+    uint32_t cap = 256, i;
+
+    if (in->kind == 2) {
+        PvkDrawMeshTasksIndirectCommandEXT c;
+        float f[4];
+
+        memcpy(&c, in->at, sizeof c);
+        *in->mscal = 0;
+        if (!mesh_counts(name, c.groupCountX, c.groupCountY, c.groupCountZ, in->task))
+            return PVK_ERROR_VALIDATION_FAILED;
+        f[0] = (float)c.groupCountX;
+        f[1] = (float)c.groupCountY;
+        f[2] = (float)c.groupCountZ;
+        f[3] = 0.0f;
+        memcpy(in->counts, f, sizeof f);
+        memcpy(in->counts + 4, &c, sizeof c);
+        *in->mscal = c.groupCountX && c.groupCountY && c.groupCountZ ? in->mscalCode : 0;
+        return PVK_SUCCESS;
+    }
+
+    ((dma_tag_t *)in->jump)->ADDR = (u32)(in->jump + 1);
+    for (;;) {
+        free(in->chain);
+        in->chain = memalign(64, (size_t)cap * 16);
+        if (!in->chain) {
+            pvk_error("%s: out of EE RAM for the draws' %u-qword chain\n", name, (unsigned)cap);
+            return PVK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        memset(&t, 0, sizeof(t));
+        t.device      = cmd->device;
+        t.pool        = cmd->pool;
+        t.replay      = 1;
+        t.pipeline    = in->pipeline;
+        memcpy(t.sets, in->sets, sizeof(t.sets));
+        memcpy(t.vertexBuffers, in->vertexBuffers, sizeof(t.vertexBuffers));
+        memcpy(t.vertexOffsets, in->vertexOffsets, sizeof(t.vertexOffsets));
+        t.indexBuffer = in->indexBuffer;
+        t.indexOffset = in->indexOffset;
+        t.packet      = cmd->packet;
+        t.packet.base = t.packet.next = in->chain;
+        t.packet.max_qwords_count   = (u16)cap;
+        t.packet.tag_opened_at      = NULL;
+        t.packet.vif_code_opened_at = NULL;
+
+        for (i = 0, at = in->at; i < in->drawCount && !t.failed; i++, at += in->stride) {
+            if (in->kind == 0) {
+                PvkDrawIndirectCommand c;
+                memcpy(&c, at, sizeof c);
+                if (indirect_first_instance(&t, name, c.firstInstance))
+                    draw_batches(&t, name, c.vertexCount, c.instanceCount, c.firstVertex, c.firstInstance);
+            } else {
+                PvkDrawIndexedIndirectCommand c;
+                memcpy(&c, at, sizeof c);
+                if (indirect_first_instance(&t, name, c.firstInstance))
+                    indexed_batches(&t, name, c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset,
+                                    c.firstInstance);
+            }
+        }
+        /* Back to the recording, at the tag behind the one that led here. */
+        if (cmd_reserve(&t, 1)) {
+            packet2_chain_next(&t.packet, (const dma_tag_t *)(in->jump + 1), 0, 0, 0);
+            packet2_vif_nop(&t.packet, 0);
+            packet2_vif_nop(&t.packet, 0);
+            packet2_chain_close_tag(&t.packet);
+        }
+        if (t.failed != 2)
+            break;
+        if (cap == 0xffff) {
+            pvk_error("%s: the draws take more than 65535 chain qwords\n", name);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        cap = cap * 2 > 0xffff ? 0xffff : cap * 2;
+    }
+    if (t.failed)
+        return PVK_ERROR_VALIDATION_FAILED;
+    ((dma_tag_t *)in->jump)->ADDR = (u32)in->chain;
+    return PVK_SUCCESS;
+}
+
+PvkResult pvk_cmd_build_indirect(PvkCommandBuffer cmd, uint32_t index)
+{
+    return indirect_build(cmd, &cmd->indirects[index]);
 }

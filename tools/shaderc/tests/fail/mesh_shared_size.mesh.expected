@@ -1,0 +1,1 @@
+mesh_shared_size.mesh: error: shared variables take 4800 bytes of VU1 memory with 'big', a 16-byte qword per scalar, vector or matrix column; at most 4096 (maxMeshSharedMemorySize)

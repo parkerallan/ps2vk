@@ -28,6 +28,18 @@
  *   16  uniform buffers: the compute shader's uniform blocks, placed as above
  *   16 + the qwords those take: storage blocks, one after another in (set,
  *       binding) order, each the bound buffer range in whole qwords
+ *
+ * A mesh draw keeps qwords 0 to 79 as above; the task shader's uniform blocks
+ * are packed against the end of the uniform area.
+ *
+ *   80  mesh header: the 8 header and invocation qwords of a compute dispatch
+ *   88  GIF tag of a kick, state, culling sign, SetMeshOutputsEXT counts
+ *   92  task header: the same 8 qwords, the next work group, the groups left
+ *   102 task payload, then the mesh and the task shader's storage blocks
+ *   top the mesh shader's outputs: a record per vertex (gl_Position, color,
+ *       texture coordinate, fog: a qword each), a record per primitive (indices
+ *       in x, y, z, gl_CullPrimitiveEXT in w; a per-primitive color), and two
+ *       GIF packets kicked in turn
  */
 #ifndef PS2VK_VU1_LAYOUT_H
 #define PS2VK_VU1_LAYOUT_H
@@ -84,6 +96,30 @@
 #define PVK_VU1_COMPUTE_LENGTHS   15  /* x..w: floats, elements in each block's runtime array */
 #define PVK_VU1_STORAGE_ADDR      16  /* plus the qwords of the shader's uniform blocks */
 #define PVK_VU1_STORAGE_BASE_REG  9   /* VI09..VI12 hold the storage blocks' first qwords */
+
+/* Mesh and task header qwords, in the order of the compute ones above. */
+#define PVK_VU1_HEADER_GROUPS     0
+#define PVK_VU1_HEADER_COUNTS     1
+#define PVK_VU1_HEADER_BASES      2
+#define PVK_VU1_HEADER_LAST       3
+#define PVK_VU1_HEADER_WORKGROUP  4
+#define PVK_VU1_HEADER_LOCAL      5
+#define PVK_VU1_HEADER_GLOBAL     6
+#define PVK_VU1_HEADER_LENGTHS    7
+#define PVK_VU1_HEADER_QWORDS     8
+
+#define PVK_VU1_MESH_ADDR         80
+#define PVK_VU1_MESH_GIFTAG       88  /* NLOOP 0 with EOP; a kick writes its vertex count */
+#define PVK_VU1_MESH_STATE        89  /* ints. x: micro address to return to, 0 = stop; y: 1 = UV, not ST;
+                                         z: 1 = cull by winding; w: 1 = the task group emitted mesh tasks */
+#define PVK_VU1_MESH_CULL         90  /* z: float, winding sign (signed area * z < 0 = cull) */
+#define PVK_VU1_MESH_OUTPUTS      91  /* ints. x: vertices, y: primitives; w: GIF packet the next kick fills */
+#define PVK_VU1_TASK_ADDR         92
+#define PVK_VU1_TASK_NEXT         100 /* x, y, z: floats, gl_WorkGroupID of the next task work group */
+#define PVK_VU1_TASK_LEFT         101 /* x, y, z: ints, task work groups left along each axis */
+#define PVK_VU1_PAYLOAD_ADDR      102
+#define PVK_VU1_MESH_ENTRY        1   /* pair a mesh program starts at alone; pair 0 is the task's entry */
+#define PVK_VU1_MESH_KICK_QWORDS  61  /* most qwords of one kicked GIF packet */
 
 /* VU1 micro memory, in instruction pairs; the last 4 hold the routine that XGKICKs the frame packet. */
 #define PVK_VU1_MICRO_PAIRS       2048

@@ -1,0 +1,22 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Three rows of 16 points: each of the work group's 3 invocations writes one row.
+layout(local_size_x = 3) in;
+layout(points, max_vertices = 48, max_primitives = 48) out;
+
+layout(location = 0) out vec4 vColor[];
+
+void main()
+{
+    int row = int(gl_LocalInvocationID.x);
+
+    SetMeshOutputsEXT(48, 48);
+    [[dont_unroll]] for (int i = 0; i < 16; i++) {
+        int v = row * 16 + i;
+        gl_MeshVerticesEXT[v].gl_Position = vec4(0.15 + 0.045 * float(i), 0.72 + 0.04 * float(row), 0.5, 1.0);
+        vColor[v] = vec4(1.0, 1.0, 1.0, 1.0);
+        gl_PrimitivePointIndicesEXT[v] = v;
+    }
+}

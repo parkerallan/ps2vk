@@ -1,0 +1,1 @@
+mesh_clip_distance.mesh: error: shader needs SPIR-V capability 32, which the PS2 does not support

@@ -1,0 +1,1 @@
+mesh_per_primitive_vec2.mesh: error: per-primitive mesh output 'pUV' must be a vec4 (the color); the GS takes nothing else per primitive

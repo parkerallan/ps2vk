@@ -55,6 +55,44 @@ static const PvkPhysicalDeviceLineRasterizationFeatures supported_line_features 
     .smoothLines    = 1,
 };
 
+/* VU1 runs both stages; the GS has one view, shades every pixel and counts nothing. */
+static const PvkPhysicalDeviceMeshShaderFeaturesEXT supported_mesh_features = {
+    .taskShader = 1,
+    .meshShader = 1,
+};
+
+static const PvkPhysicalDeviceMeshShaderPropertiesEXT mesh_properties = {
+    .maxTaskWorkGroupTotalCount           = 0xffffffffu,
+    .maxTaskWorkGroupCount                = { 65535, 65535, 65535 },
+    .maxTaskWorkGroupInvocations          = PVK_MAX_COMPUTE_WORK_GROUP_SIZE * PVK_MAX_COMPUTE_WORK_GROUP_SIZE *
+                                            PVK_MAX_COMPUTE_WORK_GROUP_SIZE,
+    .maxTaskWorkGroupSize                 = { PVK_MAX_COMPUTE_WORK_GROUP_SIZE, PVK_MAX_COMPUTE_WORK_GROUP_SIZE,
+                                              PVK_MAX_COMPUTE_WORK_GROUP_SIZE },
+    .maxTaskPayloadSize                   = PVK_MAX_TASK_PAYLOAD_BYTES,
+    .maxTaskSharedMemorySize              = PVK_MAX_SHARED_BYTES,
+    .maxTaskPayloadAndSharedMemorySize    = PVK_MAX_TASK_PAYLOAD_BYTES + PVK_MAX_SHARED_BYTES,
+    .maxMeshWorkGroupTotalCount           = 0xffffffffu,
+    .maxMeshWorkGroupCount                = { 65535, 65535, 65535 },
+    .maxMeshWorkGroupInvocations          = PVK_MAX_COMPUTE_WORK_GROUP_SIZE * PVK_MAX_COMPUTE_WORK_GROUP_SIZE *
+                                            PVK_MAX_COMPUTE_WORK_GROUP_SIZE,
+    .maxMeshWorkGroupSize                 = { PVK_MAX_COMPUTE_WORK_GROUP_SIZE, PVK_MAX_COMPUTE_WORK_GROUP_SIZE,
+                                              PVK_MAX_COMPUTE_WORK_GROUP_SIZE },
+    .maxMeshSharedMemorySize              = PVK_MAX_SHARED_BYTES,
+    .maxMeshPayloadAndSharedMemorySize    = PVK_MAX_TASK_PAYLOAD_BYTES + PVK_MAX_SHARED_BYTES,
+    .maxMeshOutputMemorySize              = PVK_MAX_MESH_OUTPUT_BYTES,
+    .maxMeshPayloadAndOutputMemorySize    = PVK_MAX_MESH_OUTPUT_BYTES,
+    .maxMeshOutputComponents              = 7,
+    .maxMeshOutputVertices                = PVK_MAX_MESH_OUTPUT_VERTICES,
+    .maxMeshOutputPrimitives              = PVK_MAX_MESH_OUTPUT_PRIMITIVES,
+    .maxMeshOutputLayers                  = 1,
+    .maxMeshMultiviewViewCount            = 1,
+    .meshOutputPerVertexGranularity       = 1,
+    .meshOutputPerPrimitiveGranularity    = 1,
+    .maxPreferredTaskWorkGroupInvocations = 1,
+    .maxPreferredMeshWorkGroupInvocations = 1,
+    .prefersCompactVertexOutput           = 1,
+};
+
 PvkResult pvkCreateInstance(const PvkInstanceCreateInfo *info, PvkInstance *instance)
 {
     (void)info;
@@ -117,6 +155,13 @@ void pvkGetPhysicalDeviceFeatures2(PvkPhysicalDevice physicalDevice, PvkPhysical
             *f = supported_line_features;
             f->sType = PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES;
             f->pNext = next;
+        } else if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT) {
+            PvkPhysicalDeviceMeshShaderFeaturesEXT *f = (PvkPhysicalDeviceMeshShaderFeaturesEXT *)s;
+            void *next = f->pNext;
+
+            *f = supported_mesh_features;
+            f->sType = PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
+            f->pNext = next;
         }
 }
 
@@ -131,9 +176,17 @@ void pvkGetPhysicalDeviceProperties2(PvkPhysicalDevice physicalDevice, PvkPhysic
     }
     pvkGetPhysicalDeviceProperties(physicalDevice, &properties->properties);
     for (s = properties->pNext; s; s = s->pNext)
-        if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES)
+        if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES) {
             ((PvkPhysicalDeviceLineRasterizationProperties *)s)->lineSubPixelPrecisionBits =
                 pvk_limits.subPixelPrecisionBits;
+        } else if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT) {
+            PvkPhysicalDeviceMeshShaderPropertiesEXT *m = (PvkPhysicalDeviceMeshShaderPropertiesEXT *)s;
+            void *next = m->pNext;
+
+            *m = mesh_properties;
+            m->sType = PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT;
+            m->pNext = next;
+        }
 }
 
 void pvkGetPhysicalDeviceMemoryProperties(PvkPhysicalDevice physicalDevice, PvkPhysicalDeviceMemoryProperties *properties)
@@ -179,6 +232,7 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
     int families[PVK_MAX_QUEUE_FAMILIES] = { 0 };
     const PvkPhysicalDeviceFeatures *enabled;
     const PvkPhysicalDeviceLineRasterizationFeatures *lines = NULL;
+    const PvkPhysicalDeviceMeshShaderFeaturesEXT *mesh = NULL;
     const struct PvkBaseStructure *s;
     uint32_t i;
 
@@ -198,6 +252,8 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
             enabled = &((const PvkPhysicalDeviceFeatures2 *)s)->features;
         } else if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES) {
             lines = (const PvkPhysicalDeviceLineRasterizationFeatures *)s;
+        } else if (s->sType == PVK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT) {
+            mesh = (const PvkPhysicalDeviceMeshShaderFeaturesEXT *)s;
         }
     }
     if (!info->queueCreateInfoCount) {
@@ -236,6 +292,15 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
             return PVK_ERROR_FEATURE_NOT_PRESENT;
         }
     }
+    if (mesh) {
+        const char *missing = mesh->multiviewMeshShader ? "multiviewMeshShader"
+                            : mesh->primitiveFragmentShadingRateMeshShader ? "primitiveFragmentShadingRateMeshShader"
+                            : mesh->meshShaderQueries ? "meshShaderQueries" : NULL;
+        if (missing) {
+            pvk_error("pvkCreateDevice: %s is not supported\n", missing);
+            return PVK_ERROR_FEATURE_NOT_PRESENT;
+        }
+    }
     if (enabled) {
         const PvkPhysicalDeviceFeatures *f = enabled;
         const char *missing = f->robustBufferAccess && !supported_features.robustBufferAccess ? "robustBufferAccess"
@@ -259,6 +324,8 @@ PvkResult pvkCreateDevice(PvkPhysicalDevice physicalDevice, const PvkDeviceCreat
         dev->features = *enabled;
     if (lines)
         dev->lineFeatures = *lines;
+    if (mesh)
+        dev->meshFeatures = *mesh;
     /* Reset the GIF: the BIOS (OSDSYS) leaves it busy, which stalls the first
      * VIF1 DIRECT transfer forever (ps2gl does the same in glutInit). */
     GIF_REG_CTRL = 1;

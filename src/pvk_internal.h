@@ -87,7 +87,7 @@ struct PvkSubmission {
 #define PVK_READBACK_GO_BIT     0x10000000u
 #define PVK_READBACK_SETUP_QWORDS 8
 
-/* One pvkCmdCopyImageToBuffer region, or the storage blocks a dispatch wrote. The chain ends before it and goes on at `resume`. */
+/* One pvkCmdCopyImageToBuffer region, the storage blocks a dispatch wrote, or an indirect draw to build. The chain ends before it and goes on at `resume`. */
 struct PvkReadback {
     qword_t  *setup;      /* VIF1 packet: MSKPATH3, FLUSHA, the transfer registers, a SIGNAL, TRXDIR = 1 */
     qword_t  *resume;     /* DMA tag the chain goes on from */
@@ -99,12 +99,14 @@ struct PvkReadback {
     uint32_t  rows, rowBytes, outPitch;  /* staged: rows, bytes copied per row, bytes between buffer rows */
     uint32_t  stagePitch, stageSkip;     /* staged: bytes between stage rows, bytes before the region in one */
     uint32_t  tableEntries, tableFirst;  /* a color table of that size: `rows` entries from tableFirst, rowBytes each */
-    uint32_t  vu1Count;   /* a dispatch's written storage blocks, copied out of VU1 data memory; 0 for an image region */
+    PvkCommandBuffer indirectCmd; /* an indirect draw the chain stops in front of: its command buffer, else NULL */
+    uint32_t  indirectIndex;      /* and its entry in that command buffer's indirects[] */
+    uint32_t  vu1Count;   /* a dispatch's or mesh draw's written storage blocks, copied out of VU1 data memory; 0 for an image region */
     struct {
         void    *dst;     /* where in the buffer */
         uint32_t qword;   /* VU1 data memory qword the block starts at */
         uint32_t bytes;
-    } vu1[PVK_MAX_STORAGE_BLOCKS];
+    } vu1[2 * PVK_MAX_STORAGE_BLOCKS]; /* a mesh shader's and a task shader's */
 };
 
 /* A pvkCmdCopyBufferToImage region DMA cannot stream in place: packed into `stage` at submit. */
@@ -114,9 +116,28 @@ struct PvkUpload {
     uint32_t       rows, rowBytes, srcPitch;
 };
 
+/* One indirect draw call, or one command of a mesh one: its commands are read when the chain stops in front of it. */
+struct PvkIndirect {
+    int            kind;      /* 0 pvkCmdDrawIndirect, 1 pvkCmdDrawIndexedIndirect, 2 pvkCmdDrawMeshTasksIndirectEXT */
+    const uint8_t *at;        /* the first command in the buffer */
+    uint32_t       drawCount, stride;
+    qword_t       *jump;      /* kinds 0 and 1: the NEXT tag that leads into `chain` */
+    qword_t       *chain;     /* kinds 0 and 1: the draws' DMA chain, built when the chain stops; NULL until then */
+    PvkPipeline    pipeline;  /* kinds 0 and 1: what the call drew with */
+    PvkDescriptorSet sets[PVK_MAX_DESCRIPTOR_SETS];
+    PvkBuffer      vertexBuffers[PVK_MAX_VERTEX_BINDINGS];
+    size_t         vertexOffsets[PVK_MAX_VERTEX_BINDINGS];
+    PvkBuffer      indexBuffer;
+    size_t         indexOffset;
+    uint32_t      *counts;    /* kind 2: the work group counts in the chain, 4 floats then 4 ints */
+    uint32_t      *mscal;     /* kind 2: the VIF code that starts VU1, a NOP while a count is 0 */
+    uint32_t       mscalCode;
+    int            task;      /* kind 2: the counts are a task shader's */
+};
+
 /* The region the handlers are reading back; stage 0 = none. */
 struct PvkReadbackRun {
-    volatile int stage;   /* 1 waiting for the channels, 2 setup sent, 3 DMA reading */
+    volatile int stage;   /* 1 waiting for the channels, 2 setup sent, 3 DMA reading, 4 pvkQueueSubmit builds an indirect draw */
     PvkQueue     queue;   /* whose head entry stopped */
     const struct PvkReadback *rb;
     uint32_t     done, chunk; /* qwords read, qwords of the running DMA */
@@ -136,6 +157,7 @@ struct PvkQueue_T {
     struct PvkSubmission ring[PVK_MAX_PENDING_SUBMISSIONS];
     volatile uint32_t head, tail; /* ring[head..tail) are in flight */
     s32       room;         /* EE semaphore released whenever a ring entry frees */
+    s32       indirect;     /* EE semaphore released when the head chain stops in front of an indirect draw */
 };
 
 /* Sleeps until every submitted chain has run; queued presents may still wait for their vblank. */
@@ -172,6 +194,7 @@ struct PvkDevice_T {
     PvkSwapchain swapchain;   /* the one swapchain, or NULL: pvk_queue_wait_idle drains its flips */
     PvkPhysicalDeviceFeatures features;
     PvkPhysicalDeviceLineRasterizationFeatures lineFeatures; /* turned on at pvkCreateDevice */
+    PvkPhysicalDeviceMeshShaderFeaturesEXT meshFeatures;        /* turned on at pvkCreateDevice */
     uint32_t vramCount;      /* taken VRAM ranges, sorted by start: swapchain framebuffers and type 1 allocations */
     struct PvkVramRange vram[PVK_MAX_VRAM_ALLOCATIONS];
     PvkQueryPool queryPools[PVK_MAX_QUERY_POOLS]; /* by the number a SIGNAL ID carries, or NULL */
@@ -180,6 +203,8 @@ struct PvkDevice_T {
 
 /* Packs the command buffer's staged upload regions, and its secondaries', from their buffers. */
 void pvk_cmd_pack_uploads(PvkCommandBuffer cmd);
+/* Reads the commands of entry `index` of the command buffer's indirects[] and builds the draws. Not from a handler. */
+PvkResult pvk_cmd_build_indirect(PvkCommandBuffer cmd, uint32_t index);
 
 /* Takes `words` words of VRAM (a multiple of a page) at the first fit; 0 when none. */
 int  pvk_vram_alloc(PvkDevice device, uint32_t words, uint32_t *address);
@@ -371,10 +396,13 @@ struct PvkDescriptorPool_T {
  * read, one bit per word, plus the set layouts. Two layouts with equal masks
  * are push-constant compatible in Vulkan's sense. */
 struct PvkPipelineLayout_T {
-    uint32_t pushWords[3];    /* [0] vertex stage, [1] fragment stage, [2] compute stage */
+    uint32_t pushWords[5];    /* [0] vertex, [1] fragment, [2] compute, [3] task, [4] mesh stage */
     uint32_t setLayoutCount;
     struct PvkDescriptorSetLayout_T setLayouts[PVK_MAX_DESCRIPTOR_SETS];
 };
+
+#define PVK_ALL_SHADER_STAGES (PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT | PVK_SHADER_STAGE_COMPUTE_BIT | \
+                               PVK_SHADER_STAGE_TASK_BIT_EXT | PVK_SHADER_STAGE_MESH_BIT_EXT)
 
 /* Bits of a layout's word mask for the bytes [offset, offset + size). */
 uint32_t pvk_push_word_mask(uint32_t offset, uint32_t size);
@@ -415,7 +443,12 @@ struct PvkPipeline_T {
     PvkAllocationCallbacks alloc;    /* the callbacks a compute pipeline was created with */
     int                    hasAlloc;
     int      compute;         /* a compute pipeline: vs is its compute shader, and nothing below uniformSlots applies */
-    uint32_t storageSlots[PVK_MAX_STORAGE_BLOCKS]; /* compute: bindings[] slot of each vs->storageBlocks[] entry in its set layout */
+    uint32_t storageSlots[PVK_MAX_STORAGE_BLOCKS]; /* compute and mesh: bindings[] slot of each vs->storageBlocks[] entry in its set layout */
+    int      mesh;            /* a mesh pipeline: vs is its mesh shader and ts its task shader, and it has no vertex input */
+    const PvkShaderCode *ts;  /* or NULL */
+    uint32_t taskUniformSlots[PVK_MAX_UNIFORM_BLOCKS]; /* bindings[] slot of each ts->uniformBlocks[] entry */
+    uint32_t taskStorageSlots[PVK_MAX_STORAGE_BLOCKS]; /* and of each ts->storageBlocks[] entry */
+    uint32_t meshEntry;       /* instruction pair a mesh draw starts VU1 at: the task program, else the mesh program */
     const PvkShaderCode *vs;
     const PvkShaderCode *fs;
     PvkPipelineLayout    layout;
@@ -490,6 +523,9 @@ struct PvkCommandBuffer_T {
     uint32_t    readbackCount, readbackCap;
     struct PvkUpload *uploads;     /* its staged pvkCmdCopyBufferToImage regions */
     uint32_t    uploadCount, uploadCap;
+    struct PvkIndirect *indirects; /* its indirect draws */
+    uint32_t    indirectCount, indirectCap;
+    int         replay;       /* a copy pvkQueueSubmit builds an indirect call's draws with, not a recording */
     packet2_t   packet;       /* VIF1 (family 0) or GIF channel (family 1) DMA chain, inside the pool's block */
     uint32_t    signalQw;     /* qword of the GS SIGNAL at a primary's end; its ID is set at submit */
     PvkPipeline pipeline;

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Shader compiler tests. Run with `make test`.
 #
-#   pass/  happy path shaders that must compile (shaderc runs dvp-as on a vertex or compute shader's VU1 code);
+#   pass/  happy path shaders that must compile (shaderc runs dvp-as on the VU1 code of every stage but fragment);
 #          the listing (shaderc --listing: the .pvs file as text, then the VU1 assembly) must match
 #          pass/expected/
 #   fail/  unhappy path shaders that must be rejected; the error message must match
@@ -20,16 +20,19 @@ trap 'rm -rf "$OUT"' EXIT
 passed=0
 failed=0
 
+# Mesh shading needs SPIR-V 1.4, which glslangValidator writes for Vulkan 1.2.
+target() { case "$1" in *.task|*.mesh|mesh_*) echo "--target-env vulkan1.2" ;; *) echo "-V" ;; esac; }
+
 ok()   { passed=$((passed + 1)); echo "PASS $1"; }
 bad()  { failed=$((failed + 1)); echo "FAIL $1: $2"; }
 
 # ---------------------------------------------------------------- must compile
 cd "$HERE/pass"
-for src in *.vert *.frag *.comp; do
+for src in *.vert *.frag *.comp *.task *.mesh; do
     [ -e "$src" ] || continue
     name=$(echo "$src" | tr . _)
 
-    if ! glslangValidator -V -g -o "$OUT/$src.spv" "$src" >"$OUT/$name.glslang"; then
+    if ! glslangValidator $(target "$src") -g -o "$OUT/$src.spv" "$src" >"$OUT/$name.glslang"; then
         bad "$src" "glslangValidator failed: $(cat "$OUT/$name.glslang")"
         continue
     fi
@@ -51,9 +54,9 @@ done
 
 # ---------------------------------------------------------------- must be rejected
 cd "$HERE/fail"
-for src in *.vert *.frag *.comp; do
+for src in *.vert *.frag *.comp *.task *.mesh; do
     [ -e "$src" ] || continue
-    if ! glslangValidator -V -g -o "$OUT/$src.spv" "$src" >"$OUT/$src.glslang"; then
+    if ! glslangValidator $(target "$src") -g -o "$OUT/$src.spv" "$src" >"$OUT/$src.glslang"; then
         bad "$src" "glslangValidator failed: $(cat "$OUT/$src.glslang")"
         continue
     fi

@@ -7,7 +7,7 @@ EE_OBJS = src/pvk_device.o src/pvk_swapchain.o src/pvk_image.o src/pvk_sampler.o
 EE_INCS = -Iinclude
 EE_WARNFLAGS = -Wall -Wextra
 
-all: $(EE_LIB) shaderc clear triangle cube lighting rain rtt water
+all: $(EE_LIB) shaderc clear triangle cube lighting rain rtt water grass
 
 $(EE_OBJS): include/ps2vk.h include/ps2vk_vu1_layout.h src/pvk_internal.h
 
@@ -35,6 +35,9 @@ rtt: $(EE_LIB) shaderc
 water: $(EE_LIB) shaderc
 	$(MAKE) -C samples/water
 
+grass: $(EE_LIB) shaderc
+	$(MAKE) -C samples/grass
+
 test:
 	$(MAKE) -C tools/shaderc test
 
@@ -51,8 +54,9 @@ clean:
 	$(MAKE) -C samples/rain clean
 	$(MAKE) -C samples/rtt clean
 	$(MAKE) -C samples/water clean
+	$(MAKE) -C samples/grass clean
 
-.PHONY: all shaderc clear triangle cube lighting rain rtt water test docs clean
+.PHONY: all shaderc clear triangle cube lighting rain rtt water grass test docs clean
 
 # The PS2 build rules come from ps2sdk. `make test` and `make docs` run on the
 # PC alone, so they work without PS2SDK set.

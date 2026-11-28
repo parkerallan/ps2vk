@@ -1,0 +1,1 @@
+mesh_output_memory.mesh: error: mesh shader's 256 vertices of 64 bytes and 64 primitives of 16 bytes take 17408 bytes of VU1 memory; they have 12800 (maxMeshOutputMemorySize) less the task payload's 0

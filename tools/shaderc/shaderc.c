@@ -4,9 +4,11 @@
  *   .vert --glslangValidator--> .spv --shaderc--> .pvs  (VU1 microcode)
  *   .frag --glslangValidator--> .spv --shaderc--> .pvs  (GS settings)
  *   .comp --glslangValidator--> .spv --shaderc--> .pvs  (VU1 microcode)
+ *   .task --glslangValidator--> .spv --shaderc--> .pvs  (VU1 microcode)
+ *   .mesh --glslangValidator--> .spv --shaderc--> .pvs  (VU1 microcode)
  *
  * A .pvs file (PvkPvsHeader in ps2vk.h) is what pvkCreateShaderModule() takes.
- * For a vertex or compute shader shaderc writes VU1 assembly, runs dvp-as on it to get
+ * For every stage but fragment shaderc writes VU1 assembly, runs dvp-as on it to get
  * the microcode and deletes the assembly. --listing also writes <output_base>.txt:
  * the .pvs file as text, followed by that assembly.
  *
@@ -40,6 +42,12 @@
  *             struct, .length() of a runtime array, the components of
  *             gl_GlobalInvocationID, gl_LocalInvocationID, gl_WorkGroupID and
  *             gl_NumWorkGroups, and gl_LocalInvocationIndex
+ *   task:     what a compute shader computes with, the task payload and
+ *             EmitMeshTasksEXT
+ *   mesh:     what a compute shader computes with, the task payload,
+ *             SetMeshOutputsEXT, gl_MeshVerticesEXT[].gl_Position, a color,
+ *             a texture coordinate and a fog output per vertex, the primitive
+ *             index arrays, gl_CullPrimitiveEXT and a perprimitiveEXT color
  *   fragment: outColor = vColor;                      (Gouraud)
  *             outColor = texture(tex, vUV);           (GS TFX decal)
  *             outColor = texture(tex, vUV) * vColor;  (GS TFX modulate)
@@ -102,31 +110,43 @@ enum {
     OpFUnordGreaterThan = 187, OpFOrdLessThanEqual = 188, OpFUnordLessThanEqual = 189,
     OpFOrdGreaterThanEqual = 190, OpFUnordGreaterThanEqual = 191,
     OpShiftRightLogical = 194, OpBitwiseXor = 198, OpNot = 200,
+    OpControlBarrier = 224, OpMemoryBarrier = 225,
     OpPhi = 245, OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249,
     OpBranchConditional = 250, OpSwitch = 251, OpKill = 252, OpReturn = 253, OpReturnValue = 254,
     OpUnreachable = 255, OpNoLine = 317, OpModuleProcessed = 330,
     OpTerminateInvocation = 4416, OpDemoteToHelperInvocation = 5380,
+    OpEmitMeshTasksEXT = 5294, OpSetMeshOutputsEXT = 5295,
     OpDynLoad = 0x10000,            /* ours: lq of a block qword through VI08 */
     OpPhiMove = 0x10001,            /* ours: copy a value into a phi's register at the end of a block */
     OpConstLoad = 0x10002,          /* ours: lq of a push constant or uniform qword */
     OpBoolToFloat = 0x10003,        /* ours: a condition as a float, 0 = false, for a bool kept by a phi */
     OpStorLoad = 0x10004,           /* ours: lq of a storage block qword */
-    OpStorStore = 0x10005           /* ours: sq of a value into a storage block qword */
+    OpStorStore = 0x10005,          /* ours: sq of a value into a storage block qword */
+    OpEmitTasks = 0x10006,          /* ours: the mesh work group counts of a task work group, unless it has them */
+    OpBarrier = 0x10007             /* ours: barrier(): the invocation waits for the others of its work group */
 };
 #define LoopControlUnroll     1
 #define LoopControlDontUnroll 2
 
 enum { DecSpecId = 1, DecBlock = 2, DecBufferBlock = 3, DecRowMajor = 4, DecColMajor = 5, DecArrayStride = 6, DecMatrixStride = 7,
-       DecBuiltIn = 11, DecLocation = 30, DecBinding = 33, DecDescriptorSet = 34, DecOffset = 35 };
+       DecBuiltIn = 11, DecLocation = 30, DecBinding = 33, DecDescriptorSet = 34, DecOffset = 35,
+       DecPerPrimitive = 5271 };
+enum { BuiltInPointSize = 1, BuiltInClipDistance = 3, BuiltInCullDistance = 4, BuiltInPrimitiveId = 7,
+       BuiltInLayer = 9, BuiltInViewportIndex = 10, BuiltInPrimitiveShadingRate = 4432,
+       BuiltInPrimitivePointIndices = 5294, BuiltInPrimitiveLineIndices = 5295,
+       BuiltInPrimitiveTriangleIndices = 5296, BuiltInCullPrimitive = 5299 };
 enum { BuiltInPosition = 0, BuiltInNumWorkgroups = 24, BuiltInWorkgroupSize = 25, BuiltInWorkgroupId = 26,
        BuiltInLocalInvocationId = 27, BuiltInGlobalInvocationId = 28, BuiltInLocalInvocationIndex = 29,
        BuiltInInstanceIndex = 43 };
 enum { ScUniformConstant = 0, ScInput = 1, ScUniform = 2, ScOutput = 3, ScWorkgroup = 4, ScFunction = 7,
-       ScPushConstant = 9, ScStorageBuffer = 12 };
-enum { ExecVertex = 0, ExecFragment = 4, ExecGLCompute = 5 };
-enum { ExecModeLocalSize = 17, ExecModeLocalSizeId = 38 };
+       ScPushConstant = 9, ScStorageBuffer = 12, ScTaskPayload = 5402 };
+enum { ExecVertex = 0, ExecFragment = 4, ExecGLCompute = 5, ExecTask = 5364, ExecMesh = 5365 };
+enum { ExecModeLocalSize = 17, ExecModeOutputVertices = 26, ExecModeOutputPoints = 27, ExecModeLocalSizeId = 38,
+       ExecModeOutputLines = 5269, ExecModeOutputPrimitives = 5270, ExecModeOutputTriangles = 5298 };
+/* The stages VU1 runs as work groups of invocations. */
+#define IS_GROUPED(sh) ((sh)->execModel == ExecGLCompute || (sh)->execModel == ExecTask || (sh)->execModel == ExecMesh)
 /* The stages whose code runs on VU1. */
-#define IS_CODE(sh) ((sh)->execModel == ExecVertex || (sh)->execModel == ExecGLCompute)
+#define IS_CODE(sh) ((sh)->execModel == ExecVertex || IS_GROUPED(sh))
 
 /* GLSL.std.450 instruction numbers. */
 enum {
@@ -224,6 +244,11 @@ typedef struct {
     int      builtinQword;   /* pointer or uvec3 value: 1 + constant qword of a gl_ built-in vector, 0 if none */
     uint32_t smem[MAX_STRUCT_MEMBERS]; /* struct value: the value id of each member */
     int      smemCount;
+    /* mesh outputs */
+    int      perPrimitive;   /* variable: a perprimitiveEXT output */
+    int      ignored;        /* pointer: stores to it change nothing the GS draws (gl_PointSize, gl_PrimitiveID) */
+    int      cullFlag;       /* pointer: gl_CullPrimitiveEXT of one primitive */
+    int      sharedQword;    /* variable: 1 + its first qword among the shared variables, 0 if not shared */
     /* ints: VU1 computes with floats, so an int that is counted or compared is one */
     int      intIsFloat;     /* int value held as a float (a counter, a sum, a phi) */
     uint32_t asFloat;        /* int value: id of its float form once made, 0 if not yet */
@@ -264,12 +289,16 @@ typedef struct {
 /* OpMemberDecorate on struct members (push constant blocks): byte Offset, and
  * for matrix members their MatrixStride and RowMajor/ColMajor layout. */
 #define MAX_MEMBER_DECORS 256
-typedef struct { uint32_t structType, member, offset, matrixStride; int hasOffset, rowMajor; } MemberDecor;
+typedef struct { uint32_t structType, member, offset, matrixStride; int hasOffset, rowMajor, builtin; } MemberDecor;
 static MemberDecor g_memberDecors[MAX_MEMBER_DECORS];
 static int g_memberDecorCount;
 
 static const char *g_src = "shader";
-static int g_compute = 0;            /* messages name a compute shader, not a vertex shader */
+static const char *g_stage = NULL;   /* compute, task or mesh: messages name that stage's shader */
+static int g_intVectors = 0;         /* mesh and task: an int vector is a vector of the floats VU1 counts with */
+static int g_header = -1;            /* first of a mesh or task program's 8 header qwords; -1 = a compute program's */
+static int g_synBase[5];             /* VU1 address of the vertex and primitive records, output counts, payload, shared variables */
+static int g_ctxQwords = 0;          /* qwords an invocation keeps at a barrier(): where it goes on, and its registers */
 static const char *g_sym = "";       /* symbol prefix of the microcode being written */
 static int g_clamps = 0;             /* run-time index clamps labelled so far */
 #define MAX_SPECS 64
@@ -291,11 +320,12 @@ static void fail(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    /* The body compiler is shared: a compute shader's messages name its stage. */
+    /* The body compiler is shared: a compute, task or mesh shader's messages name its stage. */
     for (s = msg; *s; s++) {
-        if (g_compute && !strncmp(s, "vertex shader", 13)) {
-            fputs("compute shader", stderr);
-            s += 12;
+        int skip = !g_stage ? 0 : !strncmp(s, "vertex shader", 13) ? 6 : !strncmp(s, "compute shader", 14) ? 7 : 0;
+        if (skip) {
+            fputs(g_stage, stderr);
+            s += skip - 1;
         } else {
             fputc(*s, stderr);
         }
@@ -375,7 +405,7 @@ static void unsupported(uint32_t op, const char *stage)
 
 static uint32_t *read_spirv(const char *path, size_t *words);
 
-/* Nonzero if the module's entry point is a compute shader. */
+/* Nonzero if the module's entry point is a compute, task or mesh shader. */
 static int spirv_is_compute(const char *path)
 {
     size_t words, pc;
@@ -384,7 +414,7 @@ static int spirv_is_compute(const char *path)
 
     for (pc = 5; pc < words && code[pc] >> 16; pc += code[pc] >> 16)
         if ((code[pc] & 0xffff) == OpEntryPoint && pc + 1 < words) {
-            compute = code[pc + 1] == ExecGLCompute;
+            compute = code[pc + 1] == ExecGLCompute || code[pc + 1] == ExecTask || code[pc + 1] == ExecMesh;
             break;
         }
     free(code);
@@ -487,9 +517,15 @@ static int type_size(const IdInfo *ids, uint32_t type)
     const IdInfo *t = &ids[type];
     if (is_float(ids, type) || is_int(ids, type))
         return 1;
-    if (t->type == T_VECTOR && t->elemCount >= 2 && t->elemCount <= 4 && is_float(ids, t->elemType))
+    if (t->type == T_VECTOR && t->elemCount >= 2 && t->elemCount <= 4 &&
+        (is_float(ids, t->elemType) || (g_intVectors && is_int(ids, t->elemType))))
         return (int)t->elemCount;
     return 0;
+}
+
+static int is_int_vector(const IdInfo *ids, uint32_t type)
+{
+    return ids[type].type == T_VECTOR && is_int(ids, ids[type].elemType);
 }
 
 /* Component count of an arithmetic operand or result: 1 (float) to 4 (vec4). */
@@ -541,6 +577,14 @@ static uint32_t root(const IdInfo *ids, uint32_t id)
 static int is_spec(const IdInfo *c)
 {
     return c->specId[0] >= 0 || c->specId[1] >= 0 || c->specId[2] >= 0 || c->specId[3] >= 0;
+}
+
+/* The field a scalar operand will be read from: a constant 1 is VF00's w once parsing is done. */
+static int scalar_comp(const IdInfo *ids, uint32_t bound, uint32_t id)
+{
+    if (id < bound && ids[id].kind == ID_CONST && ids[id].compCount == 1 && !is_spec(&ids[id]))
+        return ids[id].comps[0] == 0x3f800000 ? 3 : 0;
+    return ids[id].comp;
 }
 
 /* Write mask for the first n fields: "x", "xy", "xyz", "xyzw". */
@@ -633,6 +677,16 @@ typedef struct {
     int         written;     /* the shader stores to it */
 } StorBlock;
 
+/* Blocks at fixed VU1 addresses, numbered after the storage blocks: a mesh shader's vertex and
+ * primitive records, its SetMeshOutputsEXT counts, the task payload, and the shared variables. */
+enum { SYN_VERT = PVK_MAX_STORAGE_BLOCKS, SYN_PRIM, SYN_COUNTS, SYN_PAYLOAD, SYN_SHARED };
+
+/* VU1 address of header qword k (PVK_VU1_HEADER_*) of the program being compiled. */
+static int hdr_addr(int k)
+{
+    return g_header >= 0 ? g_header + k : k < 4 ? k : PVK_VU1_COMPUTE_WORKGROUP + k - 4;
+}
+
 /* Constant qwords a shader may read: the push constants, then the uniform area. */
 #define INSTANCE_QWORD (PVK_VU1_PUSH_QWORDS + PVK_VU1_UNIFORM_QWORDS) /* gl_InstanceIndex as a float in z */
 /* compute: the dispatch header's and the invocation's qwords */
@@ -683,6 +737,22 @@ typedef struct {
     StorBlock storage[PVK_MAX_STORAGE_BLOCKS]; /* compute: storage blocks, sorted by (set, binding) */
     int      storageCount;
     uint32_t builtinVars[6];        /* compute: the gl_ built-in input variables, by BuiltIn - 24 */
+    uint32_t meshMaxVertices;       /* mesh: max_vertices */
+    uint32_t meshMaxPrimitives;     /* mesh: max_primitives */
+    int      meshPrimVertices;      /* mesh: vertices per primitive, 1 points, 2 lines, 3 triangles */
+    uint32_t meshVertVar;           /* mesh: gl_MeshVerticesEXT, 0 if none */
+    uint32_t meshPrimVar;           /* mesh: gl_MeshPrimitivesEXT, 0 if none */
+    uint32_t meshIndexVar;          /* mesh: gl_PrimitiveTriangleIndicesEXT or the line or point one, 0 if none */
+    int      meshColorPerPrim;      /* mesh: the color output is perprimitiveEXT */
+    int      meshCull;              /* mesh: the shader writes gl_CullPrimitiveEXT */
+    int      vertQwords, primQwords;/* mesh: qwords of a vertex record and of a primitive record */
+    int      colorSlot, texcoordSlot, fogSlot; /* mesh: qword of each output in its record */
+    int      kickVertices, kickQwords;         /* mesh: vertices and qwords of a full GIF packet */
+    int      vertBase, primBase, kickA, kickB; /* mesh: VU1 addresses of the records and the two GIF packets */
+    uint32_t payloadVar;            /* task and mesh: the task payload variable, 0 if none */
+    int      payloadQwords;
+    int      sharedQwords;          /* task and mesh: qwords of the shared variables */
+    int      barriers;              /* task and mesh: barrier() calls */
     uint32_t constBase;             /* synthetic id of constant qword 0 (then qword 1, ...) */
     uint32_t nextId;                /* next free synthetic id, after the constant qwords */
     uint32_t floatType;             /* id of the 32-bit float type */
@@ -981,6 +1051,9 @@ static void place_uniforms(Shader *sh)
     if (qword > PVK_VU1_UNIFORM_QWORDS)
         fail("the uniform blocks take %u bytes together; ps2vk reserves %d bytes of VU1 memory "
              "for uniform buffers", (unsigned)qword * 16, PVK_VU1_UNIFORM_QWORDS * 16);
+    /* A task shader's blocks end the area, which leaves its start to the mesh shader's. */
+    for (int i = 0; sh->execModel == ExecTask && i < sh->uniformCount; i++)
+        sh->uniforms[i].qword += PVK_VU1_UNIFORM_QWORDS - qword;
 }
 
 /* VU1 address of constant qword q (the push constants, then the uniform area). */
@@ -1605,7 +1678,7 @@ static void storage_address(const IdInfo *ids, const Shader *sh, uint32_t ptr, u
 
     (void)sh;
     b->storBlock = ids[ptr].storBlock - 1;
-    b->dynBase = (int)(off / 16);
+    b->dynBase = (int)(off / 16) + (b->storBlock >= SYN_VERT ? g_synBase[b->storBlock - SYN_VERT] : 0);
     if (!ids[ptr].dynIndex)
         return;
     b->storDyn = 1;
@@ -1626,6 +1699,8 @@ static void storage_load(IdInfo *ids, Shader *sh, uint32_t id, uint32_t type, ui
     if (!size)
         fail("compute shader reads something other than a float, int, uint, vector, matrix or a struct of "
              "them from a storage block");
+    if (is_int_vector(ids, type))
+        fail("compute shader reads an int vector back from VU1 memory; read its components one at a time");
     if (comp + size > 4)
         fail("storage block member at byte %u crosses a 16-byte boundary, which VU1 cannot read as one "
              "value", (unsigned)off);
@@ -1657,6 +1732,9 @@ static void storage_store(IdInfo *ids, Shader *sh, uint32_t ptr, uint32_t type, 
     int size, toInt = 0;
     BodyOp *b;
 
+    if (ids[type].type == T_STRUCT && ids[ptr].storBlock > SYN_VERT)
+        fail("compute shader stores a whole struct to a mesh output or the task payload; write its members one "
+             "at a time");
     if (ids[type].type == T_STRUCT) {
         if (ids[val].smemCount != ids[type].memberCount)
             fail("compute shader stores a struct to a storage block that is not built from its members");
@@ -1677,6 +1755,8 @@ static void storage_store(IdInfo *ids, Shader *sh, uint32_t ptr, uint32_t type, 
         val = int_operand(ids, sh, val, sh->body, &sh->bodyCount);
         toInt = 1;
     }
+    if (is_int_vector(ids, type))
+        toInt = 1;   /* built from the floats VU1 counts with */
     if (value_size(ids, val, stage) != size)
         fail("corrupt SPIR-V: a store to a storage block of a value of another size");
     if ((int)(off % 16 / 4) + size > 4)
@@ -1690,7 +1770,229 @@ static void storage_store(IdInfo *ids, Shader *sh, uint32_t ptr, uint32_t type, 
     b->storComp = (int)(off % 16 / 4);
     b->storSize = size;
     b->storToInt = toInt;
-    sh->storage[b->storBlock].written = 1;
+    if (b->storBlock < SYN_VERT)
+        sh->storage[b->storBlock].written = 1;
+}
+
+/* Qwords a mesh output or task payload type takes: one per scalar, vector or matrix column. */
+static int plain_qwords(const IdInfo *ids, uint32_t t, const char *what)
+{
+    const IdInfo *ti = &ids[t];
+    int n = 0;
+
+    if (is_float(ids, t) || is_int(ids, t) || type_size(ids, t))
+        return 1;
+    if (matrix_cols(ids, t))
+        return matrix_cols(ids, t);
+    if (ti->type == T_ARRAY && !ti->runtimeArray)
+        return (int)ti->elemCount * plain_qwords(ids, ti->elemType, what);
+    if (ti->type != T_STRUCT)
+        fail("%s holds something other than floats, ints, vectors, matrices and structs and arrays of them", what);
+    for (int m = 0; m < ti->memberCount; m++)
+        n += plain_qwords(ids, ti->members[m], what);
+    return n;
+}
+
+/* Nonzero if an access chain from `base` reaches into a mesh output or the task payload. */
+static int is_plain_base(const IdInfo *ids, const Shader *sh, uint32_t base)
+{
+    if (ids[base].kind == ID_PTR)
+        return ids[base].ignored || ids[base].storBlock > SYN_VERT;
+    if (!base || sh->execModel == ExecVertex || sh->execModel == ExecFragment)
+        return 0;
+    return base == sh->payloadVar || ids[base].sharedQword || (sh->execModel == ExecMesh &&
+           (base == sh->meshVertVar || base == sh->meshPrimVar || base == sh->meshIndexVar ||
+            base == sh->colorVar || base == sh->texcoordVar || base == sh->fogVar));
+}
+
+/* An access chain into a mesh output array or the task payload: a qword at a fixed address, a
+ * field of it, and at most one index computed at run time. */
+static void plain_chain(IdInfo *ids, Shader *sh, const uint32_t *w, uint32_t n)
+{
+    uint32_t id = w[2], base = w[3], type, dynIndex = 0, i = 4;
+    int blk, q = 0, comp = 0, dynStride = 0, dynCount = 0, cull = 0;
+    const char *what = "a mesh output";
+
+    if (ids[base].kind == ID_PTR && ids[base].ignored) {
+        ids[id].kind = ID_PTR;
+        ids[id].ignored = 1;
+        return;
+    }
+    if (ids[base].kind == ID_PTR) {
+        blk = ids[base].storBlock - 1;
+        type = ids[base].ptrType;
+        q = (int)(ids[base].storOff / 16);
+        comp = (int)(ids[base].storOff % 16 / 4);
+        dynIndex = ids[base].dynIndex;
+        dynStride = ids[base].dynStride;
+        dynCount = ids[base].dynCount;
+    } else if (base == sh->payloadVar) {
+        blk = SYN_PAYLOAD;
+        type = ids[ids[base].varType].elemType;
+    } else if (ids[base].sharedQword) {
+        blk = SYN_SHARED;
+        type = ids[ids[base].varType].elemType;
+        q = ids[base].sharedQword - 1;
+    } else {
+        /* An output array: the first index picks the vertex or the primitive. */
+        uint32_t arr = ids[ids[base].varType].elemType, idx;
+        int perVertex = base == sh->meshVertVar || base == sh->texcoordVar || base == sh->fogVar ||
+                        (base == sh->colorVar && !sh->meshColorPerPrim);
+        int stride = perVertex ? sh->vertQwords : sh->primQwords;
+        int slot = base == sh->colorVar ? sh->colorSlot : base == sh->texcoordVar ? sh->texcoordSlot
+                 : base == sh->fogVar ? sh->fogSlot : 0;
+
+        if (n < 5)
+            fail("mesh shader reads or writes a whole output array; use its elements one at a time");
+        blk = perVertex ? SYN_VERT : SYN_PRIM;
+        idx = w[4];
+        i = 5;
+        if (ids[idx].kind == ID_CONST && !is_spec(&ids[idx])) {
+            if (ids[idx].value >= ids[arr].elemCount)
+                fail("mesh shader reaches element %u of an output array of %u", (unsigned)ids[idx].value,
+                     (unsigned)ids[arr].elemCount);
+            q = (int)ids[idx].value * stride + slot;
+        } else {
+            if (ids[idx].kind != ID_VALUE || !(ids[idx].floatIndex || is_int(ids, ids[idx].valType)))
+                fail("mesh shader indexes an output array with something other than an int; VU1 addresses "
+                     "qwords through VI08");
+            dynIndex = idx;
+            dynStride = stride;
+            dynCount = (int)ids[arr].elemCount;
+            q = slot;
+        }
+        type = ids[arr].elemType;
+        if (base == sh->meshVertVar || base == sh->meshPrimVar) {
+            /* A member of gl_MeshPerVertexEXT or gl_MeshPerPrimitiveEXT, known by its BuiltIn. */
+            const MemberDecor *d;
+            if (n < 6 || ids[w[5]].kind != ID_CONST || ids[w[5]].value >= (uint32_t)ids[type].memberCount)
+                fail("mesh shader reads or writes a whole gl_MeshVerticesEXT or gl_MeshPrimitivesEXT element; "
+                     "use its members one at a time");
+            d = member_decor(type, ids[w[5]].value, 0);
+            type = ids[type].members[ids[w[5]].value];
+            i = 6;
+            switch (d ? d->builtin - 1 : -1) {
+            case BuiltInPosition:
+                break;
+            case BuiltInPointSize: case BuiltInPrimitiveId:
+                /* A GS point is one pixel, and no fragment shader reads gl_PrimitiveID. */
+                ids[id].kind = ID_PTR;
+                ids[id].ignored = 1;
+                return;
+            case BuiltInCullPrimitive:
+                comp = 3;
+                cull = 1;
+                sh->meshCull = 1;
+                break;
+            case BuiltInClipDistance: case BuiltInCullDistance:
+                fail("mesh shader uses gl_ClipDistance or gl_CullDistance; the GS clips to the scissor "
+                     "rectangle only (shaderClipDistance, shaderCullDistance)");
+                break;
+            case BuiltInLayer: case BuiltInViewportIndex:
+                fail("mesh shader uses gl_Layer or gl_ViewportIndex; the GS draws into one image through one "
+                     "viewport (maxMeshOutputLayers, multiViewport)");
+                break;
+            default:
+                fail("mesh shader uses a member of gl_MeshVerticesEXT or gl_MeshPrimitivesEXT other than "
+                     "gl_Position, gl_PointSize, gl_PrimitiveID and gl_CullPrimitiveEXT");
+            }
+        }
+    }
+    if (blk == SYN_PAYLOAD)
+        what = "the task payload";
+    else if (blk == SYN_SHARED)
+        what = "a shared variable";
+    for (; i < n; i++) {
+        uint32_t idx = w[i], v;
+        if (ids[idx].kind != ID_CONST || is_spec(&ids[idx])) {
+            if (dynIndex)
+                fail("compute shader reaches into %s with two indices computed at run time; only one per "
+                     "access is supported", what);
+            if (ids[idx].kind != ID_VALUE || !(ids[idx].floatIndex || is_int(ids, ids[idx].valType)))
+                fail("compute shader indexes %s with something other than an int; VU1 addresses qwords "
+                     "through VI08", what);
+            if (ids[type].type == T_ARRAY)
+                dynStride = plain_qwords(ids, ids[type].elemType, what);
+            else if (ids[type].type == T_MATRIX)
+                dynStride = 1;
+            else
+                fail("compute shader picks a vector's component in %s at run time; VU1 addresses qwords, so "
+                     "index an array instead", what);
+            dynIndex = idx;
+            dynCount = (int)ids[type].elemCount;
+            type = ids[type].elemType;
+            continue;
+        }
+        v = ids[idx].value;
+        if (ids[type].type == T_STRUCT && v < (uint32_t)ids[type].memberCount) {
+            for (uint32_t m = 0; m < v; m++)
+                q += plain_qwords(ids, ids[type].members[m], what);
+            type = ids[type].members[v];
+        } else if ((ids[type].type == T_ARRAY || ids[type].type == T_MATRIX) && v < ids[type].elemCount) {
+            q += (int)v * (ids[type].type == T_ARRAY ? plain_qwords(ids, ids[type].elemType, what) : 1);
+            type = ids[type].elemType;
+        } else if (ids[type].type == T_VECTOR && v < ids[type].elemCount) {
+            comp += (int)v;
+            type = ids[type].elemType;
+        } else {
+            fail("compute shader reaches a member, element or component of %s that does not exist", what);
+        }
+    }
+    ids[id].kind = ID_PTR;
+    ids[id].storBlock = blk + 1;
+    ids[id].storOff = (uint32_t)q * 16 + (uint32_t)comp * 4;
+    ids[id].ptrType = type;
+    ids[id].comp = comp;
+    ids[id].dynIndex = dynIndex;
+    ids[id].dynStride = dynStride;
+    ids[id].dynCount = dynCount;
+    ids[id].cullFlag = cull;
+}
+
+/* gl_CullPrimitiveEXT = <bool>: nonzero in the w field of the primitive's record. */
+/* A pointer to a whole shared variable, for a load or a store that names the variable itself. */
+static uint32_t shared_ptr(IdInfo *ids, Shader *sh, uint32_t var)
+{
+    uint32_t p = new_id(sh);
+
+    ids[p].kind = ID_PTR;
+    ids[p].storBlock = SYN_SHARED + 1;
+    ids[p].storOff = (uint32_t)(ids[var].sharedQword - 1) * 16;
+    ids[p].ptrType = ids[ids[var].varType].elemType;
+    return p;
+}
+
+static void cull_store(IdInfo *ids, Shader *sh, uint32_t ptr, uint32_t val)
+{
+    uint32_t fl = new_id(sh), src = 0;
+    BodyOp *b;
+
+    ids[fl].valType = sh->floatType;
+    if (ids[val].kind == ID_CONST && !ids[val].boolKind) {
+        float v = ids[val].value ? 1.0f : 0.0f;
+        ids[fl].kind = ID_CONST;
+        memcpy(&ids[fl].comps[0], &v, sizeof(v));
+        ids[fl].compCount = 1;
+    } else {
+        ids[fl].kind = ID_VALUE;
+        if (!ids[val].boolKind)
+            fail("mesh shader stores something other than a comparison or a constant to gl_CullPrimitiveEXT");
+        if (ids[val].boolKind == BOOL_FLOAT) {
+            fl = ids[val].boolA;
+        } else {
+            b = new_op(sh->body, &sh->bodyCount, OpBoolToFloat, fl);
+            b->cond = val;
+            collect_leaves(ids, val, b);
+        }
+    }
+    if (ids[ptr].dynIndex)
+        src = int_operand(ids, sh, ids[ptr].dynIndex, sh->body, &sh->bodyCount);
+    b = new_op(sh->body, &sh->bodyCount, OpStorStore, 0);
+    b->ops[b->nops++] = fl;
+    storage_address(ids, sh, ptr, ids[ptr].storOff, b, src, 1);
+    b->storComp = 3;
+    b->storSize = 1;
+    b->storToInt = 1;
 }
 
 static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
@@ -1730,7 +2032,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
 
         switch (op) {
         case OpCapability:
-            if (w[1] != 1 && w[1] != 5379) /* Shader, DemoteToHelperInvocation */
+            if (w[1] != 1 && w[1] != 5379 && w[1] != 5283) /* Shader, DemoteToHelperInvocation, MeshShadingEXT */
                 fail("shader needs SPIR-V capability %u, which the PS2 does not support", (unsigned)w[1]);
             break;
         case OpEntryPoint:
@@ -1738,6 +2040,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 fail("only one entry point per file is supported");
             sh->execModel = w[1];
             sh->entryPoint = (const char *)&w[3];
+            g_intVectors = w[1] == ExecTask || w[1] == ExecMesh;
+            g_stage = w[1] == ExecGLCompute ? "compute" : w[1] == ExecTask ? "task" : w[1] == ExecMesh ? "mesh" : NULL;
             break;
         case OpString:
             ids[w[1]].name = (const char *)&w[2];
@@ -1750,6 +2054,12 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             } else if (w[2] == ExecModeLocalSizeId) {
                 fail("compute shader sets its local size with specialization constants (local_size_x_id); the "
                      "microcode's loops are written for the size, so give it fixed numbers");
+            } else if (w[2] == ExecModeOutputVertices && n >= 4) {
+                sh->meshMaxVertices = w[3];
+            } else if (w[2] == ExecModeOutputPrimitives && n >= 4) {
+                sh->meshMaxPrimitives = w[3];
+            } else if (w[2] == ExecModeOutputPoints || w[2] == ExecModeOutputLines || w[2] == ExecModeOutputTriangles) {
+                sh->meshPrimVertices = w[2] == ExecModeOutputPoints ? 1 : w[2] == ExecModeOutputLines ? 2 : 3;
             }
             break;
         case OpExtInstImport:
@@ -1776,10 +2086,14 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[w[1]].specId[0] = (int)w[3];
             else if (w[2] == DecBufferBlock)
                 ids[w[1]].bufferBlock = 1;
+            else if (w[2] == DecPerPrimitive)
+                ids[w[1]].perPrimitive = 1;
             break;
         case OpMemberDecorate:
-            if (w[3] == DecBuiltIn && w[4] == BuiltInPosition) {
-                ids[w[1]].structPosMember = (int)w[2];
+            if (w[3] == DecBuiltIn) {
+                member_decor(w[1], w[2], 1)->builtin = (int)w[4] + 1;
+                if (w[4] == BuiltInPosition)
+                    ids[w[1]].structPosMember = (int)w[2];
             } else if (w[3] == DecOffset) {
                 MemberDecor *d = member_decor(w[1], w[2], 1);
                 d->offset = w[4];
@@ -1853,6 +2167,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             }
             spec_declared(ids, sh, w[2]);
             break;
+        case OpConstantTrue: case OpConstantFalse:
+            ids[w[2]].kind = ID_CONST; ids[w[2]].value = op == OpConstantTrue;
+            ids[w[2]].valType = w[1];
+            break;
         case OpSpecConstantTrue: case OpSpecConstantFalse: {
             /* A bool VU1 tests as a float: 1.0 or 0.0 until the pipeline sets it. */
             float v = op == OpSpecConstantTrue ? 1.0f : 0.0f;
@@ -1869,7 +2187,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             uint32_t id = w[2];
             ids[id].kind = ID_CONST;
             ids[id].valType = w[1];
-            if (ids[w[1]].type == T_VECTOR && is_float(ids, ids[w[1]].elemType) && n - 3 <= 4) {
+            if (type_size(ids, w[1]) > 1 && n - 3 <= 4) {
                 for (uint32_t i = 0; i < n - 3; i++) {
                     ids[id].comps[i] = ids[w[3 + i]].comps[0];
                     ids[id].specId[i] = ids[w[3 + i]].specId[0];
@@ -1907,7 +2225,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 fail("compute shader declares shared variable '%s'; VU1 runs a work group's invocations one "
                      "after another, so there is no shared memory to share", ids[id].name ? ids[id].name : "variable");
             } else if (!inFunction && storage != ScInput && storage != ScOutput && storage != ScPushConstant
-                       && storage != ScUniform && !(storage == ScStorageBuffer && sh->execModel == ExecGLCompute)) {
+                       && storage != ScUniform && !(storage == ScStorageBuffer && IS_GROUPED(sh))
+                       && !(storage == ScTaskPayload && IS_GROUPED(sh))
+                       && !(storage == ScWorkgroup && IS_GROUPED(sh))) {
                 fail("'%s' is a storage buffer or something else this version of ps2vk-shaderc "
                      "does not support; it supports shader inputs, outputs, push constants, "
                      "uniform blocks and a sampler2D", ids[id].name ? ids[id].name : "variable");
@@ -1932,13 +2252,26 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         pc += n;
     }
 
-    if (sh->execModel != ExecVertex && sh->execModel != ExecFragment && sh->execModel != ExecGLCompute)
-        fail("only vertex, fragment and compute shaders are supported");
-    g_compute = sh->execModel == ExecGLCompute;
-    for (int i = 0; g_compute && i < 3; i++)
+    if (!IS_CODE(sh) && sh->execModel != ExecFragment)
+        fail("only vertex, fragment, compute, task and mesh shaders are supported");
+    g_header = sh->execModel == ExecMesh ? PVK_VU1_MESH_ADDR : sh->execModel == ExecTask ? PVK_VU1_TASK_ADDR : -1;
+    for (int i = 0; IS_GROUPED(sh) && i < 3; i++)
         if (sh->localSize[i] < 1 || sh->localSize[i] > PVK_MAX_COMPUTE_WORK_GROUP_SIZE)
-            fail("compute shader's local size along %c is %u; it must be 1 to %d (maxComputeWorkGroupSize)",
-                 "xyz"[i], (unsigned)sh->localSize[i], PVK_MAX_COMPUTE_WORK_GROUP_SIZE);
+            fail("compute shader's local size along %c is %u; it must be 1 to %d (%s)",
+                 "xyz"[i], (unsigned)sh->localSize[i], PVK_MAX_COMPUTE_WORK_GROUP_SIZE,
+                 sh->execModel == ExecMesh ? "maxMeshWorkGroupSize" : sh->execModel == ExecTask
+                 ? "maxTaskWorkGroupSize" : "maxComputeWorkGroupSize");
+    if (sh->execModel == ExecMesh) {
+        if (!sh->meshPrimVertices)
+            fail("mesh shader declares no output primitive; write 'layout(triangles, max_vertices = n, "
+                 "max_primitives = m) out;'");
+        if (sh->meshMaxVertices < 1 || sh->meshMaxVertices > PVK_MAX_MESH_OUTPUT_VERTICES)
+            fail("mesh shader's max_vertices is %u; it must be 1 to %d (maxMeshOutputVertices)",
+                 (unsigned)sh->meshMaxVertices, PVK_MAX_MESH_OUTPUT_VERTICES);
+        if (sh->meshMaxPrimitives < 1 || sh->meshMaxPrimitives > PVK_MAX_MESH_OUTPUT_PRIMITIVES)
+            fail("mesh shader's max_primitives is %u; it must be 1 to %d (maxMeshOutputPrimitives)",
+                 (unsigned)sh->meshMaxPrimitives, PVK_MAX_MESH_OUTPUT_PRIMITIVES);
+    }
     if (!sh->floatType)
         fail("shader has no float type");
     if (functions != 1)
@@ -1957,7 +2290,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             uint32_t pointee = ids[w[1]].elemType;
             const char *name = ids[id].name ? ids[id].name : "variable";
 
-            if (sh->execModel == ExecGLCompute && storage == ScInput) {
+            if (IS_GROUPED(sh) && storage == ScInput) {
                 int b = ids[id].builtin;
                 if (b < BuiltInNumWorkgroups || b > BuiltInLocalInvocationIndex || b == BuiltInWorkgroupSize)
                     fail("compute shader input '%s' is none of gl_GlobalInvocationID, gl_LocalInvocationID, "
@@ -1967,14 +2300,74 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 ids[id].builtinQword = 1 + (b == BuiltInNumWorkgroups ? GROUPS_QWORD
                                           : b == BuiltInWorkgroupId ? WORKGROUP_QWORD
                                           : b == BuiltInGlobalInvocationId ? GLOBAL_QWORD : LOCAL_QWORD);
-            } else if (sh->execModel == ExecGLCompute && storage == ScOutput) {
+            } else if ((sh->execModel == ExecGLCompute || sh->execModel == ExecTask) && storage == ScOutput) {
                 fail("compute shader declares output '%s'; a compute shader writes its results to storage "
                      "buffers", name);
+            } else if (storage == ScTaskPayload) {
+                if (sh->payloadVar)
+                    fail("shader declares two task payloads; only one is allowed");
+                sh->payloadVar = id;
+                sh->payloadQwords = plain_qwords(ids, pointee, "the task payload");
+                if (sh->payloadQwords * 16 > PVK_MAX_TASK_PAYLOAD_BYTES)
+                    fail("task payload '%s' takes %d bytes of VU1 memory, a 16-byte qword per scalar, vector or "
+                         "matrix column; at most %d (maxTaskPayloadSize)", name, sh->payloadQwords * 16,
+                         PVK_MAX_TASK_PAYLOAD_BYTES);
+            } else if (storage == ScWorkgroup) {
+                ids[id].sharedQword = 1 + sh->sharedQwords;
+                sh->sharedQwords += plain_qwords(ids, pointee, "a shared variable");
+                if (sh->sharedQwords * 16 > PVK_MAX_SHARED_BYTES)
+                    fail("shared variables take %d bytes of VU1 memory with '%s', a 16-byte qword per scalar, "
+                         "vector or matrix column; at most %d (%s)", sh->sharedQwords * 16, name,
+                         PVK_MAX_SHARED_BYTES,
+                         sh->execModel == ExecMesh ? "maxMeshSharedMemorySize" : "maxTaskSharedMemorySize");
+            } else if (storage == ScOutput && sh->execModel == ExecMesh) {
+                uint32_t elem = ids[pointee].elemType;
+                int b = ids[id].builtin, size;
+
+                if (ids[pointee].type != T_ARRAY)
+                    fail("mesh output '%s' is not an array with an element per vertex or per primitive", name);
+                size = type_size(ids, elem);
+                if (b == BuiltInPrimitiveTriangleIndices || b == BuiltInPrimitiveLineIndices ||
+                    b == BuiltInPrimitivePointIndices) {
+                    sh->meshIndexVar = id;
+                } else if (ids[elem].type == T_STRUCT && ids[elem].structPosMember >= 0) {
+                    sh->meshVertVar = id;
+                } else if (ids[elem].type == T_STRUCT) {
+                    sh->meshPrimVar = id;
+                } else if (b >= 0) {
+                    fail("built-in output '%s' is not supported", name);
+                } else if (ids[id].location < 0) {
+                    fail("output '%s' has no location", name);
+                } else if (size == 4 && !is_int_vector(ids, elem)) {
+                    if (sh->colorVar)
+                        fail("shader has 2 color outputs; the GS can interpolate only one color");
+                    sh->colorVar = id;
+                    sh->colorLocation = ids[id].location;
+                    sh->meshColorPerPrim = ids[id].perPrimitive;
+                } else if (ids[id].perPrimitive) {
+                    fail("per-primitive mesh output '%s' must be a vec4 (the color); the GS takes nothing else "
+                         "per primitive", name);
+                } else if (size == 2 && !is_int_vector(ids, elem)) {
+                    if (sh->texcoordVar)
+                        fail("mesh shader has 2 texture coordinate outputs; the GS interpolates only one pair "
+                             "(S, T)");
+                    sh->texcoordVar = id;
+                    sh->texcoordLocation = ids[id].location;
+                } else if (is_float(ids, elem)) {
+                    if (sh->fogVar)
+                        fail("mesh shader has 2 float outputs; the GS interpolates only one fog amount");
+                    sh->fogVar = id;
+                    sh->fogLocation = ids[id].location;
+                } else {
+                    fail("mesh output '%s' must be a vec4 (the color), a vec2 (the texture coordinate) or a float "
+                         "(the fog amount); the GS interpolates nothing else", name);
+                }
             } else if (storage == ScStorageBuffer || (storage == ScUniform && ids[pointee].bufferBlock)) {
                 StorBlock *b;
 
-                if (sh->execModel != ExecGLCompute)
-                    fail("'%s' is a storage buffer; storage buffers are only available in compute shaders", name);
+                if (!IS_GROUPED(sh))
+                    fail("'%s' is a storage buffer; storage buffers are only available in compute, task and mesh "
+                         "shaders", name);
                 if (sh->storageCount == PVK_MAX_STORAGE_BLOCKS)
                     fail("compute shader has more than %d storage blocks (maxPerStageDescriptorStorageBuffers)",
                          PVK_MAX_STORAGE_BLOCKS);
@@ -2122,9 +2515,46 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             fail("fragment shader declares a sampler but has no vec2 input to sample it with");
     }
     place_uniforms(sh);
-    if (g_compute) {
-        uint32_t bytes = 0;
+    if (IS_GROUPED(sh))
         place_storage(sh);
+    g_synBase[SYN_PAYLOAD - SYN_VERT] = PVK_VU1_PAYLOAD_ADDR;
+    g_synBase[SYN_SHARED - SYN_VERT] = PVK_VU1_PAYLOAD_ADDR + sh->payloadQwords;
+    if (sh->execModel == ExecMesh) {
+        /* The records and the two GIF packets end VU1 data memory; a vertex is [ST,] RGBAQ, [FOG,] XYZ2. */
+        int out = 2 + (sh->texcoordVar ? 1 : 0) + (sh->fogVar ? 1 : 0), bytes;
+
+        sh->vertQwords = sh->primQwords = 1;
+        if (sh->colorVar && !sh->meshColorPerPrim)
+            sh->colorSlot = sh->vertQwords++;
+        if (sh->texcoordVar)
+            sh->texcoordSlot = sh->vertQwords++;
+        if (sh->fogVar)
+            sh->fogSlot = sh->vertQwords++;
+        if (sh->meshColorPerPrim)
+            sh->colorSlot = sh->primQwords++;
+        sh->kickVertices = (PVK_VU1_MESH_KICK_QWORDS - 1) / (sh->meshPrimVertices * out) * sh->meshPrimVertices;
+        sh->kickQwords = 1 + sh->kickVertices * out;
+        sh->kickA = PVK_VU1_MEMORY_QWORDS - sh->kickQwords;
+        sh->kickB = sh->kickA - sh->kickQwords;
+        sh->primBase = sh->kickB - (int)sh->meshMaxPrimitives * sh->primQwords;
+        sh->vertBase = sh->primBase - (int)sh->meshMaxVertices * sh->vertQwords;
+        bytes = (sh->kickB - sh->vertBase) * 16;
+        if (bytes > PVK_MAX_MESH_OUTPUT_BYTES - sh->payloadQwords * 16)
+            fail("mesh shader's %u vertices of %d bytes and %u primitives of %d bytes take %d bytes of VU1 "
+                 "memory; they have %d (maxMeshOutputMemorySize) less the task payload's %d",
+                 (unsigned)sh->meshMaxVertices, sh->vertQwords * 16, (unsigned)sh->meshMaxPrimitives,
+                 sh->primQwords * 16, bytes, PVK_MAX_MESH_OUTPUT_BYTES, sh->payloadQwords * 16);
+        g_synBase[SYN_VERT - SYN_VERT] = sh->vertBase;
+        g_synBase[SYN_PRIM - SYN_VERT] = sh->primBase;
+        g_synBase[SYN_COUNTS - SYN_VERT] = PVK_VU1_MESH_OUTPUTS;
+        g_synBase[SYN_SHARED - SYN_VERT] = sh->vertBase - sh->sharedQwords;
+        if (g_synBase[SYN_SHARED - SYN_VERT] < PVK_VU1_PAYLOAD_ADDR + sh->payloadQwords)
+            fail("mesh shader's shared variables, outputs and task payload take %d bytes of VU1 memory "
+                 "together; they have %d (PVK_MAX_MESH_MEMORY_BYTES less the two GIF packets)",
+                 (sh->sharedQwords + sh->payloadQwords) * 16 + bytes, (sh->kickB - PVK_VU1_PAYLOAD_ADDR) * 16);
+    }
+    if (sh->execModel == ExecGLCompute) {
+        uint32_t bytes = 0;
         for (int i = 0; i < sh->uniformCount; i++)
             bytes += (sh->uniforms[i].bytes + 15) / 16 * 16;
         for (int i = 0; i < sh->storageCount; i++)
@@ -2139,7 +2569,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
     for (pc = 5; pc < words;) {
         uint32_t op = code[pc] & 0xffff, n = code[pc] >> 16, fake[16];
         const uint32_t *w = &code[pc];
-        const char *stage = sh->execModel == ExecFragment ? "fragment" : sh->execModel == ExecVertex ? "vertex" : "compute";
+        const char *stage = sh->execModel == ExecFragment ? "fragment" : g_stage ? g_stage : "vertex";
         int replay = labels && replayed < specOpCount;
 
         if (replay) {
@@ -2203,6 +2633,49 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             case OpReturn:
                 sh->returns++;
                 break;
+            case OpControlBarrier:
+                if (sh->execModel != ExecMesh && sh->execModel != ExecTask)
+                    unsupported(op, stage);
+                new_op(sh->body, &sh->bodyCount, OpBarrier, 0);
+                sh->barriers++;
+                break;
+            case OpMemoryBarrier:
+                /* VU1 runs one invocation at a time: the next read sees every store before it. */
+                if (sh->execModel != ExecMesh && sh->execModel != ExecTask)
+                    unsupported(op, stage);
+                break;
+            case OpEmitMeshTasksEXT: {
+                /* Ends the invocation like a return; the group's first call counts. */
+                uint32_t g[3];
+                BodyOp *b;
+
+                if (sh->execModel != ExecTask)
+                    unsupported(op, stage);
+                for (int k = 0; k < 3; k++) {
+                    g[k] = int_operand(ids, sh, w[1 + k], sh->body, &sh->bodyCount);
+                    if (value_size(ids, g[k], stage) != 1)
+                        fail("corrupt SPIR-V: EmitMeshTasksEXT of something other than three counts");
+                }
+                b = new_op(sh->body, &sh->bodyCount, OpEmitTasks, 0);
+                for (int k = 0; k < 3; k++)
+                    b->ops[b->nops++] = g[k];
+                sh->returns++;
+                break;
+            }
+            case OpSetMeshOutputsEXT: {
+                uint32_t counts = new_id(sh);
+
+                if (sh->execModel != ExecMesh)
+                    unsupported(op, stage);
+                ids[counts].kind = ID_PTR;
+                ids[counts].storBlock = SYN_COUNTS + 1;
+                for (uint32_t k = 0; k < 2; k++) {
+                    if (!is_int(ids, ids[w[1 + k]].valType))
+                        fail("corrupt SPIR-V: SetMeshOutputsEXT of something other than two counts");
+                    storage_store(ids, sh, counts, ids[w[1 + k]].valType, 4 * k, w[1 + k], stage);
+                }
+                break;
+            }
             case OpBranch: {
                 BodyOp *b = new_op(sh->body, &sh->bodyCount, OpBranch, 0);
                 b->target = w[1];
@@ -2361,7 +2834,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     fail("corrupt SPIR-V: OpSelect operands differ in size from the result");
                 ids[id].kind = ID_VALUE;
                 ids[id].valType = w[1];
-                ids[id].comp = size == 1 ? ids[a].comp : 0;
+                ids[id].comp = size == 1 ? scalar_comp(ids, sh->constBase, a) : 0;
                 ids[id].intIsFloat = is_int(ids, w[1]);
                 b = new_op(sh->body, &sh->bodyCount, OpSelect, id);
                 b->cond = w[3];
@@ -2386,8 +2859,31 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                         ids[id].builtinQword = ids[ptr].builtinQword;
                     break;
                 }
+                if (ids[ptr].kind == ID_VAR && ids[ptr].sharedQword)
+                    ptr = shared_ptr(ids, sh, ptr);
                 if (ids[ptr].kind == ID_PTR && ids[ptr].storBlock) {
                     uint32_t type = ids[ptr].ptrType;
+                    if (ids[ptr].storBlock == SYN_SHARED + 1 && (ids[type].type == T_STRUCT || ids[type].type == T_ARRAY)) {
+                        /* A whole shared struct or array: a value per member or element, a qword each. */
+                        int isStruct = ids[type].type == T_STRUCT;
+                        int count = isStruct ? ids[type].memberCount : (int)ids[type].elemCount;
+
+                        if (count > MAX_STRUCT_MEMBERS)
+                            fail("compute shader reads a shared struct or array of %d members or elements at once; "
+                                 "VU1 has registers for %d, so read them one at a time", count, MAX_STRUCT_MEMBERS);
+                        for (int m = 0; m < count; m++) {
+                            uint32_t mt = isStruct ? ids[type].members[m] : ids[type].elemType, mid = new_id(sh);
+                            if (!is_int(ids, mt) && !type_size(ids, mt))
+                                fail("compute shader reads a whole shared struct or array that holds a matrix, "
+                                     "struct or array; read those members one at a time");
+                            storage_load(ids, sh, mid, mt, ptr, 16 * (uint32_t)m);
+                            ids[id].smem[m] = mid;
+                        }
+                        ids[id].kind = ID_VALUE;
+                        ids[id].valType = w[1];
+                        ids[id].smemCount = count;
+                        break;
+                    }
                     ids[id].kind = ID_VALUE;
                     ids[id].valType = w[1];
                     if (matrix_cols(ids, type)) {
@@ -2661,7 +3157,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 /* A scalar result stays in the field its first operand uses; a division
                  * is copied out of Q into x. */
                 if (size == 1)
-                    ids[w[2]].comp = op == OpFDiv ? 0 : ids[a].comp;
+                    ids[w[2]].comp = op == OpFDiv ? 0 : scalar_comp(ids, sh->constBase, a);
                 b = new_op(sh->body, &sh->bodyCount, op, w[2]);
                 b->ops[0] = a;
                 b->nops = 1;
@@ -2780,7 +3276,8 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     if (size != argSize)
                         fail("corrupt SPIR-V: %s() result differs in size from its arguments", name);
                     if (size == 1)
-                        ids[id].comp = ext == GlslSqrt || ext == GlslInverseSqrt ? 0 : ids[args[0]].comp;
+                        ids[id].comp = ext == GlslSqrt || ext == GlslInverseSqrt ? 0
+                                     : scalar_comp(ids, sh->constBase, args[0]);
                 }
                 if (sh->bodyCount == MAX_BODY)
                     fail("vertex shader is too long (max %d instructions)", MAX_BODY);
@@ -2930,7 +3427,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 }
                 if (!IS_CODE(sh))
                     unsupported(op, stage);
-                if (ids[w[1]].type == T_STRUCT && sh->execModel == ExecGLCompute) {
+                if (ids[w[1]].type == T_STRUCT && IS_GROUPED(sh)) {
                     /* A struct value is its members' values. */
                     if (n - 3 > MAX_STRUCT_MEMBERS)
                         fail("compute shader builds a struct of more than %d members", MAX_STRUCT_MEMBERS);
@@ -2949,11 +3446,14 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     fail("vertex shader constructs something other than a vec2, vec3 or vec4 "
                          "from floats and vectors; only those are supported so far");
                 for (uint32_t i = 0; i < n - 3; i++) {
-                    int k = value_size(ids, w[3 + i], stage);
+                    /* An int vector holds the floats VU1 counts with. */
+                    uint32_t o = is_int_vector(ids, w[1]) ? int_operand(ids, sh, w[3 + i], sh->body, &sh->bodyCount)
+                                                          : w[3 + i];
+                    int k = value_size(ids, o, stage);
                     if (total + k > size)
                         fail("corrupt SPIR-V: OpCompositeConstruct operands overflow the result");
                     for (int j = 0; j < k; j++)
-                        fl[total + j] = field_of(ids, sh, w[3 + i], j);
+                        fl[total + j] = field_of(ids, sh, o, j);
                     total += k;
                 }
                 if (total != size)
@@ -2965,6 +3465,10 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                 uint32_t id = w[2], base = w[3], blockBytes = 0;
                 int blockQword = 0;
                 const char *kind = const_block(sh, base, &blockQword, &blockBytes);
+                if (is_plain_base(ids, sh, base)) {
+                    plain_chain(ids, sh, w, n);
+                    break;
+                }
                 if (storage_index(sh, base) >= 0 || (ids[base].kind == ID_PTR && ids[base].storBlock)) {
                     storage_chain(ids, sh, w, n);
                     break;
@@ -3139,6 +3643,17 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
                     sh->textureFunction = ids[val].texel == TEXEL_SAMPLE ? 1 : 0;
                     break;
                 }
+                if (ids[ptr].kind == ID_PTR && ids[ptr].ignored)
+                    break;
+                if (ids[ptr].kind == ID_PTR && ids[ptr].cullFlag) {
+                    cull_store(ids, sh, ptr, val);
+                    break;
+                }
+                if (ids[ptr].kind == ID_VAR && ids[ptr].sharedQword)
+                    ptr = shared_ptr(ids, sh, ptr);
+                if (is_plain_base(ids, sh, ptr) && ids[ptr].kind != ID_PTR)
+                    fail("compute shader stores a whole mesh output array or task payload; write its members "
+                         "and elements one at a time");
                 if (ids[ptr].kind == ID_PTR && ids[ptr].storBlock) {
                     storage_store(ids, sh, ptr, ids[ptr].ptrType, 0, val, stage);
                     break;
@@ -3187,7 +3702,7 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
             }
             case OpBitcast: case OpCopyObject:
                 /* int <-> uint (length() comes as an int): the same value. */
-                if (sh->execModel == ExecGLCompute && ids[w[3]].kind == ID_VALUE &&
+                if (IS_GROUPED(sh) && ids[w[3]].kind == ID_VALUE &&
                     (op == OpCopyObject ? type_size(ids, w[1]) > 0
                                         : is_int(ids, w[1]) && is_int(ids, ids[w[3]].valType))) {
                     alias_value(ids, w[2], w[1], w[3]);
@@ -3254,6 +3769,9 @@ static void parse(const uint32_t *code, size_t words, IdInfo *ids, Shader *sh)
         }
     }
 
+    if (sh->execModel == ExecMesh && (!sh->meshVertVar || !sh->meshIndexVar))
+        fail("mesh shader never writes %s", sh->meshVertVar ? "its primitives' indices (gl_PrimitiveTriangleIndicesEXT, "
+             "gl_PrimitiveLineIndicesEXT or gl_PrimitivePointIndicesEXT)" : "gl_MeshVerticesEXT[].gl_Position");
     if (sh->execModel == ExecVertex) {
         if (!sh->positionValue)
             fail("vertex shader never writes gl_Position");
@@ -3502,6 +4020,9 @@ static const int g_computePool[] = { 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 
                                      25, 26, 27, 28, 29, 30, 31 };
 static const int *g_pool = g_vertexPool;
 static int g_poolCount = (int)(sizeof(g_vertexPool) / sizeof(g_vertexPool[0]));
+/* Mesh: a constant is loaded where a block first reads it and its register given back after the
+ * block's last read, since a loop written out per vertex has more constants than VU1 has registers. */
+static int g_lazyConst = 0;
 
 typedef struct {
     int reg[MAX_IDS];       /* VF register holding each value, 0 if none */
@@ -3539,6 +4060,14 @@ static void reg_release(Regs *r, const IdInfo *ids, const Shader *sh, uint32_t i
         r->busy[r->reg[id]] = 0;
         r->reg[id] = 0;
     }
+    if (g_lazyConst && ids[id].kind == ID_CONST && r->reg[id]) {
+        for (int k = at + 1; k < sh->bodyCount && sh->body[k].op != OpLabel; k++)
+            for (int j = 0; j < sh->body[k].nops && !sh->body[k].dead; j++)
+                if (canon(ids, sh, sh->body[k].ops[j]) == id)
+                    return;
+        r->busy[r->reg[id]] = 0;
+        r->reg[id] = 0;
+    }
 }
 
 /* Register holding a value (an alias reads its root's register). */
@@ -3564,15 +4093,15 @@ static void emit_const_load(FILE *f, const Shader *sh, int q, int reg)
     char buf[64], buf2[64];
 
     static const struct { int addr; const char *what; } compute[] = {
-        { PVK_VU1_COMPUTE_GROUPS, "gl_NumWorkGroups" },
-        { PVK_VU1_COMPUTE_WORKGROUP, "gl_WorkGroupID" },
-        { PVK_VU1_COMPUTE_LOCAL, "gl_LocalInvocationID, w = gl_LocalInvocationIndex" },
-        { PVK_VU1_COMPUTE_GLOBAL, "gl_GlobalInvocationID" },
-        { PVK_VU1_COMPUTE_LENGTHS, "length() of each storage block's runtime array" },
+        { PVK_VU1_HEADER_GROUPS, "gl_NumWorkGroups" },
+        { PVK_VU1_HEADER_WORKGROUP, "gl_WorkGroupID" },
+        { PVK_VU1_HEADER_LOCAL, "gl_LocalInvocationID, w = gl_LocalInvocationIndex" },
+        { PVK_VU1_HEADER_GLOBAL, "gl_GlobalInvocationID" },
+        { PVK_VU1_HEADER_LENGTHS, "length() of each storage block's runtime array" },
     };
 
     if (q > INSTANCE_QWORD) {
-        snprintf(buf, sizeof(buf), "lq            VF%02d,%d(VI00)", reg, compute[q - GROUPS_QWORD].addr);
+        snprintf(buf, sizeof(buf), "lq            VF%02d,%d(VI00)", reg, hdr_addr(compute[q - GROUPS_QWORD].addr));
         snprintf(buf2, sizeof(buf2), "%s", compute[q - GROUPS_QWORD].what);
     } else if (q == INSTANCE_QWORD) {
         snprintf(buf, sizeof(buf), "lq            VF%02d,%d(VI00)", reg, PVK_VU1_INPUT_ADDR + PVK_VU1_INPUT_STRIDE);
@@ -3594,11 +4123,16 @@ static void emit_const_load(FILE *f, const Shader *sh, int q, int reg)
 /* A push constant or uniform qword is loaded right before its first read and
  * its register given back after its last, so a shader may read more of them
  * than VU1 has registers to hold at once. */
+static void emit_constant(FILE *f, const IdInfo *ids, const IdInfo *c, int reg, const char *sym);
+
 static void reg_ensure_loaded(FILE *f, Regs *r, const IdInfo *ids, const Shader *sh, uint32_t id)
 {
     uint32_t c = canon(ids, sh, id);
 
-    if (c >= sh->constBase && !r->reg[c]) {
+    if (g_lazyConst && ids[c].kind == ID_CONST && !ids[c].vf00 && !r->reg[c]) {
+        r->reg[c] = reg_alloc(r);
+        emit_constant(f, ids, &ids[c], r->reg[c], g_sym);
+    } else if (c >= sh->constBase && ids[c].kind != ID_CONST && !r->reg[c]) {
         r->reg[c] = reg_alloc(r);
         emit_const_load(f, sh, (int)(c - sh->constBase), r->reg[c]);
     }
@@ -3852,8 +4386,14 @@ static const char *body_name(const BodyOp *b)
     case OpBranchConditional: return "if";
     case OpPhiMove: return "value of this path";
     case OpConvertSToF: return "int to float";
-    case OpStorLoad: return "storage block read";
-    case OpStorStore: return "storage block write";
+    case OpStorLoad: return b->storBlock == SYN_SHARED ? "shared variable read"
+                            : b->storBlock == SYN_PAYLOAD ? "task payload read" : b->storBlock >= SYN_VERT
+                            ? "mesh output read" : "storage block read";
+    case OpStorStore: return b->storBlock == SYN_SHARED ? "shared variable write"
+                             : b->storBlock == SYN_PAYLOAD ? "task payload write" : b->storBlock == SYN_COUNTS
+                             ? "SetMeshOutputsEXT" : b->storBlock >= SYN_VERT ? "mesh output write" : "storage block write";
+    case OpEmitTasks: return "EmitMeshTasksEXT";
+    case OpBarrier: return "barrier()";
     default: return op_name(b->op);
     }
 }
@@ -4037,15 +4577,16 @@ static int emit_stor_addr(FILE *f, const char **c, const BodyOp *b, int t, int a
     const char *fm = &"x\0y\0z\0w"[b->dynComp * 2];
     char fc = field[b->dynComp];
     int base = PVK_VU1_STORAGE_BASE_REG + b->storBlock;
+    int fixed = b->storBlock >= SYN_VERT;   /* a mesh output or the payload: dynBase holds its address */
 
     if (!b->storDyn)
-        return base;
+        return fixed ? 0 : base;
     if (t != a)
         emit_move(f, c, t, b->dynComp, a, b->dynComp, 1);
     fprintf(f, "%s_Clamp%d:\n", g_sym, g_clamps++);
     emit_u(f, c, mn("maxx", 0, fm), "VF%02d,VF%02d,VF00x", t, t);
     if (b->storRuntime) {
-        emit_l(f, c, "lq", "VF04,%d(VI00)", PVK_VU1_COMPUTE_LAST);
+        emit_l(f, c, "lq", "VF04,%d(VI00)", hdr_addr(PVK_VU1_HEADER_LAST));
         emit_u(f, c, mn("mini", field[b->storBlock], fm), "VF%02d,VF%02d,VF04%c", t, t, field[b->storBlock]);
     } else {
         emit_loi(f, c, b->dynLast);
@@ -4060,8 +4601,35 @@ static int emit_stor_addr(FILE *f, const char **c, const BodyOp *b, int t, int a
     }
     emit_u(f, c, mn("ftoi0", 0, fm), "VF%02d,VF%02d", t, t);
     emit_l(f, c, "mtir", "VI08,VF%02d%c", t, fc);
-    emit_l(f, c, "iadd", "VI08,VI08,VI%02d", base);
+    if (!fixed)
+        emit_l(f, c, "iadd", "VI08,VI08,VI%02d", base);
     return 8;
+}
+
+/* EmitMeshTasksEXT(x, y, z): the mesh header's group counts, as floats and as ints, unless an
+ * earlier invocation of the task work group set them; a count of 0 emits nothing. */
+static void emit_tasks(FILE *f, const IdInfo *ids, const BodyOp *b, int t, const int *regs, const char *line)
+{
+    const char *c = line;
+    int label = g_labels++;
+
+    emit_l(f, &c, "ilw.w", "VI08,%d(VI00)", PVK_VU1_MESH_STATE);
+    for (int k = 0; k < 3; k++)
+        emit_move(f, &c, t, k, regs[k], ids[b->ops[k]].comp, 1);
+    emit_l(f, &c, "ibne", "VI08,VI00,%s_E%d", g_sym, label);
+    vu(f, "NOP", "NOP", "branch delay slot");
+    emit_l(f, &c, "sq.xyz", "VF%02d,%d(VI00)", t, PVK_VU1_MESH_ADDR + PVK_VU1_HEADER_GROUPS);
+    emit_u(f, &c, "ftoi0.xyz", "VF%02d,VF%02d", t, t);
+    emit_l(f, &c, "sq.xyz", "VF%02d,%d(VI00)", t, PVK_VU1_MESH_ADDR + PVK_VU1_HEADER_COUNTS);
+    for (int k = 0; k < 3; k++) {
+        emit_l(f, &c, "mtir", "VI08,VF%02d%c", t, "xyz"[k]);
+        vu(f, "NOP", "NOP", "the branch reads VI after one instruction");
+        emit_l(f, &c, "ibeq", "VI08,VI00,%s_E%d", g_sym, label);
+        vu(f, "NOP", "NOP", "branch delay slot");
+    }
+    emit_l(f, &c, "iaddiu", "VI08,VI00,1");
+    emit_l(f, &c, "isw.w", "VI08,%d(VI00)", PVK_VU1_MESH_STATE);
+    fprintf(f, "%s_E%d:\n", g_sym, label);
 }
 
 /* sq of value v (ops[0]) into fields storComp.. of a storage qword, through scratch t when the
@@ -4242,24 +4810,87 @@ static void emit_body_op(FILE *f, const IdInfo *ids, const Shader *sh, const Bod
     }
 }
 
-/* A compute program's start: the storage blocks' addresses and the local size. */
+/* barrier(): each invocation keeps g_ctxQwords qwords, a mesh shader's going down from its shared
+ * variables, a task shader's going up from behind them. VI14 points at the running invocation's. */
+static int ctx_start(const Shader *sh)
+{
+    return g_synBase[SYN_SHARED - SYN_VERT] + (sh->execModel == ExecMesh ? 0 : sh->sharedQwords);
+}
+
+/* Offset from VI14 of the invocation's qword k: 0 where it goes on, then its registers. */
+static int ctx_off(const Shader *sh, int k)
+{
+    return sh->execModel == ExecMesh ? -1 - k : k;
+}
+
+/* barrier(): the registers in use go to the invocation's qwords and the next invocation runs;
+ * a later pass over the group comes back behind the branch and loads them again. */
+static void emit_barrier(FILE *f, const Regs *r, const IdInfo *ids, const Shader *sh, const char *line)
+{
+    int regs[32], n = 0;
+    const char *c = line;
+
+    for (int i = 0; i < g_poolCount; i++) {
+        int reg = g_pool[i], constant = 0;
+
+        if (!r->busy[reg])
+            continue;
+        /* A constant loaded for the whole program stays in its register. */
+        for (uint32_t id = 0; id < MAX_IDS && !g_lazyConst && !constant; id++)
+            constant = r->reg[id] == reg && ids[id].kind == ID_CONST;
+        if (!constant)
+            regs[n++] = reg;
+    }
+    if (1 + n > g_ctxQwords)
+        g_ctxQwords = 1 + n;
+    for (int k = 0; k < n; k++)
+        emit_l(f, &c, "sq", "VF%02d,%d(VI14)", regs[k], ctx_off(sh, 1 + k));
+    emit_l(f, &c, "bal", "VI13,%s_wait", g_sym);
+    vu(f, "NOP", "NOP", "branch delay slot");
+    for (int k = 0; k < n; k++)
+        emit_l(f, &c, "lq", "VF%02d,%d(VI14)", regs[k], ctx_off(sh, 1 + k));
+}
+
+/* A compute, task or mesh program's start: the storage blocks' addresses and the local size. */
 static void emit_compute_head(FILE *f, const Shader *sh, const char *sym)
 {
     char buf[64], buf2[96], val[32];
+    int task = sh->execModel == ExecTask, mesh = sh->execModel == ExecMesh;
 
     fprintf(f, "; Generated by ps2vk-shaderc from %s. Do not edit.\n", g_src);
     fprintf(f, ";\n; VU1 registers:\n");
     fprintf(f, ";   VF01 gl_WorkGroupID, VF02 gl_LocalInvocationID (w = gl_LocalInvocationIndex), VF03 local size\n");
     fprintf(f, ";   VF04 scratch, VF05-VF31 push constants, uniforms, storage values, constants and temporaries\n");
+    if (mesh)
+        fprintf(f, ";   geometry: VF24-VF26 positions, VF27-VF28 edges, VF29 winding sign, VF30 color, VF31 XYZ2\n");
     fprintf(f, ";   VI01-VI03 work groups left along x, y, z, VI04-VI06 invocations left along x, y, z\n");
-    fprintf(f, ";   VI08 scratch, VI09-VI12 first qword of each storage block, VI13 scratch\n\n");
-    fprintf(f, "\t\t.vu\n\t\t.align 4\n");
+    fprintf(f, ";   VI08 scratch, VI09-VI12 first qword of each storage block, VI13 scratch\n");
+    if (mesh) {
+        fprintf(f, ";   geometry: VI04 primitives left, VI05 record pointer, VI06 GIF packet pointer, VI07 scratch,\n");
+        fprintf(f, ";   VI08, VI13, VI15 a primitive's vertex records, VI14 vertices left, then vertices in the packet\n");
+    }
+    fprintf(f, "\n\t\t.vu\n\t\t.align 4\n");
     fprintf(f, "\t\t.global\t%s_CodeStart\n\t\t.global\t%s_CodeEnd\n", sym, sym);
     fprintf(f, "%s_CodeStart:\n", sym);
+    if (mesh) {
+        fprintf(f, "; a task program enters here; without one the program starts at the next instruction\n");
+        snprintf(buf, sizeof(buf), "isw.x         VI15,%d(VI00)", PVK_VU1_MESH_STATE);
+        vu(f, "NOP", buf, "where to return to");
+    }
+    if (task) {
+        fprintf(f, "; the first work group, and the groups left along each axis\n");
+        snprintf(buf, sizeof(buf), "lq            VF04,%d(VI00)", hdr_addr(PVK_VU1_HEADER_COUNTS));
+        vu(f, "NOP", buf, NULL);
+        snprintf(buf, sizeof(buf), "sq            VF04,%d(VI00)", PVK_VU1_TASK_LEFT);
+        vu(f, "sub.xyzw      VF04,VF00,VF00", buf, NULL);
+        snprintf(buf, sizeof(buf), "sq            VF04,%d(VI00)", PVK_VU1_TASK_NEXT);
+        vu(f, "NOP", buf, NULL);
+        fprintf(f, "%s_group:\n", sym);
+    }
     fprintf(f, "; prologue: storage block addresses and the local size\n");
     for (int i = 0; i < sh->storageCount; i++) {
         snprintf(buf, sizeof(buf), "ilw.%c         VI%02d,%d(VI00)", "xyzw"[i], PVK_VU1_STORAGE_BASE_REG + i,
-                 PVK_VU1_COMPUTE_BASES);
+                 hdr_addr(PVK_VU1_HEADER_BASES));
         snprintf(buf2, sizeof(buf2), "storage '%s', first qword", sh->storage[i].name);
         vu(f, "NOP", buf, buf2);
     }
@@ -4274,25 +4905,47 @@ static void emit_compute_head(FILE *f, const Shader *sh, const char *sym)
         snprintf(buf, sizeof(buf), "addi.%c        VF03,VF03,I", "xyz"[i]);
         vu(f, buf, "NOP", NULL);
     }
-    vu(f, "sub.xyzw      VF01,VF00,VF00", "NOP", "gl_WorkGroupID = 0");
+    if (!task)
+        vu(f, "sub.xyzw      VF01,VF00,VF00", "NOP", "gl_WorkGroupID = 0");
 }
 
 /* The loops over the work groups and over each group's invocations, outermost first; the
- * invocation's IDs go to their qwords before the body. */
+ * invocation's IDs go to their qwords before the body. A task program runs one group per pass. */
 static void emit_compute_loops(FILE *f, const Shader *sh, const char *sym)
 {
     char buf[64];
 
-    fprintf(f, "; work groups along z, y, x, then invocations along z, y, x\n");
-    snprintf(buf, sizeof(buf), "ilw.z         VI03,%d(VI00)", PVK_VU1_COMPUTE_COUNTS);
-    vu(f, "NOP", buf, "work groups along z");
-    fprintf(f, "%s_gz:\n", sym);
-    snprintf(buf, sizeof(buf), "ilw.y         VI02,%d(VI00)", PVK_VU1_COMPUTE_COUNTS);
-    vu(f, "sub.y         VF01,VF00,VF00", buf, "work groups along y");
-    fprintf(f, "%s_gy:\n", sym);
-    snprintf(buf, sizeof(buf), "ilw.x         VI01,%d(VI00)", PVK_VU1_COMPUTE_COUNTS);
-    vu(f, "sub.x         VF01,VF00,VF00", buf, "work groups along x");
-    fprintf(f, "%s_gx:\n", sym);
+    if (sh->execModel == ExecTask) {
+        fprintf(f, "; this work group, then invocations along z, y, x\n");
+        snprintf(buf, sizeof(buf), "lq            VF01,%d(VI00)", PVK_VU1_TASK_NEXT);
+        vu(f, "NOP", buf, "gl_WorkGroupID");
+        snprintf(buf, sizeof(buf), "isw.w         VI00,%d(VI00)", PVK_VU1_MESH_STATE);
+        vu(f, "NOP", buf, "no mesh tasks emitted yet");
+    } else {
+        fprintf(f, "; work groups along z, y, x, then invocations along z, y, x\n");
+        snprintf(buf, sizeof(buf), "ilw.z         VI03,%d(VI00)", hdr_addr(PVK_VU1_HEADER_COUNTS));
+        vu(f, "NOP", buf, "work groups along z");
+        fprintf(f, "%s_gz:\n", sym);
+        snprintf(buf, sizeof(buf), "ilw.y         VI02,%d(VI00)", hdr_addr(PVK_VU1_HEADER_COUNTS));
+        vu(f, "sub.y         VF01,VF00,VF00", buf, "work groups along y");
+        fprintf(f, "%s_gy:\n", sym);
+        snprintf(buf, sizeof(buf), "ilw.x         VI01,%d(VI00)", hdr_addr(PVK_VU1_HEADER_COUNTS));
+        vu(f, "sub.x         VF01,VF00,VF00", buf, "work groups along x");
+        fprintf(f, "%s_gx:\n", sym);
+    }
+    if (sh->execModel == ExecMesh) {
+        snprintf(buf, sizeof(buf), "isw.x         VI00,%d(VI00)", PVK_VU1_MESH_OUTPUTS);
+        vu(f, "NOP", buf, "no vertices until SetMeshOutputsEXT");
+        snprintf(buf, sizeof(buf), "isw.y         VI00,%d(VI00)", PVK_VU1_MESH_OUTPUTS);
+        vu(f, "NOP", buf, "no primitives");
+    }
+    if (sh->barriers) {
+        vu(f, "NOP", "iaddiu        VI07,VI00,0", "barrier(): the first pass over the group's invocations");
+        fprintf(f, "%s_pass:\n", sym);
+        snprintf(buf, sizeof(buf), "iaddiu        VI14,VI00,%d", ctx_start(sh));
+        vu(f, "NOP", buf, "where the first invocation keeps its registers");
+        vu(f, "NOP", "iaddiu        VI15,VI00,0", "no invocation waits at a barrier()");
+    }
     snprintf(buf, sizeof(buf), "iaddiu        VI06,VI00,%u", (unsigned)sh->localSize[2]);
     vu(f, "sub.xyzw      VF02,VF00,VF00", buf, "local ID and index 0; invocations along z");
     fprintf(f, "%s_lz:\n", sym);
@@ -4302,12 +4955,25 @@ static void emit_compute_loops(FILE *f, const Shader *sh, const char *sym)
     snprintf(buf, sizeof(buf), "iaddiu        VI04,VI00,%u", (unsigned)sh->localSize[0]);
     vu(f, "sub.x         VF02,VF00,VF00", buf, "invocations along x");
     fprintf(f, "%s_lx:\n", sym);
-    snprintf(buf, sizeof(buf), "sq.xyz        VF01,%d(VI00)", PVK_VU1_COMPUTE_WORKGROUP);
+    snprintf(buf, sizeof(buf), "sq.xyz        VF01,%d(VI00)", hdr_addr(PVK_VU1_HEADER_WORKGROUP));
     vu(f, "mul.xyz       VF04,VF01,VF03", buf, "gl_WorkGroupID * local size");
-    snprintf(buf, sizeof(buf), "sq            VF02,%d(VI00)", PVK_VU1_COMPUTE_LOCAL);
+    snprintf(buf, sizeof(buf), "sq            VF02,%d(VI00)", hdr_addr(PVK_VU1_HEADER_LOCAL));
     vu(f, "add.xyz       VF04,VF04,VF02", buf, "+ gl_LocalInvocationID");
-    snprintf(buf, sizeof(buf), "sq.xyz        VF04,%d(VI00)", PVK_VU1_COMPUTE_GLOBAL);
+    snprintf(buf, sizeof(buf), "sq.xyz        VF04,%d(VI00)", hdr_addr(PVK_VU1_HEADER_GLOBAL));
     vu(f, "NOP", buf, "gl_GlobalInvocationID");
+    if (sh->barriers) {
+        snprintf(buf, sizeof(buf), "ibeq          VI07,VI00,%s_run", sym);
+        vu(f, "NOP", buf, "first pass: the invocation starts");
+        snprintf(buf, sizeof(buf), "ilw.x         VI13,%d(VI14)", ctx_off(sh, 0));
+        vu(f, "NOP", buf, "delay slot: where the invocation waits, 0 = it has returned");
+        vu(f, "NOP", "NOP", "the branch reads VI after one instruction");
+        snprintf(buf, sizeof(buf), "ibeq          VI13,VI00,%s_done", sym);
+        vu(f, "NOP", buf, NULL);
+        vu(f, "NOP", "NOP", "branch delay slot");
+        vu(f, "NOP", "jr            VI13", "go on behind its barrier()");
+        vu(f, "NOP", "NOP", "branch delay slot");
+        fprintf(f, "%s_run:\n", sym);
+    }
 }
 
 /* One loop's end: count the axis up, count the loop down, branch back while it has iterations left. */
@@ -4323,15 +4989,310 @@ static void emit_loop_end(FILE *f, const char *sym, const char *upper, int vi, c
     vu(f, "NOP", "NOP", "branch delay slot");
 }
 
-static void emit_compute_tail(FILE *f, const char *sym)
+static void emit_local_ends(FILE *f, const Shader *sh, const char *sym)
 {
-    fprintf(f, "; next invocation, then next work group\n");
+    fprintf(f, "; next invocation%s\n", sh->execModel == ExecGLCompute ? ", then next work group" : "");
     emit_loop_end(f, sym, "addw.xw       VF02,VF02,VF00w", 4, "lx", "local x + 1, index + 1");
     emit_loop_end(f, sym, "addw.y        VF02,VF02,VF00w", 5, "ly", "local y + 1");
     emit_loop_end(f, sym, "addw.z        VF02,VF02,VF00w", 6, "lz", "local z + 1");
+}
+
+static void emit_group_ends(FILE *f, const Shader *sh, const char *sym)
+{
+    if (sh->execModel != ExecGLCompute)
+        fprintf(f, "; next work group\n");
     emit_loop_end(f, sym, "addw.x        VF01,VF01,VF00w", 1, "gx", "work group x + 1");
     emit_loop_end(f, sym, "addw.y        VF01,VF01,VF00w", 2, "gy", "work group y + 1");
     emit_loop_end(f, sym, "addw.z        VF01,VF01,VF00w", 3, "gz", "work group z + 1");
+}
+
+/* A lower instruction alone, or under the given upper one. */
+static void lo(FILE *f, const char *upper, const char *comment, const char *fmt, ...)
+{
+    char buf[96];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    vu(f, upper ? upper : "NOP", buf, comment);
+}
+
+/* A mesh work group's geometry: vertex records to GS formats in place, then each primitive's
+ * vertices into a GIF packet, kicked when full while the next fills the other packet. */
+static void emit_mesh_geometry(FILE *f, const Shader *sh, const char *sym)
+{
+    static const int addr[3] = { 8, 13, 15 };
+    int st = sh->texcoordVar ? 1 : 0, fog = sh->fogVar ? 1 : 0, out = 2 + st + fog, vpp = sh->meshPrimVertices;
+    int vertexColor = sh->colorVar && !sh->meshColorPerPrim;
+
+    fprintf(f, "; geometry: the vertex records to screen coordinates and GS formats, in place\n");
+    lo(f, NULL, "primitives written", "ilw.y         VI04,%d(VI00)", PVK_VU1_MESH_OUTPUTS);
+    lo(f, NULL, "vertices written", "ilw.x         VI14,%d(VI00)", PVK_VU1_MESH_OUTPUTS);
+    lo(f, NULL, "viewport scale", "lq            VF26,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_VIEWPORT_SCALE);
+    lo(f, NULL, "viewport offset", "lq            VF27,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_VIEWPORT_OFFSET);
+    lo(f, NULL, "color scale", "lq            VF28,%d(VI00)", PVK_VU1_CONTEXT_ADDR + PVK_VU1_CTX_COLOR_SCALE);
+    lo(f, NULL, "no primitives: nothing to draw", "ibeq          VI04,VI00,%s_drawn", sym);
+    lo(f, NULL, "delay slot: first vertex record", "iaddiu        VI05,VI00,%d", sh->vertBase);
+    lo(f, NULL, "no vertices", "ibeq          VI14,VI00,%s_drawn", sym);
+    if (st)
+        lo(f, NULL, "delay slot: 1 = UV in texels (PRIM.FST)", "ilw.y         VI13,%d(VI00)", PVK_VU1_MESH_STATE);
+    else
+        vu(f, "NOP", "NOP", "branch delay slot");
+    fprintf(f, "%s_vertex:\n", sym);
+    lo(f, NULL, "gl_Position", "lq            VF24,0(VI05)");
+    vu(f, "NOP", "div           Q,VF00w,VF24w", "Q = 1 / w");
+    vu(f, "NOP", "waitq", NULL);
+    vu(f, "mulq.xyz      VF25,VF24,Q", "NOP", NULL);
+    if (st) {
+        lo(f, NULL, "texture coordinate", "lq            VF29,%d(VI05)", sh->texcoordSlot);
+        lo(f, NULL, NULL, "ibne          VI13,VI00,%s_uv", sym);
+        vu(f, "NOP", "NOP", "branch delay slot");
+        vu(f, "mulq.xy       VF29,VF29,Q", "NOP", "S / w, T / w");
+        lo(f, NULL, NULL, "b             %s_st", sym);
+        vu(f, "addq.z        VF29,VF00,Q", "NOP", "delay slot: Q = 1 / w");
+        fprintf(f, "%s_uv:\n", sym);
+        vu(f, "ftoi4.xy      VF29,VF29", "NOP", "U, V to 12.4 fixed point");
+        fprintf(f, "%s_st:\n", sym);
+        lo(f, NULL, "ST (and Q), or UV", "sq            VF29,%d(VI05)", sh->texcoordSlot);
+    }
+    vu(f, "mul.xyz       VF25,VF25,VF26", "NOP", "viewport scale");
+    vu(f, "add.xyz       VF25,VF25,VF27", "NOP", "viewport offset");
+    lo(f, NULL, "screen x, y and depth, floats for the winding test", "sq.xyz        VF25,0(VI05)");
+    if (vertexColor) {
+        lo(f, NULL, "color", "lq            VF30,%d(VI05)", sh->colorSlot);
+        vu(f, "mul.xyzw      VF30,VF30,VF28", "NOP", "color 0..1 to GS range");
+        vu(f, "ftoi0.xyzw    VF30,VF30", "NOP", NULL);
+        lo(f, NULL, "RGBAQ", "sq            VF30,%d(VI05)", sh->colorSlot);
+    }
+    if (fog) {
+        lo(f, "sub.w         VF04,VF00,VF00", "fog amount", "lq            VF31,%d(VI05)", sh->fogSlot);
+        vu(f, "maxx.w        VF04,VF04,VF31x", "NOP", "not below 0");
+        vu(f, "miniw.w       VF04,VF04,VF00w", "NOP", "not above 1");
+        vu(f, "mulx.w        VF04,VF04,VF28x", "NOP", "0..1 to 0..255");
+        vu(f, "ftoi4.w       VF04,VF04", "NOP", "the FOG register's F field starts at bit 4 of w");
+        lo(f, NULL, "FOG", "sq.w          VF04,%d(VI05)", sh->fogSlot);
+    }
+    vu(f, "NOP", "isubiu        VI14,VI14,1", NULL);
+    lo(f, NULL, "next vertex record", "iaddiu        VI05,VI05,%d", sh->vertQwords);
+    lo(f, NULL, NULL, "ibne          VI14,VI00,%s_vertex", sym);
+    vu(f, "NOP", "NOP", "branch delay slot");
+
+    if (sh->meshColorPerPrim) {
+        fprintf(f, "; the primitives' colors to the GS range\n");
+        lo(f, NULL, "first primitive record", "iaddiu        VI05,VI00,%d", sh->primBase);
+        vu(f, "NOP", "iadd          VI14,VI04,VI00", "primitives");
+        fprintf(f, "%s_color:\n", sym);
+        lo(f, NULL, "color", "lq            VF30,%d(VI05)", sh->colorSlot);
+        vu(f, "mul.xyzw      VF30,VF30,VF28", "isubiu        VI14,VI14,1", "color 0..1 to GS range");
+        vu(f, "ftoi0.xyzw    VF30,VF30", "NOP", NULL);
+        lo(f, NULL, "RGBAQ", "sq            VF30,%d(VI05)", sh->colorSlot);
+        lo(f, NULL, NULL, "ibne          VI14,VI00,%s_color", sym);
+        lo(f, NULL, "delay slot: next primitive record", "iaddiu        VI05,VI05,%d", sh->primQwords);
+    } else if (!sh->colorVar) {
+        vu(f, "mul.xyzw      VF30,VF00,VF28", "NOP", "no color output: black");
+        vu(f, "ftoi0.xyzw    VF30,VF30", "NOP", NULL);
+    }
+
+    fprintf(f, "; each primitive's vertices into the GIF packet\n");
+    lo(f, NULL, "first primitive record", "iaddiu        VI05,VI00,%d", sh->primBase);
+    lo(f, NULL, "the GIF packet to fill", "ilw.w         VI06,%d(VI00)", PVK_VU1_MESH_OUTPUTS);
+    lo(f, "sub.w         VF31,VF00,VF00", "z = winding sign; XYZ2 w = 0 (ADC off)", "lq            VF29,%d(VI00)",
+       PVK_VU1_MESH_CULL);
+    vu(f, "NOP", "iaddiu        VI14,VI00,0", "vertices in the packet");
+    vu(f, "NOP", "iaddiu        VI06,VI06,1", "past its tag");
+    fprintf(f, "%s_prim:\n", sym);
+    if (sh->meshCull)
+        vu(f, "NOP", "ilw.w         VI07,0(VI05)", "gl_CullPrimitiveEXT");
+    for (int k = 0; k < vpp; k++)
+        lo(f, NULL, k ? NULL : "the primitive's vertex indices", "ilw.%c         VI%02d,0(VI05)", "xyz"[k], addr[k]);
+    if (sh->meshCull) {
+        lo(f, NULL, "culled by the shader", "ibne          VI07,VI00,%s_skip", sym);
+        vu(f, "NOP", "NOP", "branch delay slot");
+    }
+    for (int k = 0; k < vpp && sh->vertQwords > 1; k++) {
+        /* index * qwords per vertex record */
+        if (sh->vertQwords == 3) {
+            lo(f, NULL, k ? NULL : "index * 3 qwords", "iadd          VI07,VI%02d,VI%02d", addr[k], addr[k]);
+            lo(f, NULL, NULL, "iadd          VI%02d,VI07,VI%02d", addr[k], addr[k]);
+        } else {
+            lo(f, NULL, k ? NULL : "index * qwords per record", "iadd          VI%02d,VI%02d,VI%02d", addr[k],
+               addr[k], addr[k]);
+            if (sh->vertQwords == 4)
+                lo(f, NULL, NULL, "iadd          VI%02d,VI%02d,VI%02d", addr[k], addr[k], addr[k]);
+        }
+    }
+    for (int k = 0; k < vpp; k++)
+        lo(f, NULL, k ? NULL : "screen positions", "lq            VF%02d,%d(VI%02d)", 24 + k, sh->vertBase, addr[k]);
+    if (vpp == 3) {
+        fprintf(f, "; culling: a negative signed area * winding sign drops the triangle\n");
+        lo(f, "sub.xyz       VF27,VF25,VF24", "P1 - P0; 1 = cull by winding", "ilw.z         VI07,%d(VI00)",
+           PVK_VU1_MESH_STATE);
+        vu(f, "sub.xyz       VF28,VF26,VF24", "NOP", "P2 - P0");
+        lo(f, NULL, "no culling", "ibeq          VI07,VI00,%s_draw", sym);
+        vu(f, "NOP", "NOP", "branch delay slot");
+        vu(f, "opmula.xyz    ACC,VF27,VF28", "NOP", NULL);
+        vu(f, "opmsub.xyz    VF27,VF28,VF27", "NOP", "z = signed area");
+        vu(f, "mul.z         VF27,VF27,VF29", "NOP", "area * sign, negative = cull");
+        vu(f, "NOP", "iaddiu        VI07,VI00,0x20", "MAC flags land 4 cycles later; z negative flag");
+        vu(f, "NOP", "NOP", NULL);
+        vu(f, "NOP", "NOP", NULL);
+        vu(f, "NOP", "NOP", NULL);
+        vu(f, "NOP", "fmand         VI07,VI07", "sign flag of z");
+        vu(f, "NOP", "NOP", "the branch reads VI after one instruction");
+        lo(f, NULL, "back facing", "ibne          VI07,VI00,%s_skip", sym);
+        vu(f, "NOP", "NOP", "branch delay slot");
+        fprintf(f, "%s_draw:\n", sym);
+    }
+    for (int k = 0; k < vpp; k++) {
+        char up[48];
+
+        snprintf(up, sizeof(up), "ftoi4.xy      VF31,VF%02d", 24 + k);
+        if (st)
+            lo(f, up, "x, y to 12.4 fixed point; ST or UV", "lq            VF04,%d(VI%02d)",
+               sh->vertBase + sh->texcoordSlot, addr[k]);
+        else
+            vu(f, up, "NOP", "x, y to 12.4 fixed point");
+        snprintf(up, sizeof(up), "ftoi0.z       VF31,VF%02d", 24 + k);
+        if (st)
+            lo(f, up, "z to integer depth", "sq            VF04,%d(VI06)", k * out);
+        else
+            vu(f, up, "NOP", "z to integer depth");
+        if (vertexColor)
+            lo(f, NULL, "RGBAQ", "lq            VF04,%d(VI%02d)", sh->vertBase + sh->colorSlot, addr[k]);
+        else if (sh->meshColorPerPrim)
+            lo(f, NULL, "RGBAQ of the primitive", "lq            VF04,%d(VI05)", sh->colorSlot);
+        lo(f, NULL, NULL, "sq            VF%02d,%d(VI06)", sh->colorVar ? 4 : 30, k * out + st);
+        if (fog) {
+            lo(f, NULL, "FOG", "lq            VF04,%d(VI%02d)", sh->vertBase + sh->fogSlot, addr[k]);
+            lo(f, NULL, NULL, "sq            VF04,%d(VI06)", k * out + st + 1);
+        }
+        lo(f, NULL, "XYZ2", "sq            VF31,%d(VI06)", k * out + st + fog + 1);
+    }
+    lo(f, NULL, NULL, "iaddiu        VI06,VI06,%d", vpp * out);
+    lo(f, NULL, NULL, "iaddiu        VI14,VI14,%d", vpp);
+    fprintf(f, "%s_skip:\n", sym);
+    lo(f, NULL, "next primitive record", "iaddiu        VI05,VI05,%d", sh->primQwords);
+    vu(f, "NOP", "isubiu        VI04,VI04,1", NULL);
+    lo(f, NULL, "vertices of a full packet", "iaddiu        VI07,VI00,%d", sh->kickVertices);
+    vu(f, "NOP", "NOP", "the branch reads VI after one instruction");
+    lo(f, NULL, "full: send it", "ibeq          VI14,VI07,%s_kick", sym);
+    vu(f, "NOP", "NOP", "branch delay slot");
+    lo(f, NULL, NULL, "ibne          VI04,VI00,%s_prim", sym);
+    vu(f, "NOP", "NOP", "branch delay slot");
+    lo(f, NULL, "the last packet is empty", "ibeq          VI14,VI00,%s_drawn", sym);
+    vu(f, "NOP", "NOP", "branch delay slot");
+    fprintf(f, "%s_kick:\n", sym);
+    fprintf(f, "; send the packet to the GS; the next one fills the other packet meanwhile\n");
+    lo(f, NULL, NULL, "ilw.w         VI07,%d(VI00)", PVK_VU1_MESH_OUTPUTS);
+    lo(f, NULL, "GIF tag", "lq            VF04,%d(VI00)", PVK_VU1_MESH_GIFTAG);
+    vu(f, "NOP", "iaddiu        VI08,VI14,0x4000", NULL);
+    vu(f, "NOP", "iaddiu        VI08,VI08,0x4000", "EOP");
+    vu(f, "NOP", "sq            VF04,0(VI07)", NULL);
+    vu(f, "NOP", "isw.x         VI08,0(VI07)", "NLOOP = its vertices");
+    vu(f, "NOP", "xgkick        VI07", NULL);
+    lo(f, NULL, NULL, "iaddiu        VI08,VI00,%d", sh->kickA + sh->kickB);
+    vu(f, "NOP", "isub          VI07,VI08,VI07", "the other packet");
+    lo(f, NULL, NULL, "isw.w         VI07,%d(VI00)", PVK_VU1_MESH_OUTPUTS);
+    vu(f, "NOP", "iaddiu        VI06,VI07,1", "past its tag");
+    vu(f, "NOP", "iaddiu        VI14,VI00,0", NULL);
+    lo(f, NULL, NULL, "ibne          VI04,VI00,%s_prim", sym);
+    vu(f, "NOP", "NOP", "branch delay slot");
+    fprintf(f, "%s_drawn:\n", sym);
+}
+
+/* Compute stops after its last group; mesh returns to its caller or stops; task steps to its
+ * next group, calls the mesh program behind it if the group emitted tasks, and starts over. */
+static void emit_compute_tail(FILE *f, const Shader *sh, const char *sym)
+{
+    char buf[64];
+
+    if (sh->barriers) {
+        snprintf(buf, sizeof(buf), "b             %s_done", sym);
+        vu(f, "NOP", buf, "the invocation has returned");
+        snprintf(buf, sizeof(buf), "isw.x         VI00,%d(VI14)", ctx_off(sh, 0));
+        vu(f, "NOP", buf, "delay slot: nowhere to go on");
+        fprintf(f, "%s_wait:\n", sym);
+        snprintf(buf, sizeof(buf), "isw.x         VI13,%d(VI14)", ctx_off(sh, 0));
+        vu(f, "NOP", buf, "barrier(): where the invocation goes on");
+        vu(f, "NOP", "iaddiu        VI15,VI00,1", "an invocation waits");
+        fprintf(f, "%s_done:\n", sym);
+        snprintf(buf, sizeof(buf), "%s        VI14,VI14,%d", sh->execModel == ExecMesh ? "isubiu" : "iaddiu",
+                 g_ctxQwords);
+        vu(f, "NOP", buf, "the next invocation's registers");
+    }
+    emit_local_ends(f, sh, sym);
+    if (sh->barriers) {
+        snprintf(buf, sizeof(buf), "ibeq          VI15,VI00,%s_passed", sym);
+        vu(f, "NOP", buf, "no invocation waits: the group is done");
+        vu(f, "NOP", "NOP", "branch delay slot");
+        snprintf(buf, sizeof(buf), "b             %s_pass", sym);
+        vu(f, "NOP", buf, "another pass");
+        vu(f, "NOP", "iaddiu        VI07,VI00,1", "delay slot: invocations go on where they wait");
+        fprintf(f, "%s_passed:\n", sym);
+    }
+    if (sh->execModel == ExecTask) {
+        fprintf(f, "; the next work group: x, then y, then z\n");
+        for (int i = 0; i < 3; i++) {
+            snprintf(buf, sizeof(buf), "ilw.%c         VI%02d,%d(VI00)", "xyz"[i], 1 + i, PVK_VU1_TASK_LEFT);
+            vu(f, "NOP", buf, i ? NULL : "work groups left along x, y, z");
+        }
+        for (int i = 0; i < 3; i++) {
+            char up[48];
+
+            snprintf(up, sizeof(up), "addw.%c        VF01,VF01,VF00w", "xyz"[i]);
+            snprintf(buf, sizeof(buf), "isubiu        VI%02d,VI%02d,1", 1 + i, 1 + i);
+            vu(f, up, buf, NULL);
+            if (i == 2)
+                break;
+            vu(f, "NOP", "NOP", "the branch reads VI after one instruction");
+            snprintf(buf, sizeof(buf), "ibne          VI%02d,VI00,%s_next", 1 + i, sym);
+            vu(f, "NOP", buf, NULL);
+            vu(f, "NOP", "NOP", "branch delay slot");
+            snprintf(up, sizeof(up), "sub.%c         VF01,VF00,VF00", "xyz"[i]);
+            snprintf(buf, sizeof(buf), "ilw.%c         VI%02d,%d(VI00)", "xyz"[i], 1 + i, hdr_addr(PVK_VU1_HEADER_COUNTS));
+            vu(f, up, buf, "this axis starts over");
+        }
+        fprintf(f, "%s_next:\n", sym);
+        snprintf(buf, sizeof(buf), "sq.xyz        VF01,%d(VI00)", PVK_VU1_TASK_NEXT);
+        vu(f, "NOP", buf, NULL);
+        for (int i = 0; i < 3; i++) {
+            snprintf(buf, sizeof(buf), "isw.%c         VI%02d,%d(VI00)", "xyz"[i], 1 + i, PVK_VU1_TASK_LEFT);
+            vu(f, "NOP", buf, NULL);
+        }
+        fprintf(f, "; the mesh program, if this group emitted mesh tasks\n");
+        snprintf(buf, sizeof(buf), "ilw.w         VI08,%d(VI00)", PVK_VU1_MESH_STATE);
+        vu(f, "NOP", buf, NULL);
+        vu(f, "NOP", "NOP", "the branch reads VI after one instruction");
+        snprintf(buf, sizeof(buf), "ibeq          VI08,VI00,%s_meshed", sym);
+        vu(f, "NOP", buf, NULL);
+        vu(f, "NOP", "NOP", "branch delay slot");
+        snprintf(buf, sizeof(buf), "bal           VI15,%s_CodeEnd", sym);
+        vu(f, "NOP", buf, "the pipeline places the mesh program there");
+        vu(f, "NOP", "NOP", "branch delay slot");
+        fprintf(f, "%s_meshed:\n", sym);
+        snprintf(buf, sizeof(buf), "ilw.z         VI03,%d(VI00)", PVK_VU1_TASK_LEFT);
+        vu(f, "NOP", buf, "0 after the last work group");
+        vu(f, "NOP", "NOP", "the branch reads VI after one instruction");
+        snprintf(buf, sizeof(buf), "ibne          VI03,VI00,%s_group", sym);
+        vu(f, "NOP", buf, NULL);
+        vu(f, "NOP", "NOP", "branch delay slot");
+    } else if (sh->execModel == ExecMesh) {
+        emit_mesh_geometry(f, sh, sym);
+        emit_group_ends(f, sh, sym);
+        fprintf(f, "; back to the task program, if one called\n");
+        snprintf(buf, sizeof(buf), "ilw.x         VI15,%d(VI00)", PVK_VU1_MESH_STATE);
+        vu(f, "NOP", buf, NULL);
+        vu(f, "NOP", "NOP", "the branch reads VI after one instruction");
+        snprintf(buf, sizeof(buf), "ibeq          VI15,VI00,%s_stop", sym);
+        vu(f, "NOP", buf, NULL);
+        vu(f, "NOP", "NOP", "branch delay slot");
+        vu(f, "NOP", "jr            VI15", NULL);
+        vu(f, "NOP", "NOP", "branch delay slot");
+        fprintf(f, "%s_stop:\n", sym);
+    } else {
+        emit_group_ends(f, sh, sym);
+    }
     fprintf(f, "; stop\n");
     vu(f, "NOP[E]", "NOP", NULL);
     vu(f, "NOP", "NOP", NULL);
@@ -4343,9 +5304,10 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
     char buf[64], buf2[64];
     static Regs r;
     static int def[MAX_IDS], labelAt[MAX_IDS], targeted[MAX_IDS];
-    int i, constants = 0, compute = sh->execModel == ExecGLCompute;
+    int i, constants = 0, compute = IS_GROUPED(sh), mesh = sh->execModel == ExecMesh;
 
     g_sym = sym;
+    g_lazyConst = mesh;
     g_pool = compute ? g_computePool : g_vertexPool;
     g_poolCount = compute ? (int)(sizeof(g_computePool) / sizeof(g_computePool[0]))
                           : (int)(sizeof(g_vertexPool) / sizeof(g_vertexPool[0]));
@@ -4452,7 +5414,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         emit_compute_head(f, sh, sym);
     }
 
-    for (i = 0; i <= sh->bodyCount + 3; i++) {
+    for (i = 0; i <= sh->bodyCount + 3 && !g_lazyConst; i++) {
         uint32_t use[MAX_OPERANDS] = { 0 };
         if (i < sh->bodyCount) {
             for (int j = 0; j < sh->body[i].nops && !sh->body[i].dead; j++)
@@ -4579,14 +5541,21 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             }
             continue;
         }
-        if (b->op == OpStorStore) {
+        if (b->op == OpBarrier) {
+            emit_barrier(f, &r, ids, sh, line);
+            continue;
+        }
+        if (b->op == OpStorStore || b->op == OpEmitTasks) {
             int t;
             for (int j = 0; j < b->nops; j++)
                 reg_ensure_loaded(f, &r, ids, sh, b->ops[j]);
             for (int j = 0; j < b->nops; j++)
                 regs[j] = reg_of(&r, ids, sh, b->ops[j]);
             t = reg_alloc(&r);
-            emit_stor_store(f, ids, b, t, regs, line);
+            if (b->op == OpEmitTasks)
+                emit_tasks(f, ids, b, t, regs, line);
+            else
+                emit_stor_store(f, ids, b, t, regs, line);
             r.busy[t] = 0;
             for (int j = 0; j < b->nops; j++)
                 reg_release(&r, ids, sh, b->ops[j], i);
@@ -4787,7 +5756,7 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         vu(f, "NOP", "xgkick        VI04", NULL);
         vu(f, "NOP[E]", "NOP", NULL);
     } else {
-        emit_compute_tail(f, sym);
+        emit_compute_tail(f, sh, sym);
     }
     vu(f, "NOP", "NOP", NULL);
     fprintf(f, "\t\t.align 4\n%s_CodeEnd:\n", sym);
@@ -4820,7 +5789,8 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             fail("%s holds no microcode", obj);
 
         memset(&h, 0, sizeof(h));
-        h.stage       = compute ? PVK_SHADER_STAGE_COMPUTE_BIT : PVK_SHADER_STAGE_VERTEX;
+        h.stage       = mesh ? PVK_SHADER_STAGE_MESH_BIT_EXT : sh->execModel == ExecTask ? PVK_SHADER_STAGE_TASK_BIT_EXT
+                      : compute ? PVK_SHADER_STAGE_COMPUTE_BIT : PVK_SHADER_STAGE_VERTEX;
         h.codeWords   = (end - start) / 4;
         h.convertWord = compute ? 0 : (vu_label(obj, &o, sym, "_Convert") - start) / 4;
         h.clampCount  = (uint32_t)g_clamps;
@@ -4838,9 +5808,9 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
         h.inputCount = (uint32_t)sh->inputCount;
         for (i = 0; i < sh->inputCount; i++)
             h.inputLocations[i] = (uint32_t)sh->inputs[i].location;
-        h.colorOutputLocation    = sh->colorValue ? sh->colorLocation : -1;
-        h.texcoordOutputLocation = sh->texcoordValue ? sh->texcoordLocation : -1;
-        h.fogOutputLocation      = sh->fogValue ? sh->fogLocation : -1;
+        h.colorOutputLocation    = (mesh ? sh->colorVar : sh->colorValue) ? sh->colorLocation : -1;
+        h.texcoordOutputLocation = (mesh ? sh->texcoordVar : sh->texcoordValue) ? sh->texcoordLocation : -1;
+        h.fogOutputLocation      = (mesh ? sh->fogVar : sh->fogValue) ? sh->fogLocation : -1;
         h.pushConstantBytes      = sh->pushBytes;
         h.uniformBlockCount      = (uint32_t)sh->uniformCount;
         for (i = 0; i < sh->uniformCount; i++) {
@@ -4861,6 +5831,26 @@ static void emit_vertex(const Shader *sh, const IdInfo *ids, const char *base, c
             h.storageBlocks[i].arrayOffset = sh->storage[i].arrayOffset;
             h.storageBlocks[i].arrayStride = sh->storage[i].arrayStride;
             h.storageBlocks[i].written     = (uint32_t)sh->storage[i].written;
+        }
+        if (mesh) {
+            h.meshMaxVertices       = sh->meshMaxVertices;
+            h.meshMaxPrimitives     = sh->meshMaxPrimitives;
+            h.meshPrimitiveVertices = (uint32_t)sh->meshPrimVertices;
+            h.meshOutputAddress     = (uint32_t)sh->vertBase;
+            h.meshKickAddress       = (uint32_t)sh->kickA;
+        }
+        h.payloadBytes = (uint32_t)sh->payloadQwords * 16;
+        if (compute) {
+            /* Behind the body, where the registers a barrier() keeps are known. */
+            int kept = g_ctxQwords * (int)(sh->localSize[0] * sh->localSize[1] * sh->localSize[2]);
+            int top = mesh ? sh->vertBase : PVK_VU1_MEMORY_QWORDS;
+
+            if (PVK_VU1_PAYLOAD_ADDR + sh->payloadQwords + sh->sharedQwords + kept > top)
+                fail("compute shader's barrier() keeps %d qwords for each of its %u invocations, %d bytes of "
+                     "VU1 memory; behind the task payload and the shared variables it has %d", g_ctxQwords,
+                     (unsigned)(sh->localSize[0] * sh->localSize[1] * sh->localSize[2]), kept * 16,
+                     (top - PVK_VU1_PAYLOAD_ADDR - sh->payloadQwords - sh->sharedQwords) * 16);
+            h.sharedBytes = (uint32_t)(sh->sharedQwords + kept) * 16;
         }
         write_pvs(base, &h, g_src, sh->entryPoint, (const uint32_t *)(o.text + start), clamps, specs);
         remove(obj);
@@ -4951,8 +5941,12 @@ static void write_listing(const char *base)
 
     fprintf(f, "name = %s\n", (const char *)file + h->nameOffset);
     fprintf(f, "entryPoint = %s\n", (const char *)file + h->entryPointOffset);
-    if (h->stage == PVK_SHADER_STAGE_VERTEX || h->stage == PVK_SHADER_STAGE_COMPUTE_BIT) {
-        fprintf(f, "stage = %s\n", h->stage == PVK_SHADER_STAGE_VERTEX ? "vertex" : "compute");
+    if (h->stage != PVK_SHADER_STAGE_FRAGMENT) {
+        int grouped = h->stage != PVK_SHADER_STAGE_VERTEX;
+
+        fprintf(f, "stage = %s\n", h->stage == PVK_SHADER_STAGE_VERTEX ? "vertex"
+                : h->stage == PVK_SHADER_STAGE_COMPUTE_BIT ? "compute"
+                : h->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? "task" : "mesh");
         fprintf(f, "codeWords = %u\n", (unsigned)h->codeWords);
         fprintf(f, "convertWord = %u\n", (unsigned)h->convertWord);
         fprintf(f, "clamps =");
@@ -4962,7 +5956,7 @@ static void write_listing(const char *base)
         for (uint32_t i = 0; i < h->specCount; i++)
             fprintf(f, "specConstant = { constantID %u, word %u, %s }\n", (unsigned)specs[i].constantID,
                    (unsigned)specs[i].word, specs[i].type < 4 ? spec_type_names[specs[i].type] : "?");
-        if (h->stage == PVK_SHADER_STAGE_COMPUTE_BIT) {
+        if (grouped) {
             fprintf(f, "localSize = %u %u %u\n", (unsigned)h->localSize[0], (unsigned)h->localSize[1],
                     (unsigned)h->localSize[2]);
             for (uint32_t i = 0; i < h->storageBlockCount && i < PVK_MAX_STORAGE_BLOCKS; i++)
@@ -4971,6 +5965,17 @@ static void write_listing(const char *base)
                         (unsigned)h->storageBlocks[i].bytes, (unsigned)h->storageBlocks[i].arrayOffset,
                         (unsigned)h->storageBlocks[i].arrayStride, (unsigned)h->storageBlocks[i].written);
         }
+        if (h->stage == PVK_SHADER_STAGE_MESH_BIT_EXT) {
+            fprintf(f, "meshMaxVertices = %u\n", (unsigned)h->meshMaxVertices);
+            fprintf(f, "meshMaxPrimitives = %u\n", (unsigned)h->meshMaxPrimitives);
+            fprintf(f, "meshPrimitiveVertices = %u\n", (unsigned)h->meshPrimitiveVertices);
+            fprintf(f, "meshOutputAddress = %u\n", (unsigned)h->meshOutputAddress);
+            fprintf(f, "meshKickAddress = %u\n", (unsigned)h->meshKickAddress);
+        }
+        if (h->stage == PVK_SHADER_STAGE_MESH_BIT_EXT || h->stage == PVK_SHADER_STAGE_TASK_BIT_EXT)
+            fprintf(f, "payloadBytes = %u\n", (unsigned)h->payloadBytes);
+        if (h->stage == PVK_SHADER_STAGE_MESH_BIT_EXT || h->stage == PVK_SHADER_STAGE_TASK_BIT_EXT)
+            fprintf(f, "sharedBytes = %u\n", (unsigned)h->sharedBytes);
         fprintf(f, "inputLocations =");
         for (uint32_t i = 0; i < h->inputCount && i < PVK_MAX_VERTEX_INPUTS; i++)
             fprintf(f, " %u", (unsigned)h->inputLocations[i]);

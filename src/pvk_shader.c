@@ -55,7 +55,8 @@ static const char *check_pvs(const PvkPvsHeader *h, size_t codeSize)
     if (h->fileBytes < sizeof(*h) || h->fileBytes > codeSize || h->fileBytes % 4)
         return "the .pvs file is cut short";
     if (h->stage != PVK_SHADER_STAGE_VERTEX && h->stage != PVK_SHADER_STAGE_FRAGMENT &&
-        h->stage != PVK_SHADER_STAGE_COMPUTE_BIT)
+        h->stage != PVK_SHADER_STAGE_COMPUTE_BIT && h->stage != PVK_SHADER_STAGE_TASK_BIT_EXT &&
+        h->stage != PVK_SHADER_STAGE_MESH_BIT_EXT)
         return "the .pvs file names no shader stage";
     if (!string_at(h, h->nameOffset) || !string_at(h, h->entryPointOffset))
         return "the .pvs file's names run past its end";
@@ -70,8 +71,13 @@ static const char *check_pvs(const PvkPvsHeader *h, size_t codeSize)
         return "the .pvs file's microcode runs past its end";
     if (h->convertWord >= h->codeWords || h->inputCount > PVK_MAX_VERTEX_INPUTS ||
         h->uniformBlockCount > PVK_MAX_UNIFORM_BLOCKS || h->storageBlockCount > PVK_MAX_STORAGE_BLOCKS ||
-        (h->stage == PVK_SHADER_STAGE_COMPUTE_BIT && (h->inputCount ||
+        (h->stage != PVK_SHADER_STAGE_VERTEX && (h->inputCount ||
          !h->localSize[0] || !h->localSize[1] || !h->localSize[2])))
+        return "the .pvs file's header is corrupt";
+    if (h->stage == PVK_SHADER_STAGE_MESH_BIT_EXT &&
+        (h->meshPrimitiveVertices < 1 || h->meshPrimitiveVertices > 3 || !h->meshMaxVertices || !h->meshMaxPrimitives ||
+         h->meshOutputAddress < PVK_VU1_PAYLOAD_ADDR || h->meshOutputAddress >= h->meshKickAddress ||
+         h->meshKickAddress >= PVK_VU1_MEMORY_QWORDS))
         return "the .pvs file's header is corrupt";
     for (i = 0; i < h->clampCount; i++)
         if (((const uint32_t *)((const char *)h + h->clampsOffset))[i] >= h->codeWords)
@@ -186,6 +192,13 @@ PvkResult pvkCreateShaderModule(PvkDevice device, const PvkShaderModuleCreateInf
     memcpy(sc.localSize, h->localSize, sizeof(sc.localSize));
     sc.storageBlockCount      = h->storageBlockCount;
     memcpy(sc.storageBlocks, h->storageBlocks, sizeof(sc.storageBlocks));
+    sc.meshMaxVertices        = h->meshMaxVertices;
+    sc.meshMaxPrimitives      = h->meshMaxPrimitives;
+    sc.meshPrimitiveVertices  = h->meshPrimitiveVertices;
+    sc.meshOutputAddress      = h->meshOutputAddress;
+    sc.meshKickAddress        = h->meshKickAddress;
+    sc.payloadBytes           = h->payloadBytes;
+    sc.sharedBytes            = h->sharedBytes;
 
     data->refs = 1;
     data->code = sc;

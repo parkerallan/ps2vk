@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+// A quad whose 4 invocations each write one corner to a shared array; behind the barrier() every
+// invocation moves its vertex toward the corners' centre, which it reads from the others' writes.
+layout(local_size_x = 4) in;
+layout(triangles, max_vertices = 4, max_primitives = 2) out;
+
+layout(push_constant) uniform Push {
+    vec4 centre;
+    float shrink;
+} pc;
+
+shared vec4 corner[4];
+shared float size;
+
+layout(location = 0) out vec4 vColor[];
+
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+    float x = (i == 1u || i == 3u) ? 1.0 : -1.0;
+    float y = i >= 2u ? 1.0 : -1.0;
+
+    corner[i] = pc.centre + vec4(x * 0.2, y * 0.2, 0.0, 0.0);
+    if (i == 0u)
+        size = 0.2;
+    barrier();
+
+    vec4 middle = (corner[0] + corner[1] + corner[2] + corner[3]) * 0.25;
+
+    SetMeshOutputsEXT(4, 2);
+    gl_MeshVerticesEXT[i].gl_Position = mix(corner[i], middle, pc.shrink);
+    vColor[i] = vec4(x * 0.5 + 0.5, y * 0.5 + 0.5, size * 5.0, 1.0);
+    if (i == 0u) {
+        gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+        gl_PrimitiveTriangleIndicesEXT[1] = uvec3(2, 1, 3);
+    }
+}

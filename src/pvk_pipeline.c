@@ -414,7 +414,7 @@ void pvk_viewport_context(const PvkViewport *vp, PvkFormat depthFormat, float *c
 
 static PvkResult validate_shaders(const PvkShaderCode *vs, const PvkShaderCode *fs)
 {
-    if (!vs || vs->stage != PVK_SHADER_STAGE_VERTEX) {
+    if (!vs || (vs->stage != PVK_SHADER_STAGE_VERTEX && vs->stage != PVK_SHADER_STAGE_MESH_BIT_EXT)) {
         pvk_error("pipeline: vertexShader is not a vertex shader\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
@@ -452,8 +452,7 @@ uint32_t pvk_push_word_mask(uint32_t offset, uint32_t size)
 
 int pvk_layout_push_compatible(const struct PvkPipelineLayout_T *a, const struct PvkPipelineLayout_T *b)
 {
-    return a->pushWords[0] == b->pushWords[0] && a->pushWords[1] == b->pushWords[1] &&
-           a->pushWords[2] == b->pushWords[2];
+    return !memcmp(a->pushWords, b->pushWords, sizeof(a->pushWords));
 }
 
 PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreateInfo *info, PvkPipelineLayout *layout)
@@ -490,7 +489,7 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
             free(l);
             return PVK_ERROR_VALIDATION_FAILED;
         }
-        if (!r->stageFlags || r->stageFlags & ~(PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT | PVK_SHADER_STAGE_COMPUTE_BIT)) {
+        if (!r->stageFlags || r->stageFlags & ~PVK_ALL_SHADER_STAGES) {
             pvk_error("pipeline layout: push constant range %u has stage flags 0x%x; use "
                       "PvkShaderStage values\n", (unsigned)i, (unsigned)r->stageFlags);
             free(l);
@@ -509,6 +508,10 @@ PvkResult pvkCreatePipelineLayout(PvkDevice device, const PvkPipelineLayoutCreat
             l->pushWords[1] |= mask;
         if (r->stageFlags & PVK_SHADER_STAGE_COMPUTE_BIT)
             l->pushWords[2] |= mask;
+        if (r->stageFlags & PVK_SHADER_STAGE_TASK_BIT_EXT)
+            l->pushWords[3] |= mask;
+        if (r->stageFlags & PVK_SHADER_STAGE_MESH_BIT_EXT)
+            l->pushWords[4] |= mask;
     }
 
     *layout = l;
@@ -519,6 +522,41 @@ void pvkDestroyPipelineLayout(PvkDevice device, PvkPipelineLayout layout)
 {
     (void)device;
     free(layout);
+}
+
+/* A compute, task or mesh shader's push constant block and its uniform and storage blocks must
+ * be in the layout for its stage. Fills in the slots. */
+static PvkResult validate_blocks(const PvkShaderCode *cs, PvkPipelineLayout layout, uint32_t stageBit, uint32_t pushIndex,
+                                 const char *who, const char *stage, uint32_t *uniformSlots, uint32_t *storageSlots)
+{
+    uint32_t needed = pvk_push_word_mask(0, cs->pushConstantBytes), i;
+
+    if ((layout->pushWords[pushIndex] & needed) != needed) {
+        pvk_error("%s: %s shader '%s' reads %u bytes of push constants, but the layout's "
+                  "%s stage ranges do not cover them\n", who, stage, cs->name, (unsigned)cs->pushConstantBytes, stage);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    for (i = 0; i < cs->uniformBlockCount + cs->storageBlockCount; i++) {
+        int uniform = i < cs->uniformBlockCount;
+        uint32_t set = uniform ? cs->uniformBlocks[i].set : cs->storageBlocks[i - cs->uniformBlockCount].set;
+        uint32_t binding = uniform ? cs->uniformBlocks[i].binding : cs->storageBlocks[i - cs->uniformBlockCount].binding;
+        PvkDescriptorType type = uniform ? PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : PVK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        const char *what = uniform ? "uniform" : "storage";
+        int slot = set < layout->setLayoutCount ? pvk_set_layout_find(&layout->setLayouts[set], binding) : -1;
+
+        if (slot < 0 || layout->setLayouts[set].bindings[slot].descriptorType != type ||
+            !(layout->setLayouts[set].bindings[slot].stageFlags & stageBit)) {
+            pvk_error("%s: %s shader '%s' has a %s block at set %u, binding %u, but the layout "
+                      "has no PVK_DESCRIPTOR_TYPE_%s_BUFFER binding there for the %s stage\n", who, stage, cs->name, what,
+                      (unsigned)set, (unsigned)binding, uniform ? "UNIFORM" : "STORAGE", stage);
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (uniform)
+            uniformSlots[i] = (uint32_t)slot;
+        else
+            storageSlots[i - cs->uniformBlockCount] = (uint32_t)slot;
+    }
+    return PVK_SUCCESS;
 }
 
 /* The vertex shader's push constant block, bytes 0 to pushConstantBytes, must
@@ -538,14 +576,23 @@ static PvkResult validate_layout(PvkPipeline p, const PvkGraphicsPipelineCreateI
         pvk_error("pipeline: layout is NULL; create one with pvkCreatePipelineLayout\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
-    needed = pvk_push_word_mask(0, vs->pushConstantBytes);
+    if (p->mesh) {
+        PvkResult res = validate_blocks(vs, info->layout, PVK_SHADER_STAGE_MESH_BIT_EXT, 4, "pipeline", "mesh",
+                                        p->uniformSlots, p->storageSlots);
+        if (res == PVK_SUCCESS && p->ts)
+            res = validate_blocks(p->ts, info->layout, PVK_SHADER_STAGE_TASK_BIT_EXT, 3, "pipeline", "task",
+                                  p->taskUniformSlots, p->taskStorageSlots);
+        if (res != PVK_SUCCESS)
+            return res;
+    }
+    needed = p->mesh ? 0 : pvk_push_word_mask(0, vs->pushConstantBytes);
     if ((info->layout->pushWords[0] & needed) != needed) {
         pvk_error("pipeline: vertex shader '%s' reads %u bytes of push constants, but the layout's "
                   "vertex stage ranges do not cover them\n", vs->name, (unsigned)vs->pushConstantBytes);
         return PVK_ERROR_VALIDATION_FAILED;
     }
 
-    for (i = 0; i < vs->uniformBlockCount; i++) {
+    for (i = 0; !p->mesh && i < vs->uniformBlockCount; i++) {
         const PvkShaderUniformBlock *u = &vs->uniformBlocks[i];
 
         if (u->set >= info->layout->setLayoutCount) {
@@ -852,6 +899,87 @@ static PvkResult copy_code(PvkPipeline p, const VertexFormat *const *fmt, const 
     return PVK_SUCCESS;
 }
 
+/* What a mesh pipeline's two shaders share: the uniform area, the payload and VU1 data memory. */
+static PvkResult mesh_check(const PvkShaderCode *ms, const PvkShaderCode *ts)
+{
+    uint32_t meshEnd = 0, taskStart = PVK_VU1_UNIFORM_QWORDS, i;
+
+    for (i = 0; i < ms->uniformBlockCount; i++)
+        if (ms->uniformBlocks[i].qword + (ms->uniformBlocks[i].bytes + 15) / 16 > meshEnd)
+            meshEnd = ms->uniformBlocks[i].qword + (ms->uniformBlocks[i].bytes + 15) / 16;
+    for (i = 0; ts && i < ts->uniformBlockCount; i++)
+        if (ts->uniformBlocks[i].qword < taskStart)
+            taskStart = ts->uniformBlocks[i].qword;
+    if (meshEnd > taskStart) {
+        pvk_error("pipeline: the uniform blocks of mesh shader '%s' and task shader '%s' take more than %u bytes "
+                  "together (maxUniformBufferRange)\n", ms->name, ts->name, (unsigned)PVK_MAX_UNIFORM_BYTES);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (ms->payloadBytes && (!ts || ts->payloadBytes != ms->payloadBytes)) {
+        pvk_error("pipeline: mesh shader '%s' reads a task payload of %u bytes, but %s\n", ms->name,
+                  (unsigned)ms->payloadBytes, ts ? "the task shader's payload is of another size"
+                                                 : "the pipeline has no task stage");
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    if (ts && PVK_VU1_PAYLOAD_ADDR + (ts->payloadBytes + 15) / 16 + ts->sharedBytes / 16 >
+              ms->meshOutputAddress - ms->sharedBytes / 16) {
+        pvk_error("pipeline: the payload and shared variables of task shader '%s' and the shared variables and "
+                  "outputs of mesh shader '%s' take more than %u bytes together "
+                  "(maxMeshPayloadAndOutputMemorySize)\n", ts->name, ms->name, (unsigned)PVK_MAX_MESH_OUTPUT_BYTES);
+        return PVK_ERROR_VALIDATION_FAILED;
+    }
+    return PVK_SUCCESS;
+}
+
+/* A mesh pipeline's program: the task shader's code, which calls what follows it, then the mesh
+ * shader's. The run-time index clamps are NOP'd unless the device has robustBufferAccess. */
+static PvkResult mesh_code(PvkPipeline p, int robust)
+{
+    const PvkShaderCode *part[2] = { p->ts, p->vs };
+    size_t words = 0, at = 0;
+    uint32_t i, k;
+
+    for (k = 0; k < 2; k++)
+        if (part[k])
+            words += (size_t)(part[k]->vu1CodeEnd - part[k]->vu1CodeStart);
+    if (words / 2 > PVK_VU1_FRAME_ROUTINE) {
+        pvk_error("pipeline: mesh shader '%s' and its task shader are %u VU1 instructions together; micro memory "
+                  "holds %u\n", p->vs->name, (unsigned)(words / 2), (unsigned)PVK_VU1_FRAME_ROUTINE);
+        return PVK_ERROR_INVALID_SHADER;
+    }
+    p->program = calloc(1, sizeof(*p->program));
+    if (!p->program)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    p->program->vs   = p->vs;
+    pvk_shader_retain(p->vs);
+    p->program->refs = 1;
+    p->program->code = memalign(16, words * 4);
+    if (!p->program->code)
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    p->program->codeEnd = p->program->code + words;
+    for (k = 0; k < 2; k++) {
+        const PvkShaderCode *c = part[k];
+        size_t n = c ? (size_t)(c->vu1CodeEnd - c->vu1CodeStart) : 0;
+
+        if (!c)
+            continue;
+        memcpy(p->program->code + at, c->vu1CodeStart, n * 4);
+        for (i = 0; i < c->vu1ClampCount && !robust; i++) {
+            const uint32_t *clamp = c->vu1Clamps[i];
+            if (clamp < c->vu1CodeStart || clamp + 6 > c->vu1CodeEnd) {
+                pvk_error("pipeline: shader '%s' has a run-time index clamp outside its code\n", c->name);
+                return PVK_ERROR_INVALID_SHADER;
+            }
+            vu_nop(p->program->code + at + (clamp - c->vu1CodeStart));
+            vu_nop(p->program->code + at + (clamp - c->vu1CodeStart) + 2);
+            vu_nop(p->program->code + at + (clamp - c->vu1CodeStart) + 4);
+        }
+        at += n;
+    }
+    p->meshEntry = p->ts ? 0 : PVK_VU1_MESH_ENTRY;
+    return PVK_SUCCESS;
+}
+
 /* Vulkan's rules for a stage's PvkSpecializationInfo: every entry lies within
  * data. Which constants exist is the shader's business (specialize). */
 static PvkResult check_specialization(const PvkSpecializationInfo *info, uint32_t stage)
@@ -881,10 +1009,10 @@ static PvkResult check_specialization(const PvkSpecializationInfo *info, uint32_
 /* Writes the value each entry gives one of the vertex shader's specialization
  * constants over the LOI immediate holding its default in the pipeline's copy
  * of the code, as the float VU1 computes with. */
-static PvkResult specialize(PvkPipeline p, const PvkSpecializationInfo *info)
+static PvkResult specialize(PvkPipeline p, const PvkShaderCode *vs, const PvkSpecializationInfo *info, size_t at)
 {
-    const PvkShaderCode *vs = p->vs;
-    const char *stage = vs->stage == PVK_SHADER_STAGE_COMPUTE_BIT ? "compute" : "vertex";
+    const char *stage = vs->stage == PVK_SHADER_STAGE_COMPUTE_BIT ? "compute" : vs->stage == PVK_SHADER_STAGE_MESH_BIT_EXT
+                      ? "mesh" : vs->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? "task" : "vertex";
     uint32_t i, j;
 
     for (i = 0; i < vs->vu1SpecConstantCount; i++) {
@@ -919,7 +1047,7 @@ static PvkResult specialize(PvkPipeline p, const PvkSpecializationInfo *info)
                           "which VU1 cannot represent\n", (unsigned)e->constantID, stage, vs->name);
                 return PVK_ERROR_VALIDATION_FAILED;
             }
-            memcpy(p->program->code + (c->vu1Word - vs->vu1CodeStart), &v, sizeof(v));
+            memcpy(p->program->code + at + (c->vu1Word - vs->vu1CodeStart), &v, sizeof(v));
             break;
         }
     }
@@ -996,11 +1124,12 @@ static const struct {
 PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, const PvkGraphicsPipelineCreateInfo *info,
                                     PvkPipeline *pipeline)
 {
-    const PvkShaderCode *vs = NULL, *fs = NULL;
-    const PvkSpecializationInfo *vsSpec = NULL;
+    const PvkShaderCode *vs = NULL, *fs = NULL, *ts = NULL, *ms = NULL;
+    const PvkSpecializationInfo *vsSpec = NULL, *tsSpec = NULL, *msSpec = NULL;
     const VertexFormat *fmt[PVK_MAX_VERTEX_INPUTS];
     uint32_t qword[PVK_MAX_VERTEX_INPUTS], i;
     int instance[PVK_MAX_VERTEX_INPUTS];
+    PvkGraphicsPipelineCreateInfo meshInfo;
     PvkPipeline p;
     PvkResult res;
     float *ctx;
@@ -1008,11 +1137,14 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
     for (i = 0; i < info->stageCount; i++) {
         const PvkPipelineShaderStageCreateInfo *s = &info->stages[i];
         const PvkShaderCode **slot = s->stage == PVK_SHADER_STAGE_VERTEX ? &vs
-                                   : s->stage == PVK_SHADER_STAGE_FRAGMENT ? &fs : NULL;
+                                   : s->stage == PVK_SHADER_STAGE_FRAGMENT ? &fs
+                                   : s->stage == PVK_SHADER_STAGE_TASK_BIT_EXT ? &ts
+                                   : s->stage == PVK_SHADER_STAGE_MESH_BIT_EXT ? &ms : NULL;
 
         if (!slot || *slot || !s->module) {
-            pvk_error("pipeline: stage %u must be the one PVK_SHADER_STAGE_VERTEX or the one "
-                      "PVK_SHADER_STAGE_FRAGMENT stage, with a module\n", (unsigned)i);
+            pvk_error("pipeline: stage %u must be a PVK_SHADER_STAGE_VERTEX, PVK_SHADER_STAGE_FRAGMENT, "
+                      "PVK_SHADER_STAGE_TASK_BIT_EXT or PVK_SHADER_STAGE_MESH_BIT_EXT stage, each at most once, with a "
+                      "module\n", (unsigned)i);
             return PVK_ERROR_VALIDATION_FAILED;
         }
         if (s->module->code->stage != s->stage) {
@@ -1031,9 +1163,36 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
         *slot = s->module->code;
         if (s->stage == PVK_SHADER_STAGE_VERTEX)
             vsSpec = s->specializationInfo;
+        else if (s->stage == PVK_SHADER_STAGE_TASK_BIT_EXT)
+            tsSpec = s->specializationInfo;
+        else if (s->stage == PVK_SHADER_STAGE_MESH_BIT_EXT)
+            msSpec = s->specializationInfo;
+    }
+    if (ms || ts) {
+        /* The mesh shader's output layout stands in for the vertex input and the topology. */
+        static const PvkPrimitiveTopology lists[] = { PVK_PRIMITIVE_TOPOLOGY_POINT_LIST, PVK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+                                                      PVK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+
+        if (vs || !ms) {
+            pvk_error("pipeline: a task stage needs a mesh stage, and neither goes with a vertex stage\n");
+            return PVK_ERROR_VALIDATION_FAILED;
+        }
+        if (!device->meshFeatures.meshShader || (ts && !device->meshFeatures.taskShader)) {
+            pvk_error("pipeline: a %s stage needs the %s feature turned on at pvkCreateDevice\n",
+                      device->meshFeatures.meshShader ? "task" : "mesh",
+                      device->meshFeatures.meshShader ? "taskShader" : "meshShader");
+            return PVK_ERROR_FEATURE_NOT_PRESENT;
+        }
+        if ((res = mesh_check(ms, ts)) != PVK_SUCCESS)
+            return res;
+        vs       = ms;
+        vsSpec   = msSpec;
+        meshInfo = *info;
+        meshInfo.topology = lists[ms->meshPrimitiveVertices - 1];
+        info     = &meshInfo;
     }
     if (!vs || !fs) {
-        pvk_error("pipeline: stages must hold a vertex and a fragment stage\n");
+        pvk_error("pipeline: stages must hold a fragment stage and a vertex or a mesh stage\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
     if ((res = validate_shaders(vs, fs)) != PVK_SUCCESS)
@@ -1056,10 +1215,25 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
     p->atst         = fs->alphaTestFunction;
     p->aref         = fs->alphaTestReference;
     p->layout       = info->layout;
-    if ((res = validate_layout(p, info)) != PVK_SUCCESS ||
-        (res = setup_vertex_input(p, info, fmt, qword, instance)) != PVK_SUCCESS ||
-        (res = copy_code(p, fmt, qword, instance, device->features.robustBufferAccess != 0)) != PVK_SUCCESS ||
-        (res = specialize(p, vsSpec)) != PVK_SUCCESS) {
+    p->mesh         = ms != NULL;
+    p->ts           = ts;
+    if (ts)
+        pvk_shader_retain(ts);
+    res = validate_layout(p, info);
+    if (res == PVK_SUCCESS && p->mesh) {
+        size_t taskWords = ts ? (size_t)(ts->vu1CodeEnd - ts->vu1CodeStart) : 0;
+
+        res = mesh_code(p, device->features.robustBufferAccess != 0);
+        if (res == PVK_SUCCESS && ts)
+            res = specialize(p, ts, tsSpec, 0);
+        if (res == PVK_SUCCESS)
+            res = specialize(p, vs, vsSpec, taskWords);
+    } else if (res == PVK_SUCCESS) {
+        if ((res = setup_vertex_input(p, info, fmt, qword, instance)) == PVK_SUCCESS &&
+            (res = copy_code(p, fmt, qword, instance, device->features.robustBufferAccess != 0)) == PVK_SUCCESS)
+            res = specialize(p, vs, vsSpec, 0);
+    }
+    if (res != PVK_SUCCESS) {
         pvkDestroyPipeline(device, p, NULL);
         return res;
     }
@@ -1106,39 +1280,12 @@ PvkResult pvkCreateGraphicsPipeline(PvkDevice device, PvkPipelineCache cache, co
  * visible to the compute stage, in the set layout at its set index. Fills in the slots. */
 static PvkResult validate_compute_layout(PvkPipeline p, PvkPipelineLayout layout)
 {
-    const PvkShaderCode *cs = p->vs;
-    uint32_t needed = pvk_push_word_mask(0, cs->pushConstantBytes), i;
-
     if (!layout) {
         pvk_error("compute pipeline: layout is NULL; create one with pvkCreatePipelineLayout\n");
         return PVK_ERROR_VALIDATION_FAILED;
     }
-    if ((layout->pushWords[2] & needed) != needed) {
-        pvk_error("compute pipeline: compute shader '%s' reads %u bytes of push constants, but the layout's "
-                  "compute stage ranges do not cover them\n", cs->name, (unsigned)cs->pushConstantBytes);
-        return PVK_ERROR_VALIDATION_FAILED;
-    }
-    for (i = 0; i < cs->uniformBlockCount + cs->storageBlockCount; i++) {
-        int uniform = i < cs->uniformBlockCount;
-        uint32_t set = uniform ? cs->uniformBlocks[i].set : cs->storageBlocks[i - cs->uniformBlockCount].set;
-        uint32_t binding = uniform ? cs->uniformBlocks[i].binding : cs->storageBlocks[i - cs->uniformBlockCount].binding;
-        PvkDescriptorType type = uniform ? PVK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : PVK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        const char *what = uniform ? "uniform" : "storage";
-        int slot = set < layout->setLayoutCount ? pvk_set_layout_find(&layout->setLayouts[set], binding) : -1;
-
-        if (slot < 0 || layout->setLayouts[set].bindings[slot].descriptorType != type ||
-            !(layout->setLayouts[set].bindings[slot].stageFlags & PVK_SHADER_STAGE_COMPUTE_BIT)) {
-            pvk_error("compute pipeline: compute shader '%s' has a %s block at set %u, binding %u, but the layout "
-                      "has no PVK_DESCRIPTOR_TYPE_%s_BUFFER binding there for the compute stage\n", cs->name, what,
-                      (unsigned)set, (unsigned)binding, uniform ? "UNIFORM" : "STORAGE");
-            return PVK_ERROR_VALIDATION_FAILED;
-        }
-        if (uniform)
-            p->uniformSlots[i] = (uint32_t)slot;
-        else
-            p->storageSlots[i - cs->uniformBlockCount] = (uint32_t)slot;
-    }
-    return PVK_SUCCESS;
+    return validate_blocks(p->vs, layout, PVK_SHADER_STAGE_COMPUTE_BIT, 2, "compute pipeline", "compute",
+                           p->uniformSlots, p->storageSlots);
 }
 
 /* The pipeline's copy of the compute shader, with the run-time index clamps NOP'd unless the
@@ -1225,7 +1372,7 @@ static PvkResult create_compute_pipeline(PvkDevice device, PvkPipelineCache cach
     p->layout  = info->layout;
     if ((res = validate_compute_layout(p, info->layout)) != PVK_SUCCESS ||
         (res = compute_code(p, device->features.robustBufferAccess != 0)) != PVK_SUCCESS ||
-        (res = specialize(p, s->specializationInfo)) != PVK_SUCCESS) {
+        (res = specialize(p, cs, s->specializationInfo, 0)) != PVK_SUCCESS) {
         pvkDestroyPipeline(device, p, alloc);
         return res;
     }
@@ -1264,6 +1411,7 @@ void pvkDestroyPipeline(PvkDevice device, PvkPipeline pipeline, const PvkAllocat
     program_release(pipeline->program);
     pvk_shader_release(pipeline->vs);
     pvk_shader_release(pipeline->fs);
+    pvk_shader_release(pipeline->ts);
     host_free(pAllocator, pipeline);
 }
 

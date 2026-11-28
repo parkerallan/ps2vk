@@ -1,0 +1,16 @@
+name = mesh_per_primitive.frag
+entryPoint = main
+stage = fragment
+colorInputLocation = 0
+texcoordInputLocation = -1
+gouraud = 1
+textured = 0
+textureFunction = 0
+samplerBinding = -1
+samplerSet = -1
+alphaTest = 0
+alphaTestFunction = 0
+alphaTestReference = 0
+fogInputLocation = -1
+fog = 0
+fogColor = 0x000000

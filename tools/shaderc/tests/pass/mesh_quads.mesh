@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+// One quad per work group: its centre and size come from a storage buffer, its turn from a push constant.
+layout(local_size_x = 1) in;
+layout(triangles, max_vertices = 4, max_primitives = 2) out;
+
+layout(std430, set = 0, binding = 0) readonly buffer Cells {
+    vec4 cell[];
+} cells;
+
+layout(set = 0, binding = 1) uniform Tint {
+    vec4 tint;
+} u;
+
+layout(push_constant) uniform Push {
+    vec4 turn; // x: cos, y: sin, z: x offset
+} pc;
+
+layout(location = 0) out vec4 vColor[];
+
+void main()
+{
+    vec4 c = cells.cell[gl_WorkGroupID.x];
+    vec2 ax = vec2(pc.turn.x, pc.turn.y) * c.z;
+    vec2 ay = vec2(-pc.turn.y, pc.turn.x) * c.z;
+    vec2 o = c.xy + vec2(pc.turn.z, 0.0);
+
+    SetMeshOutputsEXT(4, 2);
+    gl_MeshVerticesEXT[0].gl_Position = vec4(o - ax - ay, 0.5, 1.0);
+    gl_MeshVerticesEXT[1].gl_Position = vec4(o + ax - ay, 0.5, 1.0);
+    gl_MeshVerticesEXT[2].gl_Position = vec4(o - ax + ay, 0.5, 1.0);
+    gl_MeshVerticesEXT[3].gl_Position = vec4(o + ax + ay, 0.5, 1.0);
+    vColor[0] = vec4(1.0, 0.0, 0.0, 1.0) * u.tint;
+    vColor[1] = vec4(0.0, 1.0, 0.0, 1.0) * u.tint;
+    vColor[2] = vec4(0.0, 0.0, 1.0, 1.0) * u.tint;
+    vColor[3] = vec4(1.0, 1.0, 0.0, 1.0) * u.tint;
+    gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+    gl_PrimitiveTriangleIndicesEXT[1] = uvec3(2, 1, 3);
+}

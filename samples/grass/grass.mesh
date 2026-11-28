@@ -1,0 +1,55 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+// One blade of grass per work group: 7 vertices and 5 triangles made from one vec4 of the field.
+layout(local_size_x = 1) in;
+layout(triangles, max_vertices = 7, max_primitives = 5) out;
+
+// The blades this draw covers: x, z of the root, height, and a random 0..1 of its own.
+layout(std430, set = 0, binding = 0) readonly buffer Field {
+    vec4 blade[];
+} field;
+
+layout(push_constant) uniform Push {
+    mat4 viewProj;
+    vec4 wind; // x: time; y: gust strength; z, w: the direction the wind blows in
+} pc;
+
+layout(location = 0) out vec4 vColor[];
+
+const float HALF_WIDTH = 0.035;
+const vec3 ROOT_COLOR = vec3(0.03, 0.16, 0.04);
+const vec3 TIP_COLOR = vec3(0.45, 0.78, 0.22);
+
+void main()
+{
+    vec4 b = field.blade[gl_WorkGroupID.x];
+    float tint = 0.65 + 0.35 * b.w;
+
+    // Gusts cross the field as a wave; the blade leans with the wind and sways around that lean.
+    float gust = sin(pc.wind.x + b.x * 0.9 + b.y * 0.6 + b.w * 1.5);
+    vec2 tip = pc.wind.zw * ((0.25 + gust * pc.wind.y) * b.z);
+
+    SetMeshOutputsEXT(7, 5);
+
+    // Three pairs of vertices up the blade, each narrower and bent further than the one below.
+    for (int k = 0; k < 3; k++) {
+        float t = float(k) / 3.0;
+        float w = HALF_WIDTH * (1.0 - t);
+        vec3 c = vec3(b.x + tip.x * t * t, b.z * t, b.y + tip.y * t * t);
+        vec4 color = vec4(mix(ROOT_COLOR, TIP_COLOR, t) * tint, 1.0);
+
+        gl_MeshVerticesEXT[k * 2].gl_Position = pc.viewProj * vec4(c.x - w, c.y, c.z, 1.0);
+        gl_MeshVerticesEXT[k * 2 + 1].gl_Position = pc.viewProj * vec4(c.x + w, c.y, c.z, 1.0);
+        vColor[k * 2] = color;
+        vColor[k * 2 + 1] = color;
+    }
+    gl_MeshVerticesEXT[6].gl_Position = pc.viewProj * vec4(b.x + tip.x, b.z, b.y + tip.y, 1.0);
+    vColor[6] = vec4(TIP_COLOR * tint, 1.0);
+
+    gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+    gl_PrimitiveTriangleIndicesEXT[1] = uvec3(2, 1, 3);
+    gl_PrimitiveTriangleIndicesEXT[2] = uvec3(2, 3, 4);
+    gl_PrimitiveTriangleIndicesEXT[3] = uvec3(4, 3, 5);
+    gl_PrimitiveTriangleIndicesEXT[4] = uvec3(4, 5, 6);
+}

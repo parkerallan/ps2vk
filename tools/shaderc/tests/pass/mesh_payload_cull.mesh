@@ -1,0 +1,27 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 1) in;
+layout(triangles, max_vertices = 3, max_primitives = 1) out;
+
+struct Payload {
+    vec4 origin;
+    vec4 color;
+};
+taskPayloadSharedEXT Payload payload;
+
+layout(location = 0) perprimitiveEXT out vec4 pColor[];
+
+void main()
+{
+    float k = float(gl_WorkGroupID.x);
+    vec4 o = payload.origin + vec4(0.0, -0.13 * k, 0.0, 0.0);
+
+    SetMeshOutputsEXT(3, 1);
+    gl_MeshVerticesEXT[0].gl_Position = o + vec4(-0.1, 0.05, 0.0, 0.0);
+    gl_MeshVerticesEXT[1].gl_Position = o + vec4(0.1, 0.05, 0.0, 0.0);
+    gl_MeshVerticesEXT[2].gl_Position = o + vec4(0.0, -0.06, 0.0, 0.0);
+    pColor[0] = payload.color;
+    gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+    gl_MeshPrimitivesEXT[0].gl_CullPrimitiveEXT = k > 2.5;
+}

@@ -1,0 +1,43 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+// Each of 3 invocations writes one corner to a shared array and one member of a shared struct;
+// behind the barrier() invocation 0 reads the whole array and the whole struct in one statement each.
+layout(local_size_x = 3) in;
+layout(triangles, max_vertices = 3, max_primitives = 1) out;
+
+struct Tint {
+    vec4 color;
+    float gain;
+};
+
+shared vec4 corner[3];
+shared Tint tint;
+
+layout(location = 0) out vec4 vColor[];
+
+void main()
+{
+    uint i = gl_LocalInvocationIndex;
+
+    corner[i] = vec4(float(i) * 0.3 - 0.3, i == 1u ? -0.3 : 0.3, 0.5, 1.0);
+    if (i == 0u)
+        tint.color = vec4(1.0, 0.5, 0.25, 1.0);
+    if (i == 1u)
+        tint.gain = 0.5;
+    barrier();
+
+    if (i == 0u) {
+        vec4 all[3] = corner;
+        Tint t = tint;
+
+        SetMeshOutputsEXT(3, 1);
+        gl_MeshVerticesEXT[0].gl_Position = all[0];
+        gl_MeshVerticesEXT[1].gl_Position = all[1];
+        gl_MeshVerticesEXT[2].gl_Position = all[2];
+        vColor[0] = t.color * t.gain;
+        vColor[1] = t.color * t.gain;
+        vColor[2] = t.color;
+        gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+    }
+}

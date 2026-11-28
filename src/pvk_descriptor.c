@@ -53,7 +53,7 @@ PvkResult pvkCreateDescriptorSetLayout(PvkDevice device, const PvkDescriptorSetL
                       "not supported, use 1\n", (unsigned)b->binding, (unsigned)b->descriptorCount);
             return PVK_ERROR_FEATURE_NOT_PRESENT;
         }
-        if (!b->stageFlags || b->stageFlags & ~(PVK_SHADER_STAGE_VERTEX | PVK_SHADER_STAGE_FRAGMENT | PVK_SHADER_STAGE_COMPUTE_BIT)) {
+        if (!b->stageFlags || b->stageFlags & ~PVK_ALL_SHADER_STAGES) {
             pvk_error("descriptor set layout: binding %u has stage flags 0x%x; use PvkShaderStage values\n",
                       (unsigned)b->binding, (unsigned)b->stageFlags);
             return PVK_ERROR_VALIDATION_FAILED;

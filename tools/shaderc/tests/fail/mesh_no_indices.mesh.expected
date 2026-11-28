@@ -1,0 +1,1 @@
+mesh_no_indices.mesh: error: mesh shader never writes its primitives' indices (gl_PrimitiveTriangleIndicesEXT, gl_PrimitiveLineIndicesEXT or gl_PrimitivePointIndicesEXT)

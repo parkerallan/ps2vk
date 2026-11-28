@@ -185,6 +185,12 @@ static void readback_step(PvkDevice dev)
 
     if (*D1_CHCR & 0x100)
         return;
+    if (run->rb->indirectCmd) {
+        /* pvkQueueSubmit builds the draws: a handler may not take memory for them. */
+        run->stage = 4;
+        iSignalSema(run->queue->indirect);
+        return;
+    }
     if (run->rb->vu1Count) {
         vu1_copy(dev);
         return;
@@ -411,6 +417,12 @@ PvkResult pvk_queue_init(PvkQueue queue, uint32_t family)
         DeleteSema(queue->idle.sema);
         return PVK_ERROR_OUT_OF_HOST_MEMORY;
     }
+    queue->indirect = create_binary_sema();
+    if (queue->indirect < 0) {
+        DeleteSema(queue->room);
+        DeleteSema(queue->idle.sema);
+        return PVK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     queue->family = family;
     queue->chcr   = family ? D2_CHCR : D1_CHCR;
     queue->qwc    = family ? D2_QWC : D1_QWC;
@@ -423,6 +435,7 @@ PvkResult pvk_queue_init(PvkQueue queue, uint32_t family)
 void pvk_queue_shutdown(PvkQueue queue)
 {
     handlers_remove(queue);
+    DeleteSema(queue->indirect);
     DeleteSema(queue->room);
     DeleteSema(queue->idle.sema);
 }
@@ -522,6 +535,25 @@ PvkResult pvk_semaphores_check(const char *who, uint32_t count, const PvkSemapho
     return PVK_SUCCESS;
 }
 
+/* An indirect draw is built: its chain goes on at the draw's tag. Interrupts disabled. */
+static void indirect_resume(PvkDevice dev)
+{
+    struct PvkReadbackRun *run = &dev->readback;
+    PvkQueue queue = run->queue;
+
+    queue->ring[queue->head].readbackNext++;
+    run->stage = 0;
+    *queue->qwc  = 0;
+    *queue->tadr = DMA_SET_TADR((u32)run->rb->resume, 0);
+    *queue->chcr = DMA_SET_CHCR(1, 1, (*queue->chcr >> 4) & 3, queue->family == 0, 0, 1, 0);
+    if (run->pending) {
+        queue = run->pending;
+        run->pending = NULL;
+        readback_begin(dev, queue);
+    }
+    pvk_device_kick(dev);
+}
+
 /* Takes the next free ring entry, sleeping while the ring is full. */
 static struct PvkSubmission *ring_take(PvkQueue queue)
 {
@@ -536,7 +568,7 @@ static struct PvkSubmission *ring_take(PvkQueue queue)
 
 PvkResult pvkQueueSubmit(PvkQueue queue, uint32_t submitCount, const PvkSubmitInfo *submits, PvkFence fence)
 {
-    uint32_t s, c, i, first, n = 0;
+    uint32_t s, c, i, first, n = 0, stops = 0;
     PvkResult res;
 
     for (s = 0; s < submitCount; s++) {
@@ -606,6 +638,8 @@ PvkResult pvkQueueSubmit(PvkQueue queue, uint32_t submitCount, const PvkSubmitIn
             if (cmd) {
                 cmd->used = 1;
                 pvk_cmd_pack_uploads(cmd);
+                for (i = 0; i < cmd->readbackCount; i++)
+                    stops += cmd->readbacks[i].indirectCmd != NULL;
                 cmd->packet.base[cmd->signalQw].dw[0] = GS_SET_SIGNAL(PVK_SIGNAL_ID(queue, e - queue->ring), 0xFFFFFFFF);
             }
             queue->tail = (queue->tail + 1) % PVK_MAX_PENDING_SUBMISSIONS;
@@ -619,7 +653,24 @@ PvkResult pvkQueueSubmit(PvkQueue queue, uint32_t submitCount, const PvkSubmitIn
         queue->ring[i].state = 1;
     pvk_queue_kick(queue);
     EI();
-    return PVK_SUCCESS;
+
+    /* Each indirect draw stops its chain: read its commands, build the draws, let the chain go on. */
+    res = PVK_SUCCESS;
+    for (; stops; stops--) {
+        const struct PvkReadback *rb;
+        PvkResult built;
+
+        WaitSema(queue->indirect);
+        rb    = queue->device->readback.rb;
+        built = pvk_cmd_build_indirect(rb->indirectCmd, rb->indirectIndex);
+        if (built != PVK_SUCCESS)
+            res = built;
+        FlushCache(0);
+        DI();
+        indirect_resume(queue->device);
+        EI();
+    }
+    return res;
 }
 
 PvkResult pvkCreateFence(PvkDevice device, const PvkFenceCreateInfo *info, PvkFence *fence)

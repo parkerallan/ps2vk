@@ -1,0 +1,28 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+
+// Task work group g emits g + 1 mesh work groups and hands them a column origin and a color.
+layout(local_size_x = 1) in;
+
+struct Payload {
+    vec4 origin;
+    vec4 color;
+};
+taskPayloadSharedEXT Payload payload;
+
+layout(set = 0, binding = 1) uniform Tint {
+    vec4 tint;
+} u;
+
+layout(std430, set = 0, binding = 2) buffer Stats {
+    vec4 seen;
+} stats;
+
+void main()
+{
+    float g = float(gl_WorkGroupID.x);
+    payload.origin = vec4(-0.75 + g * 0.4, -0.05, 0.5, 1.0);
+    payload.color = vec4(g * 0.25, 1.0 - g * 0.25, 0.5, 1.0) * u.tint;
+    stats.seen.x = stats.seen.x + 1.0;
+    EmitMeshTasksEXT(gl_WorkGroupID.x + 1u, 1u, 1u);
+}

@@ -90,7 +90,7 @@ fog_vert_body:
          NOP                                      move.xyzw     VF20,VF10                  ; gl_Position
          NOP                                      move.xyzw     VF21,VF11                  ; color output, location 0
          sub.w         VF22,VF00,VF00             NOP
-         maxx.w        VF22,VF22,VF05x            NOP                                      ; fog output, location 1, not below 0
+         maxw.w        VF22,VF22,VF05w            NOP                                      ; fog output, location 1, not below 0
 ; epilogue: perspective divide, viewport, GS formats, store
          NOP                                      div           Q,VF00w,VF20w              ; Q = 1 / w
          NOP                                      waitq
